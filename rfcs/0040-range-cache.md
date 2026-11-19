@@ -139,7 +139,7 @@ write that fails after the memtable insert is fatal: the writer's cleanup closes
 ### Read path
 
 The cache serves a read only if its durability filter is `Memory`, it is not dirty, and it has no
-filter context or tracing option. A scan must also be ascending and inside cached ranges.
+filter context or tracing option. A scan must also be ascending.
 
 A point read takes no lock, and awaits only for a merge operand. It loads the index, the layers of
 its range, and then the last committed sequence number, called `seq`. If the sequence number rules
@@ -157,6 +157,22 @@ block. A scan over adjacent ranges pins all of them before it loads `seq`, becau
 otherwise install a file newer than `seq`. The scan sits behind the public `DbIterator`, so its
 contract does not change. With `DbIterator::new_resolved` and `RowEntryIterator::next_sync`, it
 returns most rows without an await, and checks Tokio's cooperative budget once every 32 rows.
+
+A scan that cached ranges hold only in part is a mixed scan. From one load of the index, it splits
+its range into parts in key order: a cached part for each ready range that intersects it, and a
+gap for each stretch that no ready range holds. It pins the layers of every cached part, loads
+`seq`, and turns each cached part that fails the rules into a gap. A gap reads through the normal
+path from a state view `V` (memtables and manifest) with `max_seq = seq`, and opens only when the
+scan reaches it, so a scan that ends early or seeks past a gap never opens it. A gap that no cached
+range holds is sampled when it opens, with the time to open it as the cost. `V` must hold every
+version visible at `seq`, but flush and compaction keep only the versions that the latest state and
+registered snapshots need. At the latest state nothing is registered at `seq`, so the scan captures
+`V` before it loads `seq`, and then checks that the active memtable is still the one in `V`. The
+SSTs and immutable memtables of `V` never change, so it keeps every version written before the
+capture; a later write at or below `seq` went into the active memtable, which `V` shares unless a
+freeze happened. After a freeze the scan tries again, up to three times, then uses the normal path.
+A snapshot or transaction is registered at `seq`, so its view can be captured after `seq`. A scan
+that no cached range touches uses the normal path, and a fully cached scan does not change.
 
 A read in a snapshot or a transaction works the same way. It still loads the last committed
 sequence number after it pins the layers, and reads at the smaller of that number and the
@@ -378,8 +394,9 @@ shows the cost of writes to cached keys; the table above gives the read numbers.
 ### Observability
 
 - Configuration: `DbBuilder::with_range_cache`. New components: rebuild and promoter tasks.
-- Metrics under `slatedb.range_cache.`: reads served, loads, rebuilds, bytes, removals by reason,
-  and gauges for ranges, file bytes and delta bytes. Automatic promotion adds its own counters.
+- Metrics under `slatedb.range_cache.`: reads served, mixed scans and the gaps they open, loads,
+  rebuilds, bytes, removals by reason, and gauges for ranges, file bytes and delta bytes.
+  Automatic promotion adds its own counters.
 - Logging: a warning when a rebuild or a cache read fails.
 
 ### Compatibility
@@ -429,7 +446,6 @@ The branch has five commits. Commits 1 and 2 do not depend on the cache and can 
 
 ## Open Questions
 
-- Should a scan continue in the normal read path when it leaves the cached ranges?
 - Should the cache survive restarts?
 - Should `cache_range` return before the load ends?
 - Should `DbIterator` get a batched read, such as `next_batch` in commit 5?
@@ -473,6 +489,10 @@ For a snapshot, `seq` is at most the last committed sequence number that the rea
    replaces the file and the frozen delta, and keeps the active delta. Automatic promotion adds
    and removes ranges only through the same load and removal code.
 6. A scan pins every range before it loads `seq`, and checks the rules for each. The ranges hold
-   disjoint keys that cover the scan range, so their answers together are the answer at `seq`.
+   disjoint keys that cover the scan range, so their answers together are the answer at `seq`. A
+   mixed scan's gaps hold the other keys. Their view holds every version at or below `seq`: a
+   snapshot's versions stay because it is registered; at the latest state, the view was captured
+   before `seq` was loaded, and no freeze happened in between (see the read path). The normal path
+   reads it with `max_seq = seq`, so every part answers at `seq`, and so does the scan.
 7. A write that fails after the memtable insert closes the database. So `seq` never reaches a
    version that never commits, and reads fail with `Closed`.

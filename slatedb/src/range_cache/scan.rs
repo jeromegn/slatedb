@@ -100,7 +100,7 @@ enum Source {
 }
 
 /// The smaller of a scan's end bound and a range's exclusive end.
-fn min_end(scan_end: &Bound<Bytes>, range_end: &Option<Bytes>) -> Bound<Bytes> {
+pub(super) fn min_end(scan_end: &Bound<Bytes>, range_end: &Option<Bytes>) -> Bound<Bytes> {
     let Some(range_end) = range_end else {
         return scan_end.clone();
     };
@@ -171,6 +171,12 @@ impl CachedScan {
         let start = RangeBounds::start_bound(range).map(|key| key.as_ref());
         scan.open(start, first_end)?;
         Ok(scan)
+    }
+
+    /// Sets whether the scan that this one is part of covers one key. A part of a mixed scan
+    /// resolves merge operands with the iterator stack of the whole scan. See `resolve`.
+    pub(super) fn set_point(&mut self, point: bool) {
+        self.point = point;
     }
 
     /// Starts reading the current layers from `start` to `end`.

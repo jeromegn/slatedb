@@ -621,6 +621,33 @@ impl DbIterator {
     }
 }
 
+#[cfg(feature = "range_cache")]
+impl DbIterator {
+    /// [`DbIterator::seek`] with the crate's error type, for a mixed range cache scan that
+    /// reads a gap through this iterator (RFC 0040).
+    pub(crate) async fn seek_entry(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        if let Some(error) = self.invalidated_error.clone() {
+            Err(error)
+        } else if matches!(self.order, IterationOrder::Descending) {
+            Err(SlateDBError::SeekNotSupportedForDescendingScan)
+        } else if !self.range.contains(&next_key) {
+            Err(SlateDBError::SeekKeyOutOfRange {
+                key: next_key.to_vec(),
+                range: self.range.clone(),
+            })
+        } else if self
+            .last_key
+            .as_ref()
+            .is_some_and(|last_key| next_key <= last_key.as_ref())
+        {
+            Err(SlateDBError::SeekKeyLessThanLastReturnedKey)
+        } else {
+            let result = self.iter.seek(next_key).await;
+            self.maybe_invalidate(result)
+        }
+    }
+}
+
 pub(crate) fn apply_filters<T>(
     iters: impl IntoIterator<Item = T>,
     max_seq: Option<u64>,

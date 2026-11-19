@@ -374,7 +374,7 @@ impl DbTransaction {
             } else {
                 match self
                     .db_inner
-                    .range_cache_scan(range, options, Some(self.started_seq))
+                    .range_cache_scan(range, options, prefix.as_ref(), Some(self.started_seq))
                     .await
                 {
                     crate::range_cache::ScanRoute::Served(result) => {

@@ -12,8 +12,17 @@ macro_rules! range_cache_stat_name {
 /// Point reads that the range cache served. The `result` label is `hit` (a value), `absent`
 /// (a definite miss) or `merge` (a merge operand that the cache resolved).
 pub const GET_COUNT: &str = range_cache_stat_name!("get_count");
-/// Scans that the range cache served.
+/// Scans that the range cache served completely.
 pub const SCAN_COUNT: &str = range_cache_stat_name!("scan_count");
+/// Scans that cached ranges served in part: the parts that no usable cached range holds, the
+/// gaps, come from the normal read path.
+pub const MIXED_SCAN_COUNT: &str = range_cache_stat_name!("mixed_scan_count");
+/// Gaps of mixed scans that the normal read path opened. A scan opens a gap only when it
+/// reaches it.
+pub const SCAN_GAP_COUNT: &str = range_cache_stat_name!("scan_gap_count");
+/// Attempts to plan a mixed scan at the latest state that a memtable freeze made the scan
+/// repeat. After a few, the scan uses the normal read path.
+pub const MIXED_SCAN_RETRY_COUNT: &str = range_cache_stat_name!("mixed_scan_retry_count");
 /// Ranges that the cache loaded.
 pub const LOAD_COUNT: &str = range_cache_stat_name!("load_count");
 /// Bytes of range cache files that loads wrote.
@@ -172,6 +181,9 @@ pub(crate) struct RangeCacheStats {
     pub(crate) get_absent: Arc<dyn CounterFn>,
     pub(crate) get_merges: Arc<dyn CounterFn>,
     pub(crate) scans: Arc<dyn CounterFn>,
+    pub(crate) mixed_scans: Arc<dyn CounterFn>,
+    pub(crate) scan_gaps: Arc<dyn CounterFn>,
+    pub(crate) mixed_scan_retries: Arc<dyn CounterFn>,
     pub(crate) loads: Arc<dyn CounterFn>,
     pub(crate) load_bytes: Arc<dyn CounterFn>,
     pub(crate) rebuilds: Arc<dyn CounterFn>,
@@ -206,6 +218,9 @@ impl RangeCacheStats {
             get_absent: get("absent"),
             get_merges: get("merge"),
             scans: recorder.counter(SCAN_COUNT).register(),
+            mixed_scans: recorder.counter(MIXED_SCAN_COUNT).register(),
+            scan_gaps: recorder.counter(SCAN_GAP_COUNT).register(),
+            mixed_scan_retries: recorder.counter(MIXED_SCAN_RETRY_COUNT).register(),
             loads: recorder.counter(LOAD_COUNT).register(),
             load_bytes: recorder.counter(LOAD_BYTES).register(),
             rebuilds: recorder.counter(REBUILD_COUNT).register(),

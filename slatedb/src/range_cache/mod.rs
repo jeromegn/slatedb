@@ -42,6 +42,7 @@
 
 mod auto;
 mod file;
+mod mixed;
 mod scan;
 pub mod stats;
 
@@ -85,6 +86,7 @@ use auto::AutoSettings;
 pub(crate) use auto::{Promoter, PromoterMessage, RANGE_CACHE_PROMOTER_TASK_NAME};
 pub use file::RangeCachePageSource;
 use file::{RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION, TEMP_FILE_EXTENSION};
+use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
 use stats::{AutoStats, RangeCacheStats, RemoveReason};
 
@@ -1221,6 +1223,83 @@ impl RangeCache {
         Some(Err(()))
     }
 
+    /// Plans a scan of `range` over cached ranges and gaps, if a cached range that follows the
+    /// sequence number rules intersects it (see the `mixed` module).
+    ///
+    /// It loads the index once, pins the layers of every cached range that intersects `range`,
+    /// then loads the read's sequence number, then checks the rules for each. A range that
+    /// fails them, or still loads, becomes a gap. Returns `None` if no part is cached.
+    fn pin_mixed(
+        &self,
+        range: &BytesRange,
+        oracle: &dyn Oracle,
+        at: Option<u64>,
+    ) -> Option<MixedPin> {
+        let (start, end) = half_open(range)?;
+        let index = self.index.load();
+        let intersecting: Vec<&Arc<CachedRange>> = covering(&index, &start)
+            .into_iter()
+            .chain(
+                index
+                    .range::<[u8], _>((Excluded(start.as_ref()), Unbounded))
+                    .map(|(_, r)| r)
+                    .take_while(|r| end.as_ref().is_none_or(|end| r.start < *end)),
+            )
+            .collect();
+        if intersecting.is_empty() {
+            return None;
+        }
+        let pinned: Vec<Arc<Layers>> = intersecting.iter().map(|r| r.layers.load_full()).collect();
+        let seq = read_seq(oracle, at);
+
+        let scan_end = RangeBounds::end_bound(range).cloned();
+        let mut parts = Vec::with_capacity(2 * intersecting.len() + 1);
+        let mut push = |kind, start: std::ops::Bound<Bytes>, end: std::ops::Bound<Bytes>| {
+            if BytesRange::try_new(start.clone(), end.clone()).is_some() {
+                parts.push(Part { kind, start, end });
+            }
+        };
+        let mut cursor = Some(RangeBounds::start_bound(range).cloned());
+        let mut first_cached: Option<&Arc<CachedRange>> = None;
+        for (cached, layers) in intersecting.iter().zip(pinned) {
+            let Some(from) = cursor.take() else {
+                break;
+            };
+            // The gap before this range, if any.
+            let before = match &from {
+                Unbounded => !cached.start.is_empty(),
+                Included(key) | Excluded(key) => *key < cached.start,
+            };
+            let from = if before {
+                push(
+                    PartKind::Gap { sample: true },
+                    from,
+                    Excluded(cached.start.clone()),
+                );
+                Included(cached.start.clone())
+            } else {
+                from
+            };
+            let to = scan::min_end(&scan_end, &cached.end);
+            let kind = if layers.file.is_none() {
+                // A loading range holds no rows yet.
+                PartKind::Gap { sample: true }
+            } else if Self::usable(&layers, seq) {
+                first_cached.get_or_insert(*cached);
+                PartKind::Cached(layers)
+            } else {
+                PartKind::Gap { sample: false }
+            };
+            push(kind, from, to);
+            cursor = cached.end.clone().map(Included);
+        }
+        if let Some(from) = cursor {
+            push(PartKind::Gap { sample: true }, from, scan_end);
+        }
+        let first = first_cached?.clone();
+        Some(MixedPin { parts, seq, first })
+    }
+
     pub(crate) fn ranges(&self) -> Vec<CachedRangeInfo> {
         self.index.load().values().map(|r| r.info()).collect()
     }
@@ -1555,6 +1634,15 @@ pub(crate) enum ScanPin {
     Unusable,
 }
 
+/// The parts of a mixed scan, with the layers of its cached parts pinned at one sequence
+/// number. See [`RangeCache::pin_mixed`].
+struct MixedPin {
+    parts: Vec<Part>,
+    seq: u64,
+    /// The first cached part's range, which counts as read if the scan goes ahead.
+    first: Arc<CachedRange>,
+}
+
 /// The layers of the adjacent cached ranges that hold a scan range, pinned at one sequence
 /// number.
 pub(crate) struct PinnedScan {
@@ -1729,6 +1817,7 @@ impl DbInner {
         &self,
         range: BytesRange,
         options: &ScanOptions,
+        prefix: Option<&Bytes>,
         at: Option<u64>,
     ) -> ScanRoute {
         let Some(cache) = &self.range_cache else {
@@ -1747,6 +1836,62 @@ impl DbInner {
                 )
             }
             ScanPin::Uncovered => {
+                for _ in 0..PIN_ATTEMPTS {
+                    // The gaps read through the normal path from a state view `V` with
+                    // `max_seq = S`, the scan's sequence number. `V` must hold every version
+                    // visible at `S`. Flush and compaction keep only the versions that the
+                    // latest state and registered snapshots need, so a view captured after `S`
+                    // was loaded can lack a version that `S` sees, when a newer one exists.
+                    //
+                    // At the latest state nothing is registered at `S`. So capture `V` first,
+                    // then load `S`, then check that the active memtable is still the one in
+                    // `V`. The SSTs and immutable memtables of `V` never change, so every
+                    // version written before the capture is in `V`, whatever flush and
+                    // compaction do later. A write at or below `S` after the capture went into
+                    // the active memtable, which `V` shares, unless a freeze happened. So if no
+                    // freeze happened, `V` holds every version at or below `S`. Else try again.
+                    //
+                    // A snapshot or a transaction is registered at `S`, so flush and compaction
+                    // keep its versions, and any view captured after `S` was loaded holds them.
+                    let latest_view = at.is_none().then(|| self.state.read().view());
+                    let Some(pin) = cache.pin_mixed(&range, self.oracle.as_ref(), at) else {
+                        break;
+                    };
+                    fail_point!(Arc::clone(&cache.fp_registry), "range-cache-mixed-pinned");
+                    let view = match latest_view {
+                        Some(view) => {
+                            let frozen =
+                                !Arc::ptr_eq(&view.memtable, self.state.read().memtable().table());
+                            if frozen {
+                                cache.stats.mixed_scan_retries.increment(1);
+                                continue;
+                            }
+                            view
+                        }
+                        None => self.state.read().view(),
+                    };
+                    // As for a fully cached scan, the first cached range counts as read.
+                    cache.touch(&pin.first);
+                    cache.stats.mixed_scans.increment(1);
+                    let gaps = GapSource {
+                        reader: self.reader.clone(),
+                        view,
+                        options: options.clone(),
+                        prefix: prefix.cloned(),
+                        cache: cache.clone(),
+                    };
+                    let scan = MixedScan::new(
+                        pin.parts,
+                        pin.seq,
+                        range.as_point().is_some(),
+                        self.reader.read_merge_operator.clone(),
+                        gaps,
+                    );
+                    self.db_stats.scan_requests.increment(1);
+                    return ScanRoute::Served(
+                        DbIterator::new_resolved(range, Box::new(scan), ReadTrace::none()).await,
+                    );
+                }
                 let sample = cache.sample().map(|sample| SampledRead {
                     sample,
                     key: scan_start(&range),

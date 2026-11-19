@@ -255,7 +255,10 @@ impl DbInner {
         // A normal-path scan that the cache could have served, sampled for automatic
         // promotion, with its start key.
         #[cfg(feature = "range_cache")]
-        let (range, sample) = match self.range_cache_scan(range, options, None).await {
+        let (range, sample) = match self
+            .range_cache_scan(range, options, prefix.as_ref(), None)
+            .await
+        {
             crate::range_cache::ScanRoute::Served(result) => return result,
             crate::range_cache::ScanRoute::Normal(range, sample) => (range, sample),
         };

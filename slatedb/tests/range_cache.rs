@@ -22,11 +22,13 @@ use slatedb::config::{
     FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, TracingOptions,
     Ttl, WriteOptions,
 };
+use slatedb::fail_parallel::{self, FailPointRegistry};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::range_cache_stats::{
-    ADMISSION_COUNT, CANDIDATE_COUNT, GET_COUNT, LOAD_COUNT, PROMOTION_COUNT, REBUILD_COUNT,
-    REJECTION_COUNT, REMOVE_COUNT, SAMPLE_COUNT, SCAN_COUNT,
+    ADMISSION_COUNT, CANDIDATE_COUNT, GET_COUNT, LOAD_COUNT, MIXED_SCAN_COUNT,
+    MIXED_SCAN_RETRY_COUNT, PROMOTION_COUNT, REBUILD_COUNT, REJECTION_COUNT, REMOVE_COUNT,
+    SAMPLE_COUNT, SCAN_COUNT, SCAN_GAP_COUNT,
 };
 use slatedb::{
     AutoPromoteOptions, CachedRangeInfo, Db, DbIterator, DbReadOps, ErrorKind, IsolationLevel,
@@ -736,8 +738,6 @@ async fn should_not_lose_writes_that_race_a_load() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_not_serve_a_write_before_it_commits() {
-    use slatedb::fail_parallel::{self, FailPointRegistry};
-
     let dir = tempfile::tempdir().unwrap();
     let fp_registry = Arc::new(FailPointRegistry::new());
     let recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -813,8 +813,6 @@ async fn should_not_lose_a_write_that_races_registration(
     #[case] fail_point: &str,
     #[case] write_commits_during_pause: bool,
 ) {
-    use slatedb::fail_parallel::{self, FailPointRegistry};
-
     let dir = tempfile::tempdir().unwrap();
     let fp_registry = Arc::new(FailPointRegistry::new());
     let recorder = Arc::new(DefaultMetricsRecorder::new());
@@ -973,8 +971,6 @@ async fn should_scan_one_state_while_writes_land() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn should_scan_across_a_rebuild() {
-    use slatedb::fail_parallel::{self, FailPointRegistry};
-
     for page_source in page_sources() {
         let dir = tempfile::tempdir().unwrap();
         let fp_registry = Arc::new(FailPointRegistry::new());
@@ -1520,8 +1516,6 @@ async fn should_promote_ranges_that_transactions_read() {
 /// fix, the delta held the operand too, and reads applied it twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn should_apply_a_merge_that_races_registration_once() {
-    use slatedb::fail_parallel::{self, FailPointRegistry};
-
     for fail_point in [
         "range-cache-register-publish",
         "range-cache-register-snapshot",
@@ -1691,6 +1685,598 @@ fn should_match_a_model() {
             Ok(())
         })
         .unwrap();
+}
+
+// Scans across cached ranges and gaps.
+
+/// One step of the mixed scan property test.
+#[derive(Debug, Clone)]
+enum MixedOp {
+    Put(u8, u8),
+    Delete(u8),
+    Merge(u8, u8),
+    Flush,
+    Cache(u8, u8),
+    Uncache(u8, u8),
+    Snapshot,
+    /// A scan at the latest state (`None`) or in a snapshot, with its bounds, the rows read
+    /// before an optional seek, and the seek target.
+    Scan {
+        snapshot: Option<usize>,
+        start: Bound<u8>,
+        end: Bound<u8>,
+        before_seek: usize,
+        seek: Option<u8>,
+    },
+}
+
+fn mixed_op() -> impl Strategy<Value = MixedOp> {
+    let k = 0u8..32;
+    let range = (k.clone(), k.clone()).prop_map(|(a, b)| (a.min(b), a.max(b) + 1));
+    let bound = prop_oneof![
+        Just(Unbounded),
+        k.clone().prop_map(Included),
+        k.clone().prop_map(Excluded),
+    ];
+    prop_oneof![
+        5 => (k.clone(), any::<u8>()).prop_map(|(k, v)| MixedOp::Put(k, v)),
+        2 => k.clone().prop_map(MixedOp::Delete),
+        2 => (k.clone(), any::<u8>()).prop_map(|(k, v)| MixedOp::Merge(k, v)),
+        1 => Just(MixedOp::Flush),
+        3 => range.clone().prop_map(|(a, b)| MixedOp::Cache(a, b)),
+        1 => range.prop_map(|(a, b)| MixedOp::Uncache(a, b)),
+        1 => Just(MixedOp::Snapshot),
+        5 => (
+            proptest::option::of(0usize..8),
+            bound.clone(),
+            bound,
+            0usize..6,
+            proptest::option::of(k),
+        )
+            .prop_map(|(snapshot, start, end, before_seek, seek)| MixedOp::Scan {
+                snapshot,
+                start,
+                end,
+                before_seek,
+                seek,
+            }),
+    ]
+}
+
+/// Runs the same scan, seek included, through the cache and through the normal read path, and
+/// asserts that they agree row by row and on each error.
+async fn assert_scan_matches_normal<R: DbReadOps + Sync>(
+    reader: &R,
+    range: (Bound<Bytes>, Bound<Bytes>),
+    before_seek: usize,
+    seek: Option<Bytes>,
+) {
+    let cached = reader.scan(range.clone()).await;
+    let normal = reader
+        .scan_with_options(range.clone(), &normal_scan())
+        .await;
+    let (mut cached, mut normal) = match (cached, normal) {
+        (Ok(c), Ok(n)) => (c, n),
+        (c, n) => {
+            assert_eq!(c.is_ok(), n.is_ok(), "{range:?}");
+            return;
+        }
+    };
+    for _ in 0..before_seek {
+        assert_eq!(
+            cached.next().await.unwrap(),
+            normal.next().await.unwrap(),
+            "{range:?}"
+        );
+    }
+    if let Some(target) = seek {
+        let c = cached.seek(&target).await;
+        let n = normal.seek(&target).await;
+        assert_eq!(c.is_ok(), n.is_ok(), "seek {target:?} in {range:?}");
+        if c.is_err() {
+            return;
+        }
+    }
+    assert_eq!(collect(cached).await, collect(normal).await, "{range:?}");
+}
+
+async fn run_mixed(ops: Vec<MixedOp>) -> (i64, i64) {
+    let t = open(|o| {
+        o.tuning.min_rebuild_delta_bytes = 64;
+        o.tuning.page_size = 512;
+        o.max_disk_bytes = 4096;
+    })
+    .await;
+    let db = &t.db;
+    let mut snapshots = Vec::new();
+    for op in ops {
+        match op {
+            MixedOp::Put(k, v) => {
+                db.put(model_key(k), [v]).await.unwrap();
+            }
+            MixedOp::Delete(k) => {
+                db.delete(model_key(k)).await.unwrap();
+            }
+            MixedOp::Merge(k, v) => {
+                db.merge(model_key(k), [v]).await.unwrap();
+            }
+            MixedOp::Flush => flush_memtable(db).await,
+            MixedOp::Cache(a, b) => {
+                let _ = db.cache_range(model_key(a)..model_key(b)).await;
+            }
+            MixedOp::Uncache(a, b) => db.uncache_range(model_key(a)..model_key(b)).unwrap(),
+            MixedOp::Snapshot => snapshots.push(db.snapshot().unwrap()),
+            MixedOp::Scan {
+                snapshot,
+                start,
+                end,
+                before_seek,
+                seek,
+            } => {
+                let start = start.map(model_key);
+                let end = end.map(model_key);
+                // An empty range is an error on both paths; skip it.
+                let empty = match (&start, &end) {
+                    (Included(s), Included(e)) => s > e,
+                    (Included(s) | Excluded(s), Excluded(e)) | (Excluded(s), Included(e)) => s >= e,
+                    _ => false,
+                };
+                if empty {
+                    continue;
+                }
+                let range = (start, end);
+                let seek = seek.map(model_key);
+                match snapshot.filter(|_| !snapshots.is_empty()) {
+                    Some(i) => {
+                        let snapshot = &snapshots[i % snapshots.len()];
+                        assert_scan_matches_normal(snapshot.as_ref(), range, before_seek, seek)
+                            .await
+                    }
+                    None => assert_scan_matches_normal(db, range, before_seek, seek).await,
+                }
+            }
+        }
+    }
+    let counts = (
+        t.metric(MIXED_SCAN_COUNT, &[]),
+        t.metric(SCAN_GAP_COUNT, &[]),
+    );
+    db.close().await.unwrap();
+    counts
+}
+
+/// Random cached ranges and gaps, versions of every kind on both sides of their boundaries,
+/// scans at random bounds, at the latest state and in older snapshots, with seeks: each scan
+/// must equal the normal read path at the same sequence number, row by row.
+#[test]
+fn should_match_the_normal_path_across_cached_ranges_and_gaps() {
+    let runtime = Runtime::new().unwrap();
+    let mut runner = TestRunner::new(Config {
+        cases: 64,
+        ..Config::default()
+    });
+    let mixed = std::sync::atomic::AtomicI64::new(0);
+    let gaps = std::sync::atomic::AtomicI64::new(0);
+    runner
+        .run(&proptest::collection::vec(mixed_op(), 1..150), |ops| {
+            let (m, g) = runtime.block_on(run_mixed(ops));
+            mixed.fetch_add(m, std::sync::atomic::Ordering::Relaxed);
+            gaps.fetch_add(g, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap();
+    // The cases exercised mixed scans and opened gaps.
+    assert!(mixed.into_inner() > 0);
+    assert!(gaps.into_inner() > 0);
+}
+
+/// Opens a database with keys `key(0..300)` and cached ranges over `key(50..100)` and
+/// `key(150..200)`.
+async fn open_with_two_ranges() -> TestDb {
+    let t = open(|_| {}).await;
+    for i in 0..300 {
+        t.db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    for i in (0..300).step_by(11) {
+        t.db.merge(key(i), "+m").await.unwrap();
+    }
+    t.db.cache_range(key(50)..key(100)).await.unwrap();
+    t.db.cache_range(key(150)..key(200)).await.unwrap();
+    t
+}
+
+/// The counters that tell a mixed scan from a fully cached one.
+fn scan_counts(t: &TestDb) -> (i64, i64, i64) {
+    (
+        t.metric(SCAN_COUNT, &[]),
+        t.metric(MIXED_SCAN_COUNT, &[]),
+        t.metric(SCAN_GAP_COUNT, &[]),
+    )
+}
+
+fn range_of(a: usize, b: usize) -> (Bound<Bytes>, Bound<Bytes>) {
+    (Included(key(a)), Excluded(key(b)))
+}
+
+#[tokio::test]
+async fn should_scan_across_cached_ranges_and_gaps() {
+    let t = open_with_two_ranges().await;
+    let db = &t.db;
+    mixed_writes(db, 300, 1).await;
+    let snapshot = db.snapshot().unwrap();
+    // (scan range, expected gaps): starts cached and leaves; starts uncached and enters;
+    // crosses both ranges and the gap between them; ends in a gap.
+    let cases = [
+        (range_of(60, 120), 1),
+        (range_of(20, 80), 1),
+        (range_of(20, 250), 3),
+        (range_of(60, 180), 1),
+        ((Included(key(160)), Unbounded), 1),
+        ((Unbounded, Excluded(key(70))), 1),
+    ];
+    for (range, gaps) in cases {
+        let before = scan_counts(&t);
+        assert_eq!(
+            collect(db.scan(range.clone()).await.unwrap()).await,
+            normal_scan_of(snapshot.as_ref(), range.clone()).await,
+            "{range:?}"
+        );
+        let after = scan_counts(&t);
+        assert_eq!(after.0, before.0, "{range:?} is not fully cached");
+        assert_eq!(after.1, before.1 + 1, "{range:?} is a mixed scan");
+        assert_eq!(after.2, before.2 + gaps, "{range:?} gaps");
+    }
+    // A scan that cached ranges hold completely stays on the fully cached path.
+    let before = scan_counts(&t);
+    collect(db.scan(range_of(60, 90)).await.unwrap()).await;
+    assert_eq!(scan_counts(&t), (before.0 + 1, before.1, before.2));
+    // A scan that no cached range touches uses the normal path.
+    collect(db.scan(range_of(0, 40)).await.unwrap()).await;
+    assert_eq!(scan_counts(&t), (before.0 + 1, before.1, before.2));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_not_open_gaps_that_a_scan_does_not_reach() {
+    let t = open_with_two_ranges().await;
+    let db = &t.db;
+    let before = scan_counts(&t);
+    // A limit that ends inside the first cached part.
+    let mut iter = db.scan(range_of(60, 250)).await.unwrap();
+    for i in 60..70 {
+        assert_eq!(iter.next().await.unwrap().unwrap().key, key(i));
+    }
+    let mut rows = Vec::new();
+    assert_eq!(iter.next_batch(&mut rows, 20).await.unwrap(), 20);
+    drop(iter);
+    assert_eq!(scan_counts(&t), (before.0, before.1 + 1, before.2));
+    // A seek across a gap into the next cached part skips the gap without opening it.
+    let mut iter = db.scan(range_of(60, 250)).await.unwrap();
+    assert_eq!(iter.next().await.unwrap().unwrap().key, key(60));
+    iter.seek(key(160)).await.unwrap();
+    assert_eq!(iter.next().await.unwrap().unwrap().key, key(160));
+    assert_eq!(scan_counts(&t), (before.0, before.1 + 2, before.2));
+    // Reading on reaches the gap after the second range.
+    let rest = collect(iter).await;
+    assert_eq!(rest.last().unwrap().key, key(249));
+    assert_eq!(scan_counts(&t), (before.0, before.1 + 2, before.2 + 1));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_seek_across_the_parts_of_a_mixed_scan() {
+    let t = open_with_two_ranges().await;
+    let db = &t.db;
+    db.delete(key(155)).await.unwrap();
+    db.merge(key(120), "+late").await.unwrap();
+    let snapshot = db.snapshot().unwrap();
+    let range = range_of(40, 260);
+    // Seeks within a gap, from a gap into a cached part, within a cached part, from a cached
+    // part into a gap, to a deleted key, and past the end.
+    let targets = [45, 52, 100, 120, 155, 157, 199, 240, 259];
+    let mut cached = db.scan(range.clone()).await.unwrap();
+    let mut normal = snapshot
+        .scan_with_options(range.clone(), &normal_scan())
+        .await
+        .unwrap();
+    for target in targets {
+        cached.seek(key(target)).await.unwrap();
+        normal.seek(key(target)).await.unwrap();
+        assert_eq!(
+            cached.next().await.unwrap(),
+            normal.next().await.unwrap(),
+            "after seek to {target}"
+        );
+    }
+    assert_eq!(collect(cached).await, collect(normal).await);
+    // Errors match too.
+    let mut cached = db.scan(range.clone()).await.unwrap();
+    cached.seek(key(170)).await.unwrap();
+    cached.next().await.unwrap();
+    assert!(cached.seek(key(60)).await.is_err());
+    assert!(cached.seek(key(270)).await.is_err());
+    db.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_keep_a_mixed_scan_at_one_state_while_the_cache_changes() {
+    for page_source in page_sources() {
+        let t = open(|o| {
+            o.page_source = page_source;
+            o.tuning.min_rebuild_delta_bytes = 2048;
+            // A file of 50 rows takes one page of 4096 bytes and a little more, so the budget
+            // holds two ranges. See `should_evict_the_least_recently_read_range`.
+            o.max_disk_bytes = 9000;
+        })
+        .await;
+        let db = &t.db;
+        for i in 0..300 {
+            db.put(key(i), value(i, 0)).await.unwrap();
+        }
+        db.cache_range(key(50)..key(100)).await.unwrap();
+        db.cache_range(key(150)..key(200)).await.unwrap();
+        mixed_writes(db, 300, 1).await;
+        let snapshot = db.snapshot().unwrap();
+        let range = range_of(0, 300);
+        let mut iter = db.scan(range.clone()).await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..30 {
+            got.extend(iter.next().await.unwrap());
+        }
+        // While the scan is open: writes, a rebuild, a load that fills the gap ahead of the
+        // scan, and an eviction of a range ahead of it.
+        let mut round = 2;
+        while t.metric(REBUILD_COUNT, &[]) == 0 {
+            mixed_writes(db, 300, round).await;
+            round += 1;
+            wait_for(|| db.cached_ranges().iter().all(|r| !r.rebuilding)).await;
+        }
+        db.cache_range(key(100)..key(150)).await.unwrap();
+        db.cache_range(key(220)..key(270)).await.unwrap();
+        assert!(t.metric(REMOVE_COUNT, &[("reason", "evicted")]) >= 1);
+        mixed_writes(db, 300, round).await;
+        got.extend(collect(iter).await);
+        assert_eq!(
+            got,
+            normal_scan_of(snapshot.as_ref(), range.clone()).await,
+            "page source {page_source:?}"
+        );
+        // A new scan sees the new state.
+        assert_matches_snapshot(db, [], range).await;
+        db.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn should_scan_across_parts_in_snapshots_and_transactions() {
+    let t = open(|_| {}).await;
+    let db = &t.db;
+    for i in 0..300 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    // A snapshot from before the loads.
+    let old = db.snapshot().unwrap();
+    db.merge(key(70), "+m").await.unwrap();
+    db.cache_range(key(50)..key(100)).await.unwrap();
+    db.cache_range(key(150)..key(200)).await.unwrap();
+    mixed_writes(db, 300, 1).await;
+    let snapshot = db.snapshot().unwrap();
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    mixed_writes(db, 300, 2).await;
+    let range = range_of(20, 250);
+    for reader in [snapshot.as_ref(), old.as_ref()] {
+        assert_eq!(
+            collect(reader.scan(range.clone()).await.unwrap()).await,
+            normal_scan_of(reader, range.clone()).await
+        );
+    }
+    // The old snapshot predates the loads, so its scan uses the normal path.
+    let before = scan_counts(&t);
+    collect(old.scan(range.clone()).await.unwrap()).await;
+    assert_eq!(scan_counts(&t), before);
+    // A transaction without writes in the range uses the mixed scan.
+    txn.put(key(290), "own").unwrap();
+    let before = scan_counts(&t);
+    assert_eq!(
+        collect(txn.scan(range.clone()).await.unwrap()).await,
+        normal_scan_of(&txn, range.clone()).await
+    );
+    assert_eq!(scan_counts(&t).1, before.1 + 1);
+    // With a write in the range, the whole scan uses the normal path.
+    txn.put(key(120), "own").unwrap();
+    let before = scan_counts(&t);
+    let rows = collect(txn.scan(range.clone()).await.unwrap()).await;
+    assert_eq!(rows, normal_scan_of(&txn, range.clone()).await);
+    assert!(rows
+        .iter()
+        .any(|kv| kv.key == key(120) && kv.value == "own"));
+    assert_eq!(scan_counts(&t), before);
+    db.close().await.unwrap();
+}
+
+/// Mixed scans sample the gaps that they read, so a gap read often enough is promoted, and the
+/// same scan is then fully cached.
+#[tokio::test]
+async fn should_promote_the_gaps_of_mixed_scans() {
+    let (t, clock) = open_auto(|_| {}).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    db.cache_range(key(400)..key(500)).await.unwrap();
+    for _ in 0..60 {
+        // Starts cached, leaves into the gap at 500.
+        collect(db.scan(key(480)..key(520)).await.unwrap()).await;
+        tick(&clock, 200).await;
+        if holding(db, 500, 519).is_some() {
+            break;
+        }
+    }
+    assert!(holding(db, 500, 519).is_some(), "{:?}", db.cached_ranges());
+    assert!(t.metric(SCAN_GAP_COUNT, &[]) > 0);
+    let before = scan_counts(&t);
+    let rows = collect(db.scan(key(480)..key(520)).await.unwrap()).await;
+    assert_eq!(rows.len(), 40);
+    assert_eq!(scan_counts(&t), (before.0 + 1, before.1, before.2));
+    db.close().await.unwrap();
+}
+
+/// A fail point that pauses the thread that reaches it until the test lets it go. Each arrival
+/// sends on the returned receiver, then waits for one message on the returned sender.
+fn pause_at(
+    fp_registry: &Arc<FailPointRegistry>,
+    name: &str,
+) -> (Arrivals, std::sync::mpsc::SyncSender<()>) {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(16);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(16);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    fail_parallel::cfg_callback(fp_registry.clone(), name, move || {
+        let _ = arrived_tx.send(());
+        let _ = resume_rx.lock().unwrap().recv();
+    })
+    .unwrap();
+    (Arrivals(Some(arrived_rx)), resume_tx)
+}
+
+/// The arrivals at a fail point set up by [`pause_at`].
+struct Arrivals(Option<std::sync::mpsc::Receiver<()>>);
+
+impl Arrivals {
+    /// Waits, without blocking the runtime, until a thread reaches the fail point.
+    async fn next(&mut self) {
+        let rx = self.0.take().unwrap();
+        let rx = tokio::task::spawn_blocking(move || {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("the fail point was not reached");
+            rx
+        })
+        .await
+        .unwrap();
+        self.0 = Some(rx);
+    }
+}
+
+/// A mixed scan at the latest state must not read its gaps from a view that lacks the versions
+/// visible at its sequence number. The test pauses a scan after it loaded that number, then
+/// writes a newer version of a key in a gap and flushes the memtable: the flush keeps only the
+/// newest version, since no snapshot needs the older one. The scan must still return the
+/// version at its start or the newer one, never the version before (stale), nothing (missing),
+/// or a value under a tombstone (phantom).
+#[rstest::rstest]
+#[case::stale(false)]
+#[case::tombstone(true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_not_read_gaps_from_a_state_that_lost_the_scan_versions(#[case] delete: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let fp_registry = Arc::new(FailPointRegistry::new());
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let db = Db::builder("mixed_race", Arc::new(InMemory::new()))
+        .with_range_cache(options(dir.path()))
+        .with_fp_registry(fp_registry.clone())
+        .with_metrics_recorder(recorder.clone())
+        .build()
+        .await
+        .unwrap();
+    db.put(b"a1", b"cached").await.unwrap();
+    db.cache_range(&b"a"[..]..&b"b"[..]).await.unwrap();
+    // `c1` is in a gap. Its oldest version is in an L0 SST, the version at the scan's start in
+    // the memtable.
+    db.put(b"c1", b"v0").await.unwrap();
+    flush_memtable(&db).await;
+    if delete {
+        db.delete(b"c1").await.unwrap();
+    } else {
+        db.put(b"c1", b"v1").await.unwrap();
+    }
+
+    let (mut arrivals, resume) = pause_at(&fp_registry, "range-cache-mixed-pinned");
+    let scan = {
+        let db = db.clone();
+        tokio::spawn(async move { collect(db.scan(&b"a"[..]..&b"d"[..]).await.unwrap()).await })
+    };
+    arrivals.next().await;
+    // During the scan: a newer version, and a flush that drops the version at its start.
+    db.put(b"c1", b"v2").await.unwrap();
+    flush_memtable(&db).await;
+    fail_parallel::cfg(fp_registry.clone(), "range-cache-mixed-pinned", "off").unwrap();
+    resume.send(()).unwrap();
+    let rows = scan.await.unwrap();
+
+    let c1 = rows
+        .iter()
+        .find(|kv| kv.key == "c1")
+        .map(|kv| kv.value.clone());
+    let at_start = if delete {
+        None
+    } else {
+        Some(Bytes::from("v1"))
+    };
+    assert!(
+        c1 == at_start || c1 == Some(Bytes::from("v2")),
+        "c1 = {c1:?}, legal: {at_start:?} or v2"
+    );
+    assert_eq!(rows.first().unwrap().key, "a1");
+    assert_eq!(
+        lookup_metric(&recorder, MIXED_SCAN_COUNT).unwrap_or(0),
+        1,
+        "the scan was not mixed"
+    );
+    // The flush froze the memtable, so the scan planned itself again.
+    assert_eq!(
+        lookup_metric(&recorder, MIXED_SCAN_RETRY_COUNT).unwrap_or(0),
+        1
+    );
+    db.close().await.unwrap();
+}
+
+/// A mixed scan at the latest state that a memtable freeze interrupts at each attempt uses the
+/// normal read path, and still returns a legal answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_fall_back_when_freezes_keep_interrupting_a_mixed_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let fp_registry = Arc::new(FailPointRegistry::new());
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let db = Db::builder("mixed_retry", Arc::new(InMemory::new()))
+        .with_range_cache(options(dir.path()))
+        .with_fp_registry(fp_registry.clone())
+        .with_metrics_recorder(recorder.clone())
+        .build()
+        .await
+        .unwrap();
+    db.put(b"a1", b"cached").await.unwrap();
+    db.cache_range(&b"a"[..]..&b"b"[..]).await.unwrap();
+    db.put(b"c1", b"v0").await.unwrap();
+    flush_memtable(&db).await;
+    db.put(b"c1", b"v1").await.unwrap();
+
+    let (mut arrivals, resume) = pause_at(&fp_registry, "range-cache-mixed-pinned");
+    let scan = {
+        let db = db.clone();
+        tokio::spawn(async move { collect(db.scan(&b"a"[..]..&b"d"[..]).await.unwrap()).await })
+    };
+    // Each attempt pauses after it loaded its sequence number. A write and a flush then freeze
+    // the memtable under it.
+    for round in 2..5 {
+        arrivals.next().await;
+        db.put(b"c1", format!("v{round}")).await.unwrap();
+        flush_memtable(&db).await;
+        resume.send(()).unwrap();
+    }
+    let rows = scan.await.unwrap();
+    fail_parallel::cfg(fp_registry.clone(), "range-cache-mixed-pinned", "off").unwrap();
+    let c1 = rows.iter().find(|kv| kv.key == "c1").unwrap().value.clone();
+    // The scan started when `v1` was the latest version, and `v4` was written last.
+    assert!(
+        ["v1", "v2", "v3", "v4"].iter().any(|v| c1 == *v),
+        "c1 = {c1:?}"
+    );
+    assert_eq!(rows.first().unwrap().key, "a1");
+    assert_eq!(
+        lookup_metric(&recorder, MIXED_SCAN_RETRY_COUNT).unwrap_or(0),
+        3
+    );
+    assert_eq!(lookup_metric(&recorder, MIXED_SCAN_COUNT).unwrap_or(0), 0);
+    // The normal path served it.
+    assert_eq!(lookup_metric(&recorder, SCAN_COUNT).unwrap_or(0), 0);
+    db.close().await.unwrap();
 }
 
 // Automatic promotion (stage 2).
