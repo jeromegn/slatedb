@@ -228,35 +228,17 @@ impl DbInner {
         self.check_closed()?;
         // A normal-path read that the cache could have served, sampled for automatic promotion.
         #[cfg(feature = "range_cache")]
-        let mut sample = None;
-        #[cfg(feature = "range_cache")]
-        if let Some(range_cache) = &self.range_cache {
-            if crate::range_cache::can_serve_get(options) {
-                use crate::range_cache::CacheRead;
-                match range_cache.get(key.as_ref(), self.oracle.as_ref()) {
-                    CacheRead::Uncovered => sample = range_cache.sample(),
-                    CacheRead::Answer(kv) => {
-                        self.db_stats.get_requests.increment(1);
-                        return Ok(kv);
-                    }
-                    CacheRead::Resolve(pinned) => {
-                        self.db_stats.get_requests.increment(1);
-                        return pinned
-                            .get(key.as_ref(), self.reader.read_merge_operator.clone())
-                            .await;
-                    }
-                }
-            }
-        }
+        let sample = match self.range_cache_get(key.as_ref(), options, None).await {
+            crate::range_cache::GetRoute::Served(result) => return result,
+            crate::range_cache::GetRoute::Normal(sample) => sample,
+        };
         let db_state = self.state.read().view();
         let result = self
             .reader
             .get_key_value_with_options(key.as_ref(), options, &db_state, None, None)
             .await;
         #[cfg(feature = "range_cache")]
-        if let (Some(range_cache), Some(sample)) = (&self.range_cache, sample) {
-            range_cache.record(sample, key.as_ref());
-        }
+        self.range_cache_record(sample);
         result
     }
 
@@ -273,21 +255,10 @@ impl DbInner {
         // A normal-path scan that the cache could have served, sampled for automatic
         // promotion, with its start key.
         #[cfg(feature = "range_cache")]
-        let mut sample = None;
-        #[cfg(feature = "range_cache")]
-        if let Some(range_cache) = &self.range_cache {
-            if crate::range_cache::can_serve_scan(options) {
-                if let Some(pinned) = range_cache.pin_scan(&range, self.oracle.as_ref()) {
-                    self.db_stats.scan_requests.increment(1);
-                    return pinned
-                        .scan(range, self.reader.read_merge_operator.clone())
-                        .await;
-                }
-                sample = range_cache
-                    .sample()
-                    .map(|sample| (sample, crate::range_cache::scan_start(&range)));
-            }
-        }
+        let (range, sample) = match self.range_cache_scan(range, options, None).await {
+            crate::range_cache::ScanRoute::Served(result) => return result,
+            crate::range_cache::ScanRoute::Normal(range, sample) => (range, sample),
+        };
         let db_state = self.state.read().view();
         let result = self
             .reader
@@ -303,9 +274,7 @@ impl DbInner {
             )
             .await;
         #[cfg(feature = "range_cache")]
-        if let (Some(range_cache), Some((sample, start))) = (&self.range_cache, sample) {
-            range_cache.record(sample, &start);
-        }
+        self.range_cache_record(sample);
         result
     }
 

@@ -433,6 +433,16 @@ mod tests {
         )
     }
 
+    /// A version as the writer makes it: every write has a create time, from a clock that
+    /// does not go back. A merge result takes the newest create time of its versions, so with
+    /// such times a tombstone under a merge operand never changes the result. The file drops
+    /// tombstones, as compaction does, so the history test depends on this.
+    fn history_entry(k: u8, kind: Kind, seq: u64) -> RowEntry {
+        let mut entry = entry(k, kind, seq);
+        entry.create_ts = Some(seq as i64);
+        entry
+    }
+
     fn kind() -> impl Strategy<Value = Kind> {
         prop_oneof![4 => Just(Kind::Value), 2 => Just(Kind::Tombstone), 2 => Just(Kind::Merge)]
     }
@@ -588,6 +598,138 @@ mod tests {
                     assert_eq!(got_seek.is_ok(), allowed);
                 }
                 assert_eq!(drain(&mut actual, usize::MAX).await, drain(&mut expected, usize::MAX).await);
+            });
+        }
+
+        /// Cached reads at any sequence number from the file's to the newest return the state
+        /// of the whole history at that number, as the normal path over all versions would.
+        ///
+        /// The history is one table of all versions. The file holds its state at `FILE_SEQ`,
+        /// written the way a load or a rebuild writes it. The deltas hold the versions after
+        /// the file, split at `FROZEN_MAX_SEQ` when there is a frozen delta. Unlike the test
+        /// above, which reads the same layers both ways, the expected answer here does not
+        /// come from the layers.
+        #[test]
+        fn should_match_the_history_at_any_read_seq(
+            history in proptest::collection::vec((0u8..24, kind(), 1..=ACTIVE_MAX_SEQ), 0..120),
+            with_frozen in any::<bool>(),
+            seq in FILE_SEQ..=ACTIVE_MAX_SEQ,
+            start in bound(),
+            end in bound(),
+            mmap in any::<bool>(),
+        ) {
+            let range = BytesRange::try_new(start.map(key), end.map(key));
+            prop_assume!(range.is_some());
+            let range = range.unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let page_source = if mmap {
+                    RangeCachePageSource::Mmap
+                } else {
+                    RangeCachePageSource::PositionalRead
+                };
+                let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+                // One version per key and sequence number, as the writer applies them.
+                let history: BTreeMap<(u8, u64), Kind> =
+                    history.into_iter().map(|(k, kind, seq)| ((k, seq), kind)).collect();
+                let all = Delta::new();
+                for ((k, seq), kind) in &history {
+                    all.table.put(history_entry(*k, *kind, *seq));
+                }
+                let all = Arc::new(Layers {
+                    active: Arc::new(all),
+                    frozen: None,
+                    file: None,
+                    file_seq: 0,
+                    end: None,
+                });
+
+                // The file: the state at `FILE_SEQ`, through the normal iterator stack.
+                let mut writer = RangeFileWriter::create(dir.path(), "f", 512).unwrap();
+                let mut rows = crate::range_cache::stack_iterator(
+                    &all,
+                    FILE_SEQ,
+                    BytesRange::unbounded(),
+                    Some(merge.clone()),
+                )
+                .await
+                .unwrap();
+                while let Some(row) = rows.next_entry().await.unwrap() {
+                    writer.push(&row).unwrap();
+                }
+                let path = writer.finish().unwrap();
+                let file = RangeFile::open(path, page_source, Arc::new(AtomicU64::new(0))).unwrap();
+                let delta = |low: u64, high: u64| {
+                    let delta = Delta::new();
+                    for ((k, seq), kind) in &history {
+                        if *seq > low && *seq <= high {
+                            delta.table.put(history_entry(*k, *kind, *seq));
+                        }
+                    }
+                    Arc::new(delta)
+                };
+                let (active, frozen) = if with_frozen {
+                    (
+                        delta(FROZEN_MAX_SEQ, ACTIVE_MAX_SEQ),
+                        Some(delta(FILE_SEQ, FROZEN_MAX_SEQ)),
+                    )
+                } else {
+                    (delta(FILE_SEQ, ACTIVE_MAX_SEQ), None)
+                };
+                let layers = Arc::new(Layers {
+                    active,
+                    frozen,
+                    file: Some(Arc::new(file)),
+                    file_seq: FILE_SEQ,
+                    end: None,
+                });
+
+                // Scans. Compare what a caller sees. The entry kinds can differ: the file drops
+                // tombstones, so a merge over a tombstone in the history is a merge over nothing
+                // in the cache, which the stack returns as a merge operand with the same bytes.
+                let visible = |rows: Vec<RowEntry>| {
+                    rows.into_iter().map(crate::types::KeyValue::from).collect::<Vec<_>>()
+                };
+                let mut expected =
+                    crate::range_cache::stack_iterator(&all, seq, range.clone(), Some(merge.clone()))
+                        .await
+                        .unwrap();
+                let scan = CachedScan::new(vec![layers.clone()], seq, &range, Some(merge.clone())).unwrap();
+                let mut actual = DbIterator::new_resolved(range.clone(), Box::new(scan), ReadTrace::none())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    visible(drain(&mut actual, usize::MAX).await),
+                    visible(drain(&mut expected, usize::MAX).await)
+                );
+
+                // Point reads, as `RangeCache::get` and `Pinned::get` answer them.
+                for k in 0u8..24 {
+                    let point = BytesRange::new(Included(key(k)), Included(key(k)));
+                    let want = crate::range_cache::stack_iterator(&all, seq, point, Some(merge.clone()))
+                        .await
+                        .unwrap()
+                        .next_entry()
+                        .await
+                        .unwrap()
+                        .map(crate::types::KeyValue::from);
+                    let got = match crate::range_cache::lookup(&layers, &key(k), seq).unwrap() {
+                        Some(entry) => match entry.value {
+                            ValueDeletable::Value(_) => Some(crate::types::KeyValue::from(entry)),
+                            ValueDeletable::Tombstone => None,
+                            ValueDeletable::Merge(_) => crate::range_cache::Pinned {
+                                layers: layers.clone(),
+                                seq,
+                            }
+                            .get(&key(k), Some(merge.clone()))
+                            .await
+                            .unwrap(),
+                        },
+                        None => None,
+                    };
+                    assert_eq!(got, want, "key {k} at {seq}");
+                }
             });
         }
     }

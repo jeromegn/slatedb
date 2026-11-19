@@ -12,17 +12,19 @@
 //! - The batch writer applies each write to the deltas after it puts the write in the memtable
 //!   and before it advances the last committed sequence number. Reads at the latest committed
 //!   state read the deltas with that sequence number as the bound, so a write becomes visible
-//!   in the cache and in the memtable at the same time.
+//!   in the cache and in the memtable at the same time. Reads in a snapshot or a transaction
+//!   use the snapshot's sequence number as the bound instead: deltas keep every version.
 //! - All changes to the set of ranges and to the layers of a range happen under one mutex. The
 //!   batch writer takes the same mutex when it applies a write to a non-empty cache. Reads take
 //!   no lock.
 //!
 //! # Sequence number rules
 //!
-//! A read loads the layers of a range, then the last committed sequence number `seq`. It uses
-//! the layers only if both rules hold:
+//! A read loads the layers of a range, then the last committed sequence number. Its sequence
+//! number `seq` is that number, or for a read in a snapshot or a transaction, the smaller of
+//! that number and the snapshot's. It uses the layers only if both rules hold:
 //!
-//! - `seq >= layers.file_seq`. The file holds the state at `file_seq`.
+//! - `seq >= layers.file_seq`. The file holds the state at `file_seq`, without older versions.
 //! - `seq <= layers.active.sealed_at`. When the cache stops applying writes to a delta (a
 //!   freeze or a removal), it seals the delta at the last sequence number that it applied.
 //!   The delta then holds every version up to that number and none after it.
@@ -1101,11 +1103,12 @@ impl RangeCache {
         }
     }
 
-    /// Reads `key` at the last committed sequence number.
+    /// Reads `key` at the last committed sequence number, or at `at` for a read in a snapshot
+    /// or a transaction (see [`read_seq`]).
     ///
     /// The common path holds the index and the layers through `arc_swap` guards and takes no
     /// reference count, so concurrent reads of one range do not write a shared cache line.
-    pub(crate) fn get(&self, key: &[u8], oracle: &dyn Oracle) -> CacheRead {
+    pub(crate) fn get(&self, key: &[u8], oracle: &dyn Oracle, at: Option<u64>) -> CacheRead {
         for _ in 0..PIN_ATTEMPTS {
             let index = self.index.load();
             let Some(cached) = covering(&index, key) else {
@@ -1115,7 +1118,7 @@ impl RangeCache {
             if layers.file.is_none() {
                 return CacheRead::Uncovered;
             }
-            let seq = oracle.last_committed_seq();
+            let seq = read_seq(oracle, at);
             if !Self::usable(&layers, seq) {
                 continue;
             }
@@ -1152,14 +1155,34 @@ impl RangeCache {
                 }
             };
         }
-        CacheRead::Uncovered
+        CacheRead::Unusable
     }
 
-    /// Pins the layers for a scan of `range` at the last committed sequence number, if ready
-    /// cached ranges hold all of `range`. The ranges can be adjacent ranges, each starting where
-    /// the one before ends. All of them must follow the sequence number rules at the same
-    /// sequence number.
-    pub(crate) fn pin_scan(&self, range: &BytesRange, oracle: &dyn Oracle) -> Option<PinnedScan> {
+    /// Pins the layers for a scan of `range` at the last committed sequence number, or at `at`
+    /// (see [`read_seq`]), if ready cached ranges hold all of `range`. The ranges can be
+    /// adjacent ranges, each starting where the one before ends. All of them must follow the
+    /// sequence number rules at the same sequence number.
+    pub(crate) fn pin_scan(
+        &self,
+        range: &BytesRange,
+        oracle: &dyn Oracle,
+        at: Option<u64>,
+    ) -> ScanPin {
+        match self.try_pin_scan(range, oracle, at) {
+            Some(Ok(pinned)) => ScanPin::Pinned(pinned),
+            Some(Err(())) => ScanPin::Unusable,
+            None => ScanPin::Uncovered,
+        }
+    }
+
+    /// See [`RangeCache::pin_scan`]. Returns `None` if ready ranges do not hold all of `range`,
+    /// and `Some(Err(()))` if they do but fail the sequence number rules.
+    fn try_pin_scan(
+        &self,
+        range: &BytesRange,
+        oracle: &dyn Oracle,
+        at: Option<u64>,
+    ) -> Option<Result<PinnedScan, ()>> {
         if self.index.load().is_empty() {
             return None;
         }
@@ -1186,16 +1209,16 @@ impl RangeCache {
             if parts.iter().any(|l| l.file.is_none()) {
                 return None;
             }
-            let seq = oracle.last_committed_seq();
+            let seq = read_seq(oracle, at);
             if !parts.iter().all(|l| Self::usable(l, seq)) {
                 continue;
             }
             // Only the first range counts as read: most scans end in it.
             self.touch(first);
             self.stats.scans.increment(1);
-            return Some(PinnedScan { parts, seq });
+            return Some(Ok(PinnedScan { parts, seq }));
         }
-        None
+        Some(Err(()))
     }
 
     pub(crate) fn ranges(&self) -> Vec<CachedRangeInfo> {
@@ -1473,11 +1496,29 @@ impl RangeCache {
     }
 }
 
+/// The sequence number of a read: the last committed sequence number, or `at` for a read in a
+/// snapshot or a transaction. The caller loads it after it pins the layers.
+///
+/// Like the normal read path (see `Reader::prepare_max_seq`), a read at `at` never reads above
+/// the last committed sequence number. `Db::snapshot` and `Db::begin` take `at` from the last
+/// committed sequence number, so `at` is already committed for them. Only the snapshot of a
+/// load can be above it, and a load reads through the normal path. The bound keeps the rules
+/// of the RFC true for any `at`: every write at or below the read's sequence number is in a
+/// delta or a file.
+fn read_seq(oracle: &dyn Oracle, at: Option<u64>) -> u64 {
+    let committed = oracle.last_committed_seq();
+    at.map_or(committed, |at| at.min(committed))
+}
+
 /// The result of [`RangeCache::get`].
 pub(crate) enum CacheRead {
     /// No ready range holds the key, or the cache cannot answer now.
     Uncovered,
-    /// The value of the key at the last committed sequence number.
+    /// A ready range holds the key, but its layers failed the sequence number rules at each
+    /// attempt. For a read in a snapshot, the file can be newer than the snapshot. Use the
+    /// normal read path, and do not sample the read: a cached range holds it.
+    Unusable,
+    /// The value of the key at the read's sequence number.
     Answer(Option<KeyValue>),
     /// The newest version of the key is a merge operand. Use [`Pinned::get`] to resolve it.
     Resolve(Pinned),
@@ -1501,6 +1542,17 @@ impl Pinned {
         let mut iter = stack_iterator(&self.layers, self.seq, point, merge_operator).await?;
         Ok(iter.next_entry().await?.map(KeyValue::from))
     }
+}
+
+/// The result of [`RangeCache::pin_scan`].
+pub(crate) enum ScanPin {
+    /// Pinned layers that serve the scan.
+    Pinned(PinnedScan),
+    /// Ready ranges do not hold all of the scan range.
+    Uncovered,
+    /// Ready ranges hold the scan range, but failed the sequence number rules. See
+    /// [`CacheRead::Unusable`].
+    Unusable,
 }
 
 /// The layers of the adjacent cached ranges that hold a scan range, pinned at one sequence
@@ -1582,15 +1634,18 @@ async fn stack_iterator(
 }
 
 /// Returns the first key that a scan of `range` can return, for sampling.
-pub(crate) fn scan_start(range: &BytesRange) -> Bytes {
+fn scan_start(range: &BytesRange) -> Bytes {
     match RangeBounds::start_bound(range) {
         Included(key) | Excluded(key) => key.clone(),
         Unbounded => Bytes::new(),
     }
 }
 
-/// Returns true if a point read with `options` reads the latest committed state, which the
-/// cache can serve.
+/// Returns true if a point read with `options` reads committed state, at the latest committed
+/// sequence number or at a snapshot's, which the cache can serve.
+///
+/// The cache never serves a read with a tracing option. Tests rely on this to force the normal
+/// read path at a snapshot's sequence number, so keep it so or give tests another way.
 pub(crate) fn can_serve_get(options: &ReadOptions) -> bool {
     matches!(options.durability_filter, DurabilityLevel::Memory)
         && !options.dirty
@@ -1598,8 +1653,8 @@ pub(crate) fn can_serve_get(options: &ReadOptions) -> bool {
         && options.tracing_options.is_none()
 }
 
-/// Returns true if a scan with `options` reads the latest committed state in ascending order,
-/// which the cache can serve.
+/// Returns true if a scan with `options` reads committed state in ascending order, which the
+/// cache can serve. See [`can_serve_get`].
 pub(crate) fn can_serve_scan(options: &ScanOptions) -> bool {
     matches!(options.durability_filter, DurabilityLevel::Memory)
         && !options.dirty
@@ -1608,7 +1663,107 @@ pub(crate) fn can_serve_scan(options: &ScanOptions) -> bool {
         && options.tracing_options.is_none()
 }
 
+/// A normal-path read that automatic promotion sampled, with its key: the key of a point read
+/// or the first key of a scan. Pass it to [`DbInner::range_cache_record`] after the read.
+pub(crate) struct SampledRead {
+    sample: ReadSample,
+    key: Bytes,
+}
+
+/// Where a point read goes. See [`DbInner::range_cache_get`].
+pub(crate) enum GetRoute {
+    /// The range cache served the read.
+    Served(Result<Option<KeyValue>, SlateDBError>),
+    /// Use the normal read path.
+    Normal(Option<SampledRead>),
+}
+
+/// Where a scan goes. See [`DbInner::range_cache_scan`].
+pub(crate) enum ScanRoute {
+    /// The range cache serves the scan.
+    Served(Result<DbIterator, SlateDBError>),
+    /// Use the normal read path for this range.
+    Normal(BytesRange, Option<SampledRead>),
+}
+
 impl DbInner {
+    /// Serves a point read of `key` from the range cache if it can. `at` is the sequence number
+    /// of a snapshot or a transaction, or `None` for a read at the latest committed state. A
+    /// read that no cached range holds may be sampled for automatic promotion.
+    pub(crate) async fn range_cache_get(
+        &self,
+        key: &[u8],
+        options: &ReadOptions,
+        at: Option<u64>,
+    ) -> GetRoute {
+        let Some(cache) = &self.range_cache else {
+            return GetRoute::Normal(None);
+        };
+        if !can_serve_get(options) {
+            return GetRoute::Normal(None);
+        }
+        match cache.get(key, self.oracle.as_ref(), at) {
+            CacheRead::Uncovered => GetRoute::Normal(cache.sample().map(|sample| SampledRead {
+                sample,
+                key: Bytes::copy_from_slice(key),
+            })),
+            CacheRead::Unusable => GetRoute::Normal(None),
+            CacheRead::Answer(kv) => {
+                self.db_stats.get_requests.increment(1);
+                GetRoute::Served(Ok(kv))
+            }
+            CacheRead::Resolve(pinned) => {
+                self.db_stats.get_requests.increment(1);
+                GetRoute::Served(
+                    pinned
+                        .get(key, self.reader.read_merge_operator.clone())
+                        .await,
+                )
+            }
+        }
+    }
+
+    /// Serves a scan of `range` from the range cache if it can. See
+    /// [`DbInner::range_cache_get`].
+    pub(crate) async fn range_cache_scan(
+        &self,
+        range: BytesRange,
+        options: &ScanOptions,
+        at: Option<u64>,
+    ) -> ScanRoute {
+        let Some(cache) = &self.range_cache else {
+            return ScanRoute::Normal(range, None);
+        };
+        if !can_serve_scan(options) {
+            return ScanRoute::Normal(range, None);
+        }
+        match cache.pin_scan(&range, self.oracle.as_ref(), at) {
+            ScanPin::Pinned(pinned) => {
+                self.db_stats.scan_requests.increment(1);
+                ScanRoute::Served(
+                    pinned
+                        .scan(range, self.reader.read_merge_operator.clone())
+                        .await,
+                )
+            }
+            ScanPin::Uncovered => {
+                let sample = cache.sample().map(|sample| SampledRead {
+                    sample,
+                    key: scan_start(&range),
+                });
+                ScanRoute::Normal(range, sample)
+            }
+            ScanPin::Unusable => ScanRoute::Normal(range, None),
+        }
+    }
+
+    /// Records a sampled normal-path read, after the read.
+    pub(crate) fn range_cache_record(&self, sampled: Option<SampledRead>) {
+        if let (Some(cache), Some(sampled)) = (&self.range_cache, sampled) {
+            cache.record(sampled.sample, &sampled.key);
+        }
+    }
+
     /// Loads the parts of `range` that no cached range holds. See [`Db::cache_range`].
     async fn cache_range(self: &Arc<Self>, range: BytesRange) -> Result<(), SlateDBError> {
         self.cache_range_with(range, Origin::Explicit).await
@@ -1693,9 +1848,10 @@ impl Db {
     ///
     /// The call loads the parts of `range` that no cached range holds yet, from a snapshot of
     /// the database. Writes that happen during the load go to the new ranges, so no write is
-    /// lost. After the call returns, point reads and ascending scans at the latest committed
-    /// state read cached keys from local disk and memory. Other reads, such as reads in
-    /// snapshots and transactions, use the normal read path.
+    /// lost. After the call returns, point reads and ascending scans read cached keys from
+    /// local disk and memory: reads at the latest committed state, and reads in snapshots and
+    /// transactions that start after the load or the last rebuild of the range. Other reads,
+    /// such as dirty reads and reads in older snapshots, use the normal read path.
     ///
     /// ## Errors
     /// - [`crate::ErrorKind::Invalid`] if the database has no range cache, if the range holds

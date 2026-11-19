@@ -1,7 +1,9 @@
 //! Integration tests for the range cache (RFC 0040).
 //!
-//! Most tests compare reads that the range cache serves with reads through a snapshot. A
-//! snapshot read always uses the normal read path, so the two must agree.
+//! Most tests compare reads that the range cache serves with reads through a snapshot that use
+//! the normal read path. The cache serves snapshot reads too, so these reads carry a tracing
+//! option: the cache never serves a read with one, and a tracing option changes no result. See
+//! `normal_read` and `should_not_serve_traced_reads`.
 
 #![allow(clippy::disallowed_types, clippy::disallowed_methods)]
 
@@ -17,7 +19,8 @@ use proptest::test_runner::{Config, TestRunner};
 use slatedb::config::SizeTieredCompactionSchedulerOptions;
 use slatedb::config::{CompactionWorkerOptions, CompactorOptions, Settings};
 use slatedb::config::{
-    FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, Ttl, WriteOptions,
+    FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions, TracingOptions,
+    Ttl, WriteOptions,
 };
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
@@ -26,9 +29,9 @@ use slatedb::range_cache_stats::{
     REJECTION_COUNT, REMOVE_COUNT, SAMPLE_COUNT, SCAN_COUNT,
 };
 use slatedb::{
-    AutoPromoteOptions, CachedRangeInfo, Db, DbIterator, ErrorKind, IsolationLevel, IterationOrder,
-    KeyValue, MergeOperator, MergeOperatorError, RangeCacheOptions, RangeCachePageSource,
-    WriteBatch,
+    AutoPromoteOptions, CachedRangeInfo, Db, DbIterator, DbReadOps, ErrorKind, IsolationLevel,
+    IterationOrder, KeyValue, MergeOperator, MergeOperatorError, RangeCacheOptions,
+    RangeCachePageSource, WriteBatch,
 };
 use slatedb_common::clock::{MockSystemClock, SystemClock};
 use slatedb_common::metrics::{lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder};
@@ -133,7 +136,41 @@ async fn collect(mut iter: DbIterator) -> Vec<KeyValue> {
     out
 }
 
-/// Asserts that point reads of `keys` and a scan of `range` agree with a snapshot.
+/// Read options that make a read take the normal read path: the range cache never serves a
+/// read with a tracing option.
+fn normal_read() -> ReadOptions {
+    ReadOptions::default().with_tracing_options(Some(TracingOptions::new("normal-path")))
+}
+
+/// Scan options that make a scan take the normal read path. See [`normal_read`].
+fn normal_scan() -> ScanOptions {
+    ScanOptions::default().with_tracing_options(Some(TracingOptions::new("normal-path")))
+}
+
+/// Reads `key` in `reader` through the normal read path.
+async fn normal_get<R: DbReadOps + Sync>(reader: &R, key: &Bytes) -> Option<KeyValue> {
+    reader
+        .get_key_value_with_options(key, &normal_read())
+        .await
+        .unwrap()
+}
+
+/// Scans `range` in `reader` through the normal read path.
+async fn normal_scan_of<R: DbReadOps + Sync>(
+    reader: &R,
+    range: (Bound<Bytes>, Bound<Bytes>),
+) -> Vec<KeyValue> {
+    collect(
+        reader
+            .scan_with_options(range, &normal_scan())
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// Asserts that point reads of `keys` and a scan of `range` agree with the normal read path at
+/// a snapshot.
 async fn assert_matches_snapshot(
     db: &Db,
     keys: impl IntoIterator<Item = Bytes>,
@@ -143,13 +180,13 @@ async fn assert_matches_snapshot(
     for k in keys {
         assert_eq!(
             db.get_key_value(&k).await.unwrap(),
-            snapshot.get_key_value(&k).await.unwrap(),
+            normal_get(snapshot.as_ref(), &k).await,
             "key {k:?}"
         );
     }
     assert_eq!(
         collect(db.scan(range.clone()).await.unwrap()).await,
-        collect(snapshot.scan(range).await.unwrap()).await
+        normal_scan_of(snapshot.as_ref(), range).await
     );
 }
 
@@ -296,7 +333,7 @@ async fn should_serve_covered_scans_only() {
     let covered = (Included(key(20)), Excluded(key(40)));
     assert_eq!(
         collect(db.scan(covered.clone()).await.unwrap()).await,
-        collect(snapshot.scan(covered).await.unwrap()).await
+        normal_scan_of(snapshot.as_ref(), covered).await
     );
     assert_eq!(t.metric(SCAN_COUNT, &[]), 1);
 
@@ -404,7 +441,7 @@ async fn should_scan_across_adjacent_ranges() {
     db.delete(key(150)).await.unwrap();
     assert_eq!(
         collect(iter).await,
-        collect(snapshot.scan(key(90)..key(210)).await.unwrap()).await
+        normal_scan_of(snapshot.as_ref(), (Included(key(90)), Excluded(key(210)))).await
     );
     assert_eq!(t.metric(SCAN_COUNT, &[]), before + 3);
 
@@ -827,7 +864,9 @@ async fn should_not_lose_a_write_that_races_registration(
     );
     let snapshot = db.snapshot().unwrap();
     assert_eq!(
-        snapshot.get(b"a1").await.unwrap(),
+        normal_get(snapshot.as_ref(), &Bytes::from_static(b"a1"))
+            .await
+            .map(|kv| kv.value),
         Some(Bytes::from_static(b"new"))
     );
     assert_eq!(
@@ -924,7 +963,7 @@ async fn should_scan_one_state_while_writes_land() {
         while let Some(kv) = iter.next().await.unwrap() {
             got.push(kv);
         }
-        let want = collect(snapshot.scan(key(10)..key(290)).await.unwrap()).await;
+        let want = normal_scan_of(snapshot.as_ref(), (Included(key(10)), Excluded(key(290)))).await;
         assert_eq!(got, want, "page source {page_source:?}");
         // A new scan sees the new writes.
         assert_matches_snapshot(db, [], (Included(key(0)), Excluded(key(300)))).await;
@@ -981,7 +1020,7 @@ async fn should_scan_across_a_rebuild() {
         while let Some(kv) = iter.next().await.unwrap() {
             got.push(kv);
         }
-        let want = collect(snapshot.scan(key(0)..key(200)).await.unwrap()).await;
+        let want = normal_scan_of(snapshot.as_ref(), (Included(key(0)), Excluded(key(200)))).await;
         assert_eq!(got, want, "page source {page_source:?}");
         assert_matches_snapshot(&db, [], (Unbounded, Unbounded)).await;
         db.close().await.unwrap();
@@ -1004,7 +1043,10 @@ async fn should_seek_within_a_cached_scan() {
         let snapshot = db.snapshot().unwrap();
         let range = key(10)..key(90);
         let mut cached = db.scan(range.clone()).await.unwrap();
-        let mut normal = snapshot.scan(range).await.unwrap();
+        let mut normal = snapshot
+            .scan_with_options(range, &normal_scan())
+            .await
+            .unwrap();
         let scans = t.metric(SCAN_COUNT, &[]);
         assert!(scans > 0, "the cache did not serve the scan");
         let step = |a: Option<KeyValue>, b: Option<KeyValue>| assert_eq!(a, b);
@@ -1032,8 +1074,448 @@ async fn should_seek_within_a_cached_scan() {
     }
 }
 
-/// A merge operand that is in flight while a load registers its range must apply once.
-///
+// Reads in snapshots and transactions.
+
+/// The reads that the range cache served: point reads of each result, and scans.
+fn served(t: &TestDb) -> i64 {
+    ["hit", "absent", "merge"]
+        .iter()
+        .map(|r| t.metric(GET_COUNT, &[("result", r)]))
+        .sum::<i64>()
+        + t.metric(SCAN_COUNT, &[])
+}
+
+/// Asserts that the default reads of `keys` and a scan of `range` in `reader` agree with the
+/// normal read path in `reader`, and returns the reads that the cache served for them.
+async fn assert_reader_matches_normal<R: DbReadOps + Sync>(
+    t: &TestDb,
+    reader: &R,
+    keys: impl IntoIterator<Item = Bytes>,
+    range: (Bound<Bytes>, Bound<Bytes>),
+) -> i64 {
+    let before = served(t);
+    let mut normal_reads = Vec::new();
+    for k in keys {
+        let got = reader.get_key_value(&k).await.unwrap();
+        let served_now = served(t);
+        let want = normal_get(reader, &k).await;
+        normal_reads.push(served(t) - served_now);
+        assert_eq!(got, want, "key {k:?}");
+    }
+    let got = collect(reader.scan(range.clone()).await.unwrap()).await;
+    let served_now = served(t);
+    let want = normal_scan_of(reader, range).await;
+    normal_reads.push(served(t) - served_now);
+    assert_eq!(got, want);
+    assert!(
+        normal_reads.iter().all(|n| *n == 0),
+        "the cache served a read with a tracing option"
+    );
+    served(t) - before
+}
+
+#[tokio::test]
+async fn should_not_serve_traced_reads() {
+    let t = open(|_| {}).await;
+    let db = &t.db;
+    for i in 0..100 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    db.cache_range(..).await.unwrap();
+    let snapshot = db.snapshot().unwrap();
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    let range = (Included(key(10)), Excluded(key(90)));
+    let before = served(&t);
+    normal_get(db, &key(5)).await;
+    normal_get(snapshot.as_ref(), &key(5)).await;
+    normal_get(&txn, &key(5)).await;
+    normal_scan_of(db, range.clone()).await;
+    normal_scan_of(snapshot.as_ref(), range.clone()).await;
+    normal_scan_of(&txn, range.clone()).await;
+    assert_eq!(
+        served(&t),
+        before,
+        "the oracle of these tests uses the cache"
+    );
+    // The same reads without the tracing option are served.
+    db.get(key(5)).await.unwrap();
+    snapshot.get(key(5)).await.unwrap();
+    txn.get(key(5)).await.unwrap();
+    collect(db.scan(range.clone()).await.unwrap()).await;
+    collect(snapshot.scan(range.clone()).await.unwrap()).await;
+    collect(txn.scan(range).await.unwrap()).await;
+    assert_eq!(served(&t), before + 6);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_serve_snapshot_reads_from_the_cache() {
+    for page_source in page_sources() {
+        let t = open(|o| o.page_source = page_source).await;
+        let db = &t.db;
+        for i in 0..100 {
+            db.put(key(i), value(i, 0)).await.unwrap();
+        }
+        for i in (0..100).step_by(9) {
+            db.merge(key(i), "+m").await.unwrap();
+        }
+        flush_memtable(db).await;
+        db.cache_range(key(10)..key(90)).await.unwrap();
+        let mut snapshots = vec![db.snapshot().unwrap()];
+        // Puts, deletes and merge operands after each snapshot, in and out of the range.
+        for round in 1..5 {
+            mixed_writes(db, 100, round).await;
+            db.put(Bytes::from(format!("key{:05}a", 10 * round)), "new")
+                .await
+                .unwrap();
+            snapshots.push(db.snapshot().unwrap());
+        }
+        let keys: Vec<Bytes> = (0..100).map(key).collect();
+        for (i, snapshot) in snapshots.iter().enumerate() {
+            let merges = t.metric(GET_COUNT, &[("result", "merge")]);
+            let covered = (Included(key(10)), Excluded(key(90)));
+            let n =
+                assert_reader_matches_normal(&t, snapshot.as_ref(), keys.clone(), covered).await;
+            // 80 point reads in the range, and the scan.
+            assert_eq!(n, 81, "page source {page_source:?}");
+            // The file holds resolved values. Later snapshots read merge operands in the delta.
+            if i > 0 {
+                assert!(t.metric(GET_COUNT, &[("result", "merge")]) > merges);
+            }
+            // A scan that leaves the range uses the normal path.
+            let crossing = (Included(key(80)), Excluded(key(95)));
+            assert_eq!(
+                assert_reader_matches_normal(&t, snapshot.as_ref(), [], crossing).await,
+                0
+            );
+        }
+        // The oldest snapshot still reads the state before all writes.
+        assert_eq!(snapshots[0].get(key(20)).await.unwrap(), Some(value(20, 0)));
+        db.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn should_fall_back_for_a_snapshot_older_than_the_load() {
+    let t = open(|_| {}).await;
+    let db = &t.db;
+    for i in 0..100 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    let old = db.snapshot().unwrap();
+    mixed_writes(db, 100, 1).await;
+    db.cache_range(key(0)..key(100)).await.unwrap();
+    let keys: Vec<Bytes> = (0..100).map(key).collect();
+    let all = (Included(key(0)), Excluded(key(100)));
+    // The file holds a newer state than the snapshot, so the snapshot uses the normal path.
+    assert_eq!(
+        assert_reader_matches_normal(&t, old.as_ref(), keys.clone(), all.clone()).await,
+        0
+    );
+    assert_eq!(old.get(key(1)).await.unwrap(), Some(value(1, 0)));
+    // A snapshot after the load uses the cache.
+    let new = db.snapshot().unwrap();
+    assert_eq!(
+        assert_reader_matches_normal(&t, new.as_ref(), keys, all).await,
+        101
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_fall_back_for_a_snapshot_older_than_a_rebuild() {
+    let t = open(|o| {
+        o.tuning.min_rebuild_delta_bytes = 2048;
+        o.tuning.page_size = 512;
+    })
+    .await;
+    let db = &t.db;
+    for i in 0..200 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    db.cache_range(..).await.unwrap();
+    mixed_writes(db, 200, 1).await;
+    let old = db.snapshot().unwrap();
+    let keys: Vec<Bytes> = (0..200).map(key).collect();
+    let all = (Included(key(0)), Excluded(key(200)));
+    // Before the rebuild, the cache serves the snapshot.
+    assert_eq!(
+        assert_reader_matches_normal(&t, old.as_ref(), keys.clone(), all.clone()).await,
+        201
+    );
+    // An iterator opened before the rebuild keeps its layers.
+    let mut open_iter = old.scan(all.clone()).await.unwrap();
+    let first = open_iter.next().await.unwrap();
+    let mut round = 2;
+    while t.metric(REBUILD_COUNT, &[]) == 0 {
+        mixed_writes(db, 200, round).await;
+        round += 1;
+        wait_for(|| db.cached_ranges().iter().all(|r| !r.rebuilding)).await;
+    }
+    // The new file holds a state after the snapshot, so the snapshot uses the normal path.
+    assert_eq!(
+        assert_reader_matches_normal(&t, old.as_ref(), keys.clone(), all.clone()).await,
+        0
+    );
+    let mut rest: Vec<KeyValue> = first.into_iter().collect();
+    rest.extend(collect(open_iter).await);
+    assert_eq!(rest, normal_scan_of(old.as_ref(), all.clone()).await);
+    // A snapshot after the rebuild uses the cache.
+    let new = db.snapshot().unwrap();
+    assert_eq!(
+        assert_reader_matches_normal(&t, new.as_ref(), keys, all).await,
+        201
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_read_a_snapshot_while_its_range_is_removed() {
+    // The budget holds two ranges of 50 rows. See `should_evict_the_least_recently_read_range`.
+    let t = open(|o| {
+        o.tuning.page_size = 4096;
+        o.max_disk_bytes = 9000;
+    })
+    .await;
+    let db = &t.db;
+    for i in 0..300 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    db.cache_range(key(0)..key(50)).await.unwrap();
+    db.cache_range(key(100)..key(150)).await.unwrap();
+    mixed_writes(db, 300, 1).await;
+    let snapshot = db.snapshot().unwrap();
+    mixed_writes(db, 300, 2).await;
+    let first = (Included(key(0)), Excluded(key(50)));
+    let second = (Included(key(100)), Excluded(key(150)));
+    let mut first_iter = snapshot.scan(first.clone()).await.unwrap();
+    let mut second_iter = snapshot.scan(second.clone()).await.unwrap();
+    let mut first_rows = vec![first_iter.next().await.unwrap().unwrap()];
+    let mut second_rows = vec![second_iter.next().await.unwrap().unwrap()];
+    let scans = t.metric(SCAN_COUNT, &[]);
+
+    // An explicit removal of the first range, and an eviction of the second one.
+    db.uncache_range(key(0)..key(50)).unwrap();
+    db.get(key(120)).await.unwrap();
+    db.cache_range(key(200)..key(250)).await.unwrap();
+    db.cache_range(key(250)..key(300)).await.unwrap();
+    assert!(t.metric(REMOVE_COUNT, &[("reason", "evicted")]) >= 1);
+    assert!(db
+        .cached_ranges()
+        .iter()
+        .all(|r| r.start != key(0) && r.start != key(100)));
+    mixed_writes(db, 300, 3).await;
+
+    // The open iterators finish on their pinned layers, and new reads use the normal path.
+    first_rows.extend(collect(first_iter).await);
+    second_rows.extend(collect(second_iter).await);
+    assert_eq!(
+        first_rows,
+        normal_scan_of(snapshot.as_ref(), first.clone()).await
+    );
+    assert_eq!(
+        second_rows,
+        normal_scan_of(snapshot.as_ref(), second.clone()).await
+    );
+    assert_eq!(t.metric(SCAN_COUNT, &[]), scans);
+    for range in [first, second] {
+        let keys: Vec<Bytes> = (0..300).map(key).collect();
+        assert_eq!(
+            assert_reader_matches_normal(&t, snapshot.as_ref(), keys, range).await,
+            0
+        );
+    }
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_read_own_writes_in_a_transaction() {
+    for isolation in [
+        IsolationLevel::Snapshot,
+        IsolationLevel::SerializableSnapshot,
+    ] {
+        let t = open(|_| {}).await;
+        let db = &t.db;
+        for i in 0..100 {
+            db.put(key(i), value(i, 0)).await.unwrap();
+        }
+        db.merge(key(30), "+m").await.unwrap();
+        db.cache_range(key(10)..key(90)).await.unwrap();
+        let txn = db.begin(isolation).unwrap();
+        // Writes by others after the transaction started stay invisible to it. They touch no
+        // key that the transaction writes, so that it can commit.
+        for i in (51..100).step_by(3) {
+            match i % 4 {
+                0 => db.delete(key(i)).await.unwrap(),
+                1 => db.merge(key(i), "+other").await.unwrap(),
+                _ => db.put(key(i), value(i, 1)).await.unwrap(),
+            };
+        }
+        // The transaction's own writes: a put, a delete, merge operands over a value, over a
+        // put in the batch, over a merge operand in the database and over no value.
+        txn.put(key(20), "own").unwrap();
+        txn.delete(key(21)).unwrap();
+        txn.merge(key(22), "+own").unwrap();
+        txn.put(key(23), "own").unwrap();
+        txn.merge(key(23), "+own").unwrap();
+        txn.merge(key(30), "+own").unwrap();
+        txn.merge(Bytes::from("key00040a"), "+own").unwrap();
+        txn.delete(key(41)).unwrap();
+        txn.put(key(41), "again").unwrap();
+        // A write outside the cached range.
+        txn.put(key(95), "own").unwrap();
+
+        // The written keys: the batch answers puts and deletes, merges take the normal path.
+        let written = [20, 21, 22, 23, 30, 41, 95]
+            .map(key)
+            .into_iter()
+            .chain([Bytes::from("key00040a")]);
+        let before = served(&t);
+        for k in written {
+            assert_eq!(
+                txn.get_key_value(&k).await.unwrap(),
+                normal_get(&txn, &k).await,
+                "key {k:?}"
+            );
+        }
+        assert_eq!(served(&t), before, "{isolation:?}");
+        assert_eq!(txn.get(key(20)).await.unwrap(), Some(Bytes::from("own")));
+        assert_eq!(txn.get(key(21)).await.unwrap(), None);
+        assert_eq!(
+            txn.get(key(22)).await.unwrap(),
+            Some(Bytes::from("value-22-0+own"))
+        );
+        assert_eq!(
+            txn.get(key(23)).await.unwrap(),
+            Some(Bytes::from("own+own"))
+        );
+        assert_eq!(
+            txn.get(key(30)).await.unwrap(),
+            Some(Bytes::from("value-30-0+m+own"))
+        );
+
+        // Other keys come from the cache at the transaction's sequence number.
+        let others: Vec<Bytes> = (50..90).map(key).collect();
+        assert_eq!(
+            assert_reader_matches_normal(&t, &txn, others, (Included(key(50)), Excluded(key(90))))
+                .await,
+            41,
+            "{isolation:?}"
+        );
+        // A scan over the transaction's writes uses the normal path, and sees them.
+        let with_writes = (Included(key(10)), Excluded(key(50)));
+        assert_eq!(
+            assert_reader_matches_normal(&t, &txn, [], with_writes.clone()).await,
+            0
+        );
+        let rows = collect(txn.scan(with_writes).await.unwrap()).await;
+        assert!(rows.iter().any(|kv| kv.key == key(20) && kv.value == "own"));
+        assert!(rows.iter().all(|kv| kv.key != key(21)));
+        // A write after a cached scan opened does not change that scan, as in the normal
+        // path, where the scan copies the batch entries of its range when it opens.
+        let range = (Included(key(60)), Excluded(key(70)));
+        let iter = txn.scan(range.clone()).await.unwrap();
+        let want = normal_scan_of(&txn, range).await;
+        txn.put(key(65), "late").unwrap();
+        assert_eq!(collect(iter).await, want);
+        assert_eq!(txn.get(key(65)).await.unwrap(), Some(Bytes::from("late")));
+        if isolation == IsolationLevel::SerializableSnapshot {
+            // The transaction read keys that others wrote after it started, through the cache.
+            let err = txn.commit().await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Transaction);
+        } else {
+            // The commit still applies every write.
+            txn.commit().await.unwrap();
+            assert_eq!(db.get(key(23)).await.unwrap(), Some(Bytes::from("own+own")));
+        }
+        assert_matches_snapshot(db, (0..100).map(key), (Unbounded, Unbounded)).await;
+        db.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn should_detect_conflicts_on_cached_reads() {
+    let t = open(|_| {}).await;
+    let db = &t.db;
+    for i in 0..100 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    db.cache_range(key(10)..key(90)).await.unwrap();
+
+    // A point read that the cache serves, then a write to that key by another writer.
+    let hits = t.metric(GET_COUNT, &[("result", "hit")]);
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    assert_eq!(txn.get(key(20)).await.unwrap(), Some(value(20, 0)));
+    assert_eq!(t.metric(GET_COUNT, &[("result", "hit")]), hits + 1);
+    txn.put(key(5), "x").unwrap();
+    db.put(key(20), value(20, 1)).await.unwrap();
+    let err = txn.commit().await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Transaction);
+
+    // A scan that the cache serves, then a new key inside the scanned range. The scan never
+    // returned that key, but the range counts as read.
+    let scans = t.metric(SCAN_COUNT, &[]);
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    let rows = collect(txn.scan(key(30)..key(40)).await.unwrap()).await;
+    assert_eq!(rows.len(), 10);
+    assert_eq!(t.metric(SCAN_COUNT, &[]), scans + 1);
+    txn.put(key(5), "x").unwrap();
+    db.put(Bytes::from("key00035a"), "phantom").await.unwrap();
+    let err = txn.commit().await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Transaction);
+
+    // Without a conflicting write, both commit.
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    txn.get(key(20)).await.unwrap();
+    collect(txn.scan(key(30)..key(40)).await.unwrap()).await;
+    txn.put(key(5), "y").unwrap();
+    db.put(key(50), value(50, 1)).await.unwrap();
+    txn.commit().await.unwrap();
+    // Snapshot isolation does not track reads, cached or not.
+    let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+    txn.get(key(20)).await.unwrap();
+    txn.put(key(5), "z").unwrap();
+    db.put(key(20), value(20, 2)).await.unwrap();
+    txn.commit().await.unwrap();
+    db.close().await.unwrap();
+}
+
+/// Automatic promotion samples reads in transactions and snapshots, which the cache could
+/// serve, as it samples other reads.
+#[tokio::test]
+async fn should_promote_ranges_that_transactions_read() {
+    let (t, clock) = open_auto(|_| {}).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    for _ in 0..40 {
+        let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        for i in 500..510 {
+            txn.get(key(i)).await.unwrap();
+        }
+        collect(txn.scan(key(510)..key(520)).await.unwrap()).await;
+        txn.rollback();
+        let snapshot = db.snapshot().unwrap();
+        for i in 500..510 {
+            snapshot.get(key(i)).await.unwrap();
+        }
+        tick(&clock, 200).await;
+        if holding(db, 500, 519).is_some() {
+            break;
+        }
+    }
+    assert!(holding(db, 500, 519).is_some(), "{:?}", db.cached_ranges());
+    assert!(t.metric(SAMPLE_COUNT, &[("result", "recorded")]) >= 40);
+    // Now the cache serves them.
+    let hits = t.metric(GET_COUNT, &[("result", "hit")]);
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    for i in 500..520 {
+        txn.get(key(i)).await.unwrap();
+    }
+    assert_eq!(t.metric(GET_COUNT, &[("result", "hit")]), hits + 20);
+    db.close().await.unwrap();
+}
+
+/// A merge operand that a writer applies while a load registers its range must count once.
 /// The load's snapshot holds the operand, and the writer then finds the new range. Before the
 /// fix, the delta held the operand too, and reads applied it twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1069,10 +1551,14 @@ async fn should_apply_a_merge_that_races_registration_once() {
         loader.await.unwrap().unwrap();
         writer.await.unwrap().unwrap();
         let want = Some(Bytes::from_static(b"base+op"));
-        // A snapshot read uses the normal path.
         let snapshot = db.snapshot().unwrap();
-        assert_eq!(snapshot.get(b"a1").await.unwrap(), want, "{fail_point}");
+        let k = Bytes::from_static(b"a1");
+        assert_eq!(
+            normal_get(snapshot.as_ref(), &k).await.map(|kv| kv.value),
+            want
+        );
         assert_eq!(db.get(b"a1").await.unwrap(), want, "{fail_point}");
+        assert_eq!(snapshot.get(b"a1").await.unwrap(), want, "{fail_point}");
         let rows = collect(db.scan(&b"a"[..]..&b"b"[..]).await.unwrap()).await;
         assert_eq!(
             rows.first().map(|kv| kv.value.clone()),

@@ -154,6 +154,15 @@ impl DbTransaction {
             self.txn_manager.track_read_keys(&self.txn_id, read_keys);
         }
 
+        // The range cache serves reads at the transaction's sequence number, under the same
+        // rules as reads at the latest state (RFC 0040). The transaction's own writes come
+        // first.
+        #[cfg(feature = "range_cache")]
+        let sample = match self.range_cache_get(key.as_ref(), options).await {
+            crate::range_cache::GetRoute::Served(result) => return result.map_err(Into::into),
+            crate::range_cache::GetRoute::Normal(sample) => sample,
+        };
+
         let db_state = self.db_inner.state.read().view();
 
         // Build the write batch iterator synchronously while holding the read
@@ -184,9 +193,50 @@ impl DbTransaction {
                 write_batch_iter,
                 Some(self.started_seq),
             )
+            .await;
+        #[cfg(feature = "range_cache")]
+        self.db_inner.range_cache_record(sample);
+        kv.map_err(crate::Error::from)
+    }
+
+    /// Serves a point read from the write batch or the range cache, if they can answer it
+    /// without the normal read path. A put in the batch is the answer and a delete means
+    /// absent, as in the normal path, where the batch is the newest source and holds no
+    /// expire time. A merge operand needs the older versions, so it takes the normal path.
+    /// Otherwise the range cache reads the key at the transaction's sequence number.
+    #[cfg(feature = "range_cache")]
+    async fn range_cache_get(
+        &self,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> crate::range_cache::GetRoute {
+        use crate::batch::WriteOp;
+        use crate::range_cache::GetRoute;
+
+        // Only a read that the cache could serve skips the normal path.
+        if self.db_inner.range_cache.is_none() || !crate::range_cache::can_serve_get(options) {
+            return GetRoute::Normal(None);
+        }
+        {
+            let batch = self.write_batch.read();
+            if let Some((batch_key, ops)) = batch.ops.get_key_value(key) {
+                return match ops.last() {
+                    Some(op @ WriteOp::Put(..)) => {
+                        self.db_inner.db_stats.get_requests.increment(1);
+                        let entry = op.to_row_entry(batch_key, u64::MAX, None, None);
+                        GetRoute::Served(Ok(Some(KeyValue::from(entry))))
+                    }
+                    Some(WriteOp::Delete) => {
+                        self.db_inner.db_stats.get_requests.increment(1);
+                        GetRoute::Served(Ok(None))
+                    }
+                    Some(WriteOp::Merge(..)) | None => GetRoute::Normal(None),
+                };
+            }
+        }
+        self.db_inner
+            .range_cache_get(key, options, Some(self.started_seq))
             .await
-            .map_err(crate::Error::from)?;
-        Ok(kv)
     }
 
     /// Scan a range of keys using the default scan options.
@@ -302,6 +352,39 @@ impl DbTransaction {
         }
 
         self.db_inner.check_closed()?;
+
+        // The range cache serves a scan at the transaction's sequence number if the
+        // transaction wrote no key in the scan range. The range tracker above holds the
+        // requested range and takes nothing from the iterator, so it is the same either way.
+        #[cfg(feature = "range_cache")]
+        let (range, sample) = {
+            let batch_overlaps = self.db_inner.range_cache.is_some() && {
+                let guard = self.write_batch.read();
+                guard
+                    .ops
+                    .range::<Bytes, _>((
+                        std::ops::RangeBounds::start_bound(&range),
+                        std::ops::RangeBounds::end_bound(&range),
+                    ))
+                    .next()
+                    .is_some()
+            };
+            if batch_overlaps {
+                (range, None)
+            } else {
+                match self
+                    .db_inner
+                    .range_cache_scan(range, options, Some(self.started_seq))
+                    .await
+                {
+                    crate::range_cache::ScanRoute::Served(result) => {
+                        return result.map_err(Into::into)
+                    }
+                    crate::range_cache::ScanRoute::Normal(range, sample) => (range, sample),
+                }
+            }
+        };
+
         let db_state = self.db_inner.state.read().view();
 
         // Build the write batch iterator synchronously while holding the read
@@ -319,7 +402,8 @@ impl DbTransaction {
             ))
         };
 
-        self.db_inner
+        let result = self
+            .db_inner
             .reader
             .scan_with_options(
                 range,
@@ -331,8 +415,10 @@ impl DbTransaction {
                     prefix,
                 },
             )
-            .await
-            .map_err(Into::into)
+            .await;
+        #[cfg(feature = "range_cache")]
+        self.db_inner.range_cache_record(sample);
+        result.map_err(Into::into)
     }
 
     /// Put a key-value pair into the transaction.

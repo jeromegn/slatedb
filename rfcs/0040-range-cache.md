@@ -48,7 +48,8 @@ idea works. Inside SlateDB, the cache can apply each write before the write beco
 
 ## Goals
 
-- Serve point reads and ascending scans at the latest committed state from cached ranges.
+- Serve point reads and ascending scans from cached ranges, at the latest committed state and in
+  snapshots and transactions.
 - Return the same values, sequence numbers and create timestamps as the normal read path.
 - Keep cached ranges up to date with puts, deletes, merges, write batches and transaction commits.
 - Cost nothing when the feature is off, and almost nothing for keys that are not cached.
@@ -58,7 +59,8 @@ idea works. Inside SlateDB, the cache can apply each write before the write beco
 
 - Replace the block cache, the object store cache or the local object mirror.
 - Keep the cache across restarts.
-- Serve snapshot, transaction or dirty reads, `DurabilityLevel::Remote` reads or descending scans.
+- Serve dirty reads, `DurabilityLevel::Remote` reads or descending scans.
+- Serve a snapshot or a transaction that is older than the file of its range.
 - Support `DbReader`, which has no write path for the cache to follow.
 - Turn automatic promotion on by default.
 
@@ -124,9 +126,8 @@ cache, the writer runs these steps after the memtable insert and before that adv
 1. Advance the cache's `inserted_seq` counter to the batch sequence number. Then load its
    `publish_epoch` counter. Both operations are `SeqCst`.
 2. Load the index without a lock. If no entry falls in a cached range, return.
-3. Take the mutex. Put each covered entry, tombstones and merge operands included, in its delta.
-   Skip an entry at or below the range's `file_seq`: the file, or the snapshot that a load
-   reads, already holds it.
+3. Take the mutex. Put each covered entry, tombstones and merge operands included, in its delta,
+   unless its sequence number is at or below the range's `file_seq`: the file holds it already.
 4. If an entry has an expire time, remove its range. Seal its delta one below the batch sequence
    number, because the delta does not hold this write.
 5. If an active delta is larger than its rebuild threshold, freeze it (see [Rebuild](#rebuild)).
@@ -157,12 +158,25 @@ otherwise install a file newer than `seq`. The scan sits behind the public `DbIt
 contract does not change. With `DbIterator::new_resolved` and `RowEntryIterator::next_sync`, it
 returns most rows without an await, and checks Tokio's cooperative budget once every 32 rows.
 
+A read in a snapshot or a transaction works the same way. It still loads the last committed
+sequence number after it pins the layers, and reads at the smaller of that number and the
+snapshot's sequence number `S`, as the normal path does. `Db::snapshot` and `Db::begin` take `S`
+from the last committed sequence number, so `S` is committed. Deltas keep every version, so the
+cursors and lookups filter with `S`. A transaction reads its own writes first. For a point read,
+a put in its batch is the answer, a delete means absent, and a merge operand uses the normal path.
+A scan uses the normal path if the batch has a key in the scan range. Conflict tracking of
+serializable transactions does not change: it records the read key, or the requested scan range,
+before the read, and takes nothing from the iterator. Automatic promotion samples these reads
+like the others.
+
 ### Sequence number rules
 
-A read pins layers `L`, then loads `seq`. It uses `L` only if both rules hold:
+A read pins layers `L`, then loads `seq` (for a snapshot, the smaller of it and `S`). It uses `L`
+only if both rules hold:
 
 - `seq >= L.file_seq`. Right after a load or a rebuild, `seq` can be lower for a short time. The
   file holds the state at `file_seq`, so without this rule a read could see an uncommitted write.
+  The file has no older versions, so a snapshot older than the file uses the normal path.
 - `seq <= L.active.sealed_at`. Otherwise a write after the seal can be missing from the delta.
 
 The second rule is stronger than linearizability needs: without it, a read could return an older
@@ -172,22 +186,22 @@ state that was current during the read. It makes a cached read equal the normal 
 
 1. Under the mutex, in this order: publish a loading range with an empty active delta for each part
    that no range holds; advance `publish_epoch`, then read `inserted_seq`, both `SeqCst`; register
-   a snapshot at the larger of `inserted_seq` and the last committed sequence number; record that
-   number as the `file_seq` of the loading range.
+   a snapshot at the larger of `inserted_seq` and the last committed sequence number; record its
+   sequence number as the `file_seq` of the new ranges.
 2. Scan each part from the snapshot into a new file, with `dirty: true` and `cache_blocks: false`.
    Stop on a row with an expire time, or when the file grows larger than the disk budget.
 3. Under the mutex, if the range is still in the index, attach the file, with the snapshot sequence
    number as `file_seq`. Then apply the disk budget.
 
-The order of step 1 makes sure that each write is in the snapshot or in the delta, and never in
-both. The writer advances `inserted_seq` after its memtable insert, so every write up to the
-snapshot's sequence number is in the memtable, and the snapshot holds exactly those writes. The
-writer and the load each update one counter and then read the other, all with `SeqCst`. So a
-write above the snapshot's sequence number sees the new `publish_epoch`, finds the new range, and
-goes to its delta. A write at or below it is in the snapshot, and the writer skips it. Without
-the skip, a merge operand in both places would apply twice. The snapshot is dirty because its
-newest write can still be in flight; that write commits, or the database closes. The snapshot
-also keeps compaction from dropping the versions that the load reads.
+The order of step 1 makes sure that no write is lost. The writer and the load each update one
+counter and then read the other, all with `SeqCst`, so at least one side sees the other. If the
+writer sees the new `publish_epoch`, it finds the new range and puts the write in its delta.
+Otherwise the load sees the writer's `inserted_seq`, so the write is in the snapshot. Both can
+happen to one write. Every write at or below the snapshot is in the memtable and visible to the
+load, so the writer skips it (step 3 of the write path); a merge operand in both would apply twice.
+The snapshot is dirty because a write at `inserted_seq` can still be in flight; that write commits,
+or the database closes. The snapshot also keeps compaction from dropping the versions that the load
+reads.
 
 ### Rebuild
 
@@ -313,7 +327,7 @@ SlateDB features and components that this RFC interacts with. Check all that app
 - **TTL.** Expiry happens only at flush and compaction, so an expiring row changes without a
   write. The cache holds no expiring rows, and does not help with `Settings::default_ttl_millis`.
 - **Transactions and snapshots.** A commit is a write batch, so the cache applies it. Reads in
-  transactions and snapshots use the normal read path.
+  transactions and snapshots use the cache when their snapshot is not older than the file.
 - **Compaction.** It does not invalidate the cache: only expiry and compaction filters change
   visible data. The builder rejects a cache with an embedded compactor that has a filter. A
   compactor in another process must not use one.
@@ -376,12 +390,15 @@ shows the cost of writes to cached keys; the table above gives the read numbers.
 ## Testing
 
 - Unit tests cover the file format with both page sources, the searches, and the index. A
-  property test compares cached scans with the normal iterator stack, field by field.
+  property test compares cached scans with the normal iterator stack, field by field. Another
+  compares cached reads at any sequence number from `file_seq` up with the whole history.
 - Integration tests mostly compare cached reads with snapshot reads, under writes, rebuilds,
-  eviction, close, fencing, races with loads, and automatic promotion.
+  eviction, close, fencing, races with loads, and automatic promotion. The cache serves snapshot
+  reads too, so these reads carry a tracing option, which the cache never serves.
 - A separate checker, written from this specification and kept outside this branch, checks
-  concurrent gets and scans for linearizability with 2, 6 and 16 tasks. It found no violation, and
-  it caught deliberate bugs.
+  concurrent gets and scans for linearizability with 2, 6 and 16 tasks. It also checks reads in
+  snapshots and transactions against the state at their sequence number. It found no violation,
+  and it caught deliberate bugs.
 - Fail points pause a batch before its commit, and a load around its publish step. Not yet
   covered: deterministic simulation, and runs on Linux.
 
@@ -413,7 +430,6 @@ The branch has five commits. Commits 1 and 2 do not depend on the cache and can 
 ## Open Questions
 
 - Should a scan continue in the normal read path when it leaves the cached ranges?
-- Should the cache serve snapshot and transaction reads?
 - Should the cache survive restarts?
 - Should `cache_range` return before the load ends?
 - Should `DbIterator` get a batched read, such as `next_batch` in commit 5?
@@ -438,6 +454,8 @@ The branch has five commits. Commits 1 and 2 do not depend on the cache and can 
 
 Claim: when a read at `seq` uses layers `L` under the sequence number rules, `L` holds every
 version of each key in the range that is visible at `seq`, and the read uses no other version.
+For a snapshot, `seq` is at most the last committed sequence number that the read loaded after
+`L`, so every step below holds for it as it holds for that number.
 
 1. The writer puts a write `w` in its delta before a `SeqCst` store makes `w` committed. A read
    loads `seq` (`SeqCst`) after it loads `L`, so if `w <= seq`, it sees the write in the delta.
@@ -445,8 +463,9 @@ version of each key in the range that is visible at `seq`, and the read uses no 
    at `s` holds each write to its range up to `s` that the older layers lack, and none above `s`.
    The seal comes before any write above `s` commits, so a read with `seq > s` retries.
 3. A file holds the state of its range at `file_seq`: for a load, through the counter pair in
-   [Loading a range](#loading-a-range); for a rebuild, at the seal of the frozen delta. Reads
-   filter delta versions with `max_seq = seq`, and use the file only if `file_seq <= seq`.
+   [Loading a range](#loading-a-range); for a rebuild, at the seal of the frozen delta. Deltas
+   hold only versions above `file_seq`. Reads filter delta versions with `max_seq = seq`, and use
+   the file only if `file_seq <= seq`, since it lacks the versions that an older `seq` needs.
 4. A removal seals the active delta, under the mutex, at the last sequence number that the writer
    applied. A read that pinned the range earlier then needs `seq` at or below that number. A writer
    that saw the range before the removal finds it gone under the mutex, and applies nothing.
