@@ -709,7 +709,13 @@ impl RangeCache {
                 }
                 continue;
             }
-            range.layers.load().active.table.put(entry.clone());
+            let layers = range.layers.load();
+            if entry.seq <= layers.file_seq {
+                // The file, or the snapshot that a load reads, holds this write already. This
+                // happens to the write in flight when `register` ran. See `register`.
+                continue;
+            }
+            layers.active.table.put(entry.clone());
             if !touched.iter().any(|r| Arc::ptr_eq(r, range)) {
                 touched.push(range.clone());
             }
@@ -1315,10 +1321,10 @@ impl RangeCache {
     }
 
     /// Registers loading ranges for the parts of `[start, end)` that no range holds, and calls
-    /// `snapshot` to pick the state that they load.
+    /// `snapshot` with the value of `inserted_seq` to pick the state that they load.
     ///
     /// The order matters. The new ranges go into the index first, and `publish_epoch`
-    /// advances. Then the cache reads `inserted_seq`, and `snapshot` reads `last_seq`. The writer
+    /// advances. Then the cache reads `inserted_seq`, and calls `snapshot`. The writer
     /// does the mirror image in `apply_write`: it advances `inserted_seq` after its memtable
     /// insert, and then loads `publish_epoch` before it checks the index. All four operations
     /// are `SeqCst`, so at least one side sees the other. If the writer misses the new epoch,
@@ -1330,7 +1336,7 @@ impl RangeCache {
         start: &Bytes,
         end: Option<&Bytes>,
         origin: Origin,
-        snapshot: impl FnOnce() -> Arc<DbSnapshot>,
+        snapshot: impl FnOnce(u64) -> Arc<DbSnapshot>,
     ) -> Result<(Vec<Arc<CachedRange>>, Arc<DbSnapshot>), SlateDBError> {
         let state = self.state.lock();
         if state.closed {
@@ -1345,8 +1351,9 @@ impl RangeCache {
                 active: Arc::new(Delta::new()),
                 frozen: None,
                 file: None,
-                // A loading range serves no read. `load` sets the real value.
-                file_seq: u64::MAX,
+                // A loading range serves no read. The value is set below, before the mutex
+                // is released, so `apply_write` never sees this one.
+                file_seq: 0,
                 end: part_end.clone(),
             };
             let range = Arc::new(CachedRange::new(
@@ -1374,8 +1381,22 @@ impl RangeCache {
         );
         // Synchronizes with the writer: every write up to `inserted` is in the memtable.
         let inserted = self.inserted_seq.load(Ordering::SeqCst);
-        let snapshot = snapshot();
+        let snapshot = snapshot(inserted);
         debug_assert!(snapshot.seq() >= inserted);
+        // The snapshot holds exactly the writes up to its sequence number (see
+        // `DbInner::cache_range_with`), and each later write finds the new ranges. Record the
+        // number now, under the mutex, so that `apply_write` puts no write that the file holds
+        // in a delta too. A merge operand in both would apply twice.
+        for range in &ranges {
+            let layers = range.layers.load_full();
+            range.layers.store(Arc::new(Layers {
+                active: layers.active.clone(),
+                frozen: None,
+                file: None,
+                file_seq: snapshot.seq(),
+                end: range.end.clone(),
+            }));
+        }
         drop(state);
         Ok((ranges, snapshot))
     }
@@ -1607,11 +1628,16 @@ impl DbInner {
         let Some((start, end)) = half_open(&range) else {
             return Ok(());
         };
-        // `register` calls this after it publishes the new ranges. `last_seq` can be one more
-        // than the last committed sequence number while a write is in flight. The snapshot then
-        // includes that write if it is in the memtable already. See RFC 0040, "Loading a range".
-        let (ranges, snapshot) = cache.register(&start, end.as_ref(), origin, || {
-            DbSnapshot::new(self.clone(), Some(self.oracle.last_seq()))
+        // `register` calls this after it publishes the new ranges, with the `inserted_seq`
+        // that it read after the publish. Every write up to `inserted` or up to the last
+        // committed sequence number is in the memtable and visible here, so the snapshot holds
+        // exactly the writes up to its sequence number. A write above it advances
+        // `inserted_seq` after `register` read it, so it finds the new ranges and goes to their
+        // deltas. `inserted` can be one more than the last committed sequence number while a
+        // write is in flight. See RFC 0040, "Loading a range".
+        let (ranges, snapshot) = cache.register(&start, end.as_ref(), origin, |inserted| {
+            let seq = inserted.max(self.oracle.last_committed_seq());
+            DbSnapshot::new(self.clone(), Some(seq))
         })?;
         let options = ScanOptions {
             // The snapshot sequence number can be above the last committed one. See above.

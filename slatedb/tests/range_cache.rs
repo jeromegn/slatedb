@@ -1032,6 +1032,57 @@ async fn should_seek_within_a_cached_scan() {
     }
 }
 
+/// A merge operand that is in flight while a load registers its range must apply once.
+///
+/// The load's snapshot holds the operand, and the writer then finds the new range. Before the
+/// fix, the delta held the operand too, and reads applied it twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_apply_a_merge_that_races_registration_once() {
+    use slatedb::fail_parallel::{self, FailPointRegistry};
+
+    for fail_point in [
+        "range-cache-register-publish",
+        "range-cache-register-snapshot",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let db = Db::builder("merge_race", Arc::new(InMemory::new()))
+            .with_range_cache(options(dir.path()))
+            .with_merge_operator(Arc::new(ConcatMergeOperator))
+            .with_fp_registry(fp_registry.clone())
+            .build()
+            .await
+            .unwrap();
+        db.put(b"a1", b"base").await.unwrap();
+        fail_parallel::cfg(fp_registry.clone(), fail_point, "pause").unwrap();
+        let loader = {
+            let db = db.clone();
+            tokio::spawn(async move { db.cache_range(&b"a"[..]..&b"b"[..]).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let writer = {
+            let db = db.clone();
+            tokio::spawn(async move { db.merge(b"a1", b"+op").await.map(|_| ()) })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fail_parallel::cfg(fp_registry.clone(), fail_point, "off").unwrap();
+        loader.await.unwrap().unwrap();
+        writer.await.unwrap().unwrap();
+        let want = Some(Bytes::from_static(b"base+op"));
+        // A snapshot read uses the normal path.
+        let snapshot = db.snapshot().unwrap();
+        assert_eq!(snapshot.get(b"a1").await.unwrap(), want, "{fail_point}");
+        assert_eq!(db.get(b"a1").await.unwrap(), want, "{fail_point}");
+        let rows = collect(db.scan(&b"a"[..]..&b"b"[..]).await.unwrap()).await;
+        assert_eq!(
+            rows.first().map(|kv| kv.value.clone()),
+            want,
+            "{fail_point}"
+        );
+        db.close().await.unwrap();
+    }
+}
+
 /// One step of the model test.
 #[derive(Debug, Clone)]
 enum Op {

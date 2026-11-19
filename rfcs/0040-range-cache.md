@@ -125,6 +125,8 @@ cache, the writer runs these steps after the memtable insert and before that adv
    `publish_epoch` counter. Both operations are `SeqCst`.
 2. Load the index without a lock. If no entry falls in a cached range, return.
 3. Take the mutex. Put each covered entry, tombstones and merge operands included, in its delta.
+   Skip an entry at or below the range's `file_seq`: the file, or the snapshot that a load
+   reads, already holds it.
 4. If an entry has an expire time, remove its range. Seal its delta one below the batch sequence
    number, because the delta does not hold this write.
 5. If an active delta is larger than its rebuild threshold, freeze it (see [Rebuild](#rebuild)).
@@ -170,18 +172,22 @@ state that was current during the read. It makes a cached read equal the normal 
 
 1. Under the mutex, in this order: publish a loading range with an empty active delta for each part
    that no range holds; advance `publish_epoch`, then read `inserted_seq`, both `SeqCst`; register
-   a snapshot at `last_seq`, the last sequence number that the writer assigned.
+   a snapshot at the larger of `inserted_seq` and the last committed sequence number; record that
+   number as the `file_seq` of the loading range.
 2. Scan each part from the snapshot into a new file, with `dirty: true` and `cache_blocks: false`.
    Stop on a row with an expire time, or when the file grows larger than the disk budget.
 3. Under the mutex, if the range is still in the index, attach the file, with the snapshot sequence
    number as `file_seq`. Then apply the disk budget.
 
-The order of step 1 makes sure that no write is lost. The writer and the load each update one
-counter and then read the other, all with `SeqCst`, so at least one side sees the other. If the
-writer sees the new `publish_epoch`, it finds the new range and puts the write in its delta.
-Otherwise the load sees the writer's `inserted_seq`, so the write is in the snapshot. The snapshot
-is dirty because a write at `last_seq` can still be in flight; that write commits, or the database
-closes. The snapshot also keeps compaction from dropping the versions that the load reads.
+The order of step 1 makes sure that each write is in the snapshot or in the delta, and never in
+both. The writer advances `inserted_seq` after its memtable insert, so every write up to the
+snapshot's sequence number is in the memtable, and the snapshot holds exactly those writes. The
+writer and the load each update one counter and then read the other, all with `SeqCst`. So a
+write above the snapshot's sequence number sees the new `publish_epoch`, finds the new range, and
+goes to its delta. A write at or below it is in the snapshot, and the writer skips it. Without
+the skip, a merge operand in both places would apply twice. The snapshot is dirty because its
+newest write can still be in flight; that write commits, or the database closes. The snapshot
+also keeps compaction from dropping the versions that the load reads.
 
 ### Rebuild
 
