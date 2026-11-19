@@ -167,6 +167,12 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
         mut messages: BoxStream<'async_trait, BatchWriterMessage>,
         result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
+        // No write reaches the range cache after this point, so drop it. This covers close
+        // and errors such as fencing.
+        #[cfg(feature = "range_cache")]
+        if let Some(range_cache) = &self.db_inner.range_cache {
+            range_cache.close();
+        }
         let error = result.clone().err().unwrap_or(SlateDBError::Closed);
         while let Some(msg) = messages.next().await {
             match msg {
@@ -474,6 +480,16 @@ impl DbInner {
         let memtable = guard.memtable();
         self.status_manager.add_memtable_segments(&touched_segments);
         memtable.record_touched_segments(touched_segments.clone());
+        #[cfg(feature = "range_cache")]
+        if let Some(range_cache) = &self.range_cache {
+            // The range cache must get the entries after the memtable has them, and before the
+            // last committed sequence number advances. See RFC 0040, "Write path".
+            entries.iter().for_each(|entry| memtable.put(entry.clone()));
+            let durable_watcher = memtable.table().durable_watcher();
+            drop(guard);
+            range_cache.apply_write(&entries);
+            return durable_watcher;
+        }
         entries.into_iter().for_each(|entry| memtable.put(entry));
         memtable.table().durable_watcher()
     }

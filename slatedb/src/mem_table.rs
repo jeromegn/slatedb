@@ -567,6 +567,17 @@ impl KVTable {
         iterator
     }
 
+    /// Returns the newest version of `key` with a sequence number at or below `max_seq`.
+    #[cfg(feature = "range_cache")]
+    pub(crate) fn newest_version(&self, key: &Bytes, max_seq: u64) -> Option<RowEntry> {
+        let start = SequencedKey::new(key.clone(), max_seq);
+        let end = SequencedKey::new(key.clone(), 0);
+        self.map
+            .range(start..=end)
+            .next()
+            .map(|entry| entry.value().clone())
+    }
+
     pub(crate) fn put(&self, row: RowEntry) {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);

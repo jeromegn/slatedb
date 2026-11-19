@@ -44,6 +44,15 @@ pub(crate) trait RowEntryIterator: Send + Sync {
     /// to ensure that optimizations which eagerly initialize the iterator are not
     /// lost in a refactor and instead would throw errors.
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError>;
+
+    /// Returns the next entry if the iterator can produce it without an await, or `None` if the
+    /// caller must call [`RowEntryIterator::next`]. Only `DbIterator` calls it, and only for a
+    /// source from `DbIterator::new_resolved` (range cache scans, RFC 0040). The default never
+    /// produces an entry.
+    #[cfg(feature = "range_cache")]
+    fn next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        None
+    }
 }
 
 /// Iterator trait that tracks bytes processed for progress reporting.
@@ -69,6 +78,11 @@ impl<'a> RowEntryIterator for Box<dyn RowEntryIterator + 'a> {
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         self.as_mut().seek(next_key).await
+    }
+
+    #[cfg(feature = "range_cache")]
+    fn next_sync(&mut self) -> Option<Result<Option<RowEntry>, SlateDBError>> {
+        self.as_mut().next_sync()
     }
 }
 

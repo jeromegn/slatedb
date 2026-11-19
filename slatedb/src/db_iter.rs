@@ -262,7 +262,19 @@ pub struct DbIterator {
     last_key: Option<Bytes>,
     order: IterationOrder,
     read_span: tracing::Span,
+    /// True if `iter` came from [`DbIterator::new_resolved`] and can return entries without an
+    /// await.
+    #[cfg(feature = "range_cache")]
+    sync_source: bool,
+    /// Entries returned from a resolved source since the last cooperative budget check.
+    #[cfg(feature = "range_cache")]
+    unbudgeted: u32,
 }
+
+/// A resolved source checks the cooperative budget once in this many entries, not for each
+/// entry. Its entries come from memory or local pages, so a task still yields often.
+#[cfg(feature = "range_cache")]
+const RESOLVED_BUDGET_EVERY: u32 = 32;
 
 impl DbIterator {
     pub(crate) async fn new(
@@ -338,6 +350,34 @@ impl DbIterator {
             last_key: None,
             order,
             read_span,
+            #[cfg(feature = "range_cache")]
+            sync_source: false,
+            #[cfg(feature = "range_cache")]
+            unbudgeted: 0,
+        })
+    }
+
+    /// Builds an iterator over a source that already resolves each key. The source must return
+    /// at most one entry for each key, in ascending key order, inside `range`, with no version
+    /// above the read's sequence number and with merge operands resolved. The range cache uses
+    /// it for scans of cached ranges (RFC 0040).
+    #[cfg(feature = "range_cache")]
+    pub(crate) async fn new_resolved(
+        range: BytesRange,
+        mut iter: Box<dyn RowEntryIterator + 'static>,
+        read_trace: ReadTrace,
+    ) -> Result<Self, SlateDBError> {
+        let read_span = read_trace.read_span();
+        iter.init().instrument(read_span.clone()).await?;
+        Ok(DbIterator {
+            range,
+            iter,
+            invalidated_error: None,
+            last_key: None,
+            order: IterationOrder::Ascending,
+            read_span,
+            sync_source: true,
+            unbudgeted: 0,
         })
     }
 
@@ -350,6 +390,10 @@ impl DbIterator {
     ///
     /// Returns [`Error`] if the iterator has been invalidated due to an underlying error.
     pub async fn next(&mut self) -> Result<Option<KeyValue>, crate::Error> {
+        #[cfg(feature = "range_cache")]
+        if let Some(result) = self.next_resolved() {
+            return result.map_err(Into::into);
+        }
         let entry_opt = self.next_entry().await?;
         match entry_opt {
             Some(entry) => {
@@ -359,6 +403,37 @@ impl DbIterator {
                 Ok(Some(KeyValue::from(entry)))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Returns the next row of a resolved source without an await, as [`DbIterator::next`]
+    /// would. Returns `None` when `next` must take the general path: the source is not a
+    /// resolved one, it needs an await for this row, or the cooperative budget check is due.
+    #[cfg(feature = "range_cache")]
+    fn next_resolved(&mut self) -> Option<Result<Option<KeyValue>, SlateDBError>> {
+        if !self.sync_source || self.invalidated_error.is_some() {
+            return None;
+        }
+        // The general path counts this row and checks the budget.
+        if self.unbudgeted + 1 >= RESOLVED_BUDGET_EVERY {
+            return None;
+        }
+        loop {
+            match self.iter.next_sync()? {
+                Ok(Some(entry)) => {
+                    if entry.value.is_tombstone() {
+                        continue;
+                    }
+                    self.unbudgeted += 1;
+                    self.last_key = Some(entry.key.clone());
+                    return Some(Ok(Some(KeyValue::from(entry))));
+                }
+                Ok(None) => return Some(Ok(None)),
+                Err(e) => {
+                    self.invalidated_error = Some(e.clone());
+                    return Some(Err(e));
+                }
+            }
         }
     }
 
@@ -372,9 +447,29 @@ impl DbIterator {
             Err(error)
         } else {
             let result = loop {
+                // A resolved range cache source returns most entries without an await.
+                #[cfg(feature = "range_cache")]
+                let next = match self.sync_source.then(|| self.iter.next_sync()).flatten() {
+                    Some(next) => next,
+                    None => self.iter.next().await,
+                };
+                #[cfg(not(feature = "range_cache"))]
                 let next = self.iter.next().await;
                 // Keep cached iteration cooperative.
-                tokio::task::coop::consume_budget().await;
+                #[cfg(feature = "range_cache")]
+                let check_budget = !self.sync_source || {
+                    self.unbudgeted += 1;
+                    self.unbudgeted >= RESOLVED_BUDGET_EVERY
+                };
+                #[cfg(not(feature = "range_cache"))]
+                let check_budget = true;
+                if check_budget {
+                    #[cfg(feature = "range_cache")]
+                    {
+                        self.unbudgeted = 0;
+                    }
+                    tokio::task::coop::consume_budget().await;
+                }
                 match next {
                     Ok(Some(entry)) => match entry.value {
                         ValueDeletable::Tombstone => continue,
