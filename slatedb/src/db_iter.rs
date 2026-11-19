@@ -437,6 +437,85 @@ impl DbIterator {
         }
     }
 
+    /// Appends up to `max` rows to `out` and returns how many it appended. It returns 0 only
+    /// when the iterator has no more rows, or when `max` is 0.
+    ///
+    /// The rows are the ones that [`DbIterator::next`] would return, in the same order, and
+    /// the iterator ends up in the same state. It works for every iterator. For a scan that
+    /// the range cache serves, it reads most rows without an await and without a future per
+    /// row, which makes it cheaper per row than calling `next` in a loop.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`DbIterator::next`]. Rows appended before an error stay in `out`.
+    #[cfg(feature = "range_cache")]
+    pub async fn next_batch(
+        &mut self,
+        out: &mut Vec<KeyValue>,
+        max: usize,
+    ) -> Result<usize, crate::Error> {
+        let mut n = 0;
+        if self.sync_source && self.invalidated_error.is_none() {
+            while n < max {
+                match self.iter.next_sync() {
+                    Some(Ok(Some(entry))) => {
+                        if !entry.value.is_tombstone() {
+                            out.push(KeyValue::from(entry));
+                            n += 1;
+                        }
+                    }
+                    Some(Ok(None)) => break,
+                    Some(Err(e)) => {
+                        self.set_last_key(out, n);
+                        self.invalidated_error = Some(e.clone());
+                        return Err(e.into());
+                    }
+                    // The source needs an await for this row, as for a merge operand.
+                    None => {
+                        self.set_last_key(out, n);
+                        match self.next().await? {
+                            Some(kv) => {
+                                out.push(kv);
+                                n += 1;
+                                continue;
+                            }
+                            None => return Ok(n),
+                        }
+                    }
+                }
+                self.unbudgeted += 1;
+                if self.unbudgeted >= RESOLVED_BUDGET_EVERY {
+                    self.unbudgeted = 0;
+                    self.set_last_key(out, n);
+                    tokio::task::coop::consume_budget().await;
+                }
+            }
+            self.set_last_key(out, n);
+            return Ok(n);
+        }
+        while n < max {
+            match self.next().await? {
+                Some(kv) => {
+                    out.push(kv);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(n)
+    }
+
+    /// Records the key of the last row of `out` as the last returned key, if `next_batch`
+    /// appended at least one row.
+    #[cfg(feature = "range_cache")]
+    fn set_last_key(&mut self, out: &[KeyValue], appended: usize) {
+        if appended > 0 {
+            if let Some(kv) = out.last() {
+                self.last_key = Some(kv.key.clone());
+            }
+        }
+    }
+
     pub(crate) async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         let read_span = self.read_span.clone();
         self.next_entry_inner().instrument(read_span).await

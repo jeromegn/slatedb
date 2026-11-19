@@ -327,6 +327,49 @@ async fn should_serve_covered_scans_only() {
 }
 
 #[tokio::test]
+async fn should_read_batches_like_next() {
+    let t = open(|o| o.tuning.min_rebuild_delta_bytes = 2048).await;
+    let db = &t.db;
+    for i in 0..300 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    db.cache_range(key(0)..key(200)).await.unwrap();
+    // Merge operands need an await in a cached scan, and tombstones are skipped.
+    for i in (0..300).step_by(13) {
+        db.merge(key(i), b"+m").await.unwrap();
+    }
+    for i in (0..300).step_by(17) {
+        db.delete(key(i)).await.unwrap();
+    }
+    // A cached scan, and a scan that leaves the cached range and uses the normal path.
+    for range in [key(0)..key(200), key(150)..key(300)] {
+        let expected = collect(db.scan(range.clone()).await.unwrap()).await;
+        for max in [1, 7, 64, 1000] {
+            let mut iter = db.scan(range.clone()).await.unwrap();
+            let mut got = Vec::new();
+            loop {
+                let n = iter.next_batch(&mut got, max).await.unwrap();
+                assert!(n <= max);
+                if n == 0 {
+                    break;
+                }
+            }
+            assert_eq!(got, expected, "{range:?} in batches of {max}");
+            assert_eq!(iter.next().await.unwrap(), None);
+        }
+    }
+    // A batch moves the iterator as `next` does: seek must go past its last row.
+    let mut iter = db.scan(key(0)..key(200)).await.unwrap();
+    let mut got = Vec::new();
+    assert_eq!(iter.next_batch(&mut got, 10).await.unwrap(), 10);
+    assert!(iter.seek(got[9].key.clone()).await.is_err());
+    iter.seek(key(100)).await.unwrap();
+    assert_eq!(iter.next().await.unwrap().unwrap().key, key(100));
+    assert_eq!(iter.next_batch(&mut got, 0).await.unwrap(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn should_scan_across_adjacent_ranges() {
     let t = open(|o| o.tuning.min_rebuild_delta_bytes = 2048).await;
     let db = &t.db;
