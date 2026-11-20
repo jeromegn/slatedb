@@ -97,7 +97,11 @@ fn cache_files(dir: &Path) -> usize {
 }
 
 fn options(dir: &Path) -> RangeCacheOptions {
-    RangeCacheOptions::new(dir)
+    let mut options = RangeCacheOptions::new(dir);
+    // The tests check the read counters right after the reads, so each read folds its counts
+    // into the shared counters at once.
+    options.tuning.stats_fold_events = 1;
+    options
 }
 
 async fn open_db(

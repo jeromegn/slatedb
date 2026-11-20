@@ -235,7 +235,9 @@ range. A rebuild absorbs at least a quarter of the file, so write amplification 
 After each load and rebuild, if the files are larger than `max_disk_bytes`, the cache removes
 ranges until they fit, least recently read first. With automatic promotion, it removes automatic
 ranges first, lowest read density first, and explicit ranges last. It never removes the range that
-a load just installed. A read updates its range's recency only when a shared clock has moved.
+a load just installed. A read counts its range's reads and recency on its own thread. Each thread
+adds them to the range every 4096 reads or about every 10 ms, so eviction and promotion use counts
+that are up to that far behind, and miss the last counts of a thread that stopped reading.
 
 ### Range cache files
 
@@ -375,7 +377,9 @@ p50 latency on one task, then operations per second on 1, 8 and 16 tasks.
 - Positional reads stop scaling near 1M reads per second on this machine, at any number of tasks.
   A profile shows the time inside the `pread` system call. `Mmap` does not have this limit, and is
   the default.
-- With a metrics recorder, per-read counters cost about a quarter of 16-task point read throughput.
+- Reads count on their own thread and fold their counts into the metrics, so a metrics recorder
+  costs little: 31.5M point reads/s on 16 tasks with one, 31.9M/s without. Shared per-read
+  counters cost about a quarter (22.6M/s).
 - Files take about the size of the cached data. A load reads its range once from the object store.
 - Automatic promotion, from an empty cache: with room for all the data, 99% of reads were served
   from the cache within about 12 seconds. With a budget smaller than the data, 16-task point reads
@@ -399,9 +403,12 @@ shows the cost of writes to cached keys; the table above gives the read numbers.
 ### Observability
 
 - Configuration: `DbBuilder::with_range_cache`. New components: rebuild and promoter tasks.
-- Metrics under `slatedb.range_cache.`: reads served, mixed scans and the gaps they open, loads,
-  rebuilds, bytes, removals by reason, and gauges for ranges, file bytes and delta bytes.
-  Automatic promotion adds its own counters.
+- Metrics under `slatedb.range_cache.`: reads served, mixed scans and the gaps they open, retries
+  and fallbacks to the normal path by reason, loads, rebuilds, bytes, removals by reason, and
+  gauges for ranges, file bytes and delta bytes. Automatic promotion adds its own counters. The
+  read-path counters, and `slatedb.db.request_count` for reads that the cache serves, are counted
+  on each thread and added to the shared counters at the same folds as the ranges' reads, so a
+  read writes no shared counter. They are exact only after a fold.
 - Logging: a warning when a rebuild or a cache read fails.
 
 ### Compatibility

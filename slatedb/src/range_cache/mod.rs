@@ -39,14 +39,21 @@
 //! normal-path reads (see the `auto` module). This module keeps the parts that the cache core
 //! needs: the read heat of each range, eviction by read density, the payback check of rebuilds,
 //! and the memory of removed ranges and failed promotions.
+//!
+//! # Read bookkeeping
+//!
+//! A read that the cache serves writes no memory that other reads write. It counts its result
+//! and the range that it used on its own thread, and the thread adds its counts to the metrics
+//! and to the ranges' read counts and last accesses every few thousand reads or about every
+//! 10 ms (see the `hits` module). Eviction and automatic promotion use those folded values.
 
 mod auto;
 mod file;
+mod hits;
 mod mixed;
 mod scan;
 pub mod stats;
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -86,9 +93,10 @@ use auto::AutoSettings;
 pub(crate) use auto::{Promoter, PromoterMessage, RANGE_CACHE_PROMOTER_TASK_NAME};
 pub use file::RangeCachePageSource;
 use file::{RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION, TEMP_FILE_EXTENSION};
+use hits::{HitStats, RangeHits};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
-use stats::{AutoStats, RangeCacheStats, RemoveReason};
+use stats::{AutoStats, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
 
 /// The number of times a read tries to pin a range before it uses the normal read path.
 const PIN_ATTEMPTS: usize = 3;
@@ -191,6 +199,15 @@ pub struct RangeCacheTuning {
     /// most `load_fetch_bytes * load_fetch_tasks` for each of them. See
     /// [`crate::config::ScanOptions::max_fetch_tasks`].
     pub load_fetch_tasks: usize,
+    /// A thread adds the counts of the reads that the cache served to the shared counters after
+    /// this many counted events. The shared counters are the read-path metrics, the database's
+    /// request counters, and the read counts and last accesses of ranges, which eviction and
+    /// automatic promotion use. 1 updates them at each read. 0 counts as 1.
+    pub stats_fold_events: u32,
+    /// A thread also adds its counts when this long has passed since it last did. It checks the
+    /// time at the 1st, 2nd, 4th, 8th and so on counted event after it last added them, so a
+    /// thread that keeps reading adds its counts within about twice this time.
+    pub stats_fold_interval: Duration,
 }
 
 impl Default for RangeCacheTuning {
@@ -216,6 +233,8 @@ impl Default for RangeCacheTuning {
             // reason. See `CompactionWorkerOptions::bytes_to_fetch`.
             load_fetch_bytes: 2 * 1024 * 1024,
             load_fetch_tasks: 4,
+            stats_fold_events: 4096,
+            stats_fold_interval: Duration::from_millis(10),
         }
     }
 }
@@ -305,18 +324,11 @@ pub(crate) enum Origin {
     },
 }
 
-/// Reads count in steps of this size on each thread, so that a read of a hot range does not
-/// write its counter each time.
-const HEAT_STEP: u64 = 16;
-
-thread_local! {
-    static HEAT_TICKS: Cell<u64> = const { Cell::new(0) };
-}
-
-/// The read rate of a cached range, for automatic promotion.
+/// The reads and the read rate of a cached range, for eviction and automatic promotion.
 struct Heat {
-    /// The reads that the range served, counted in steps of `HEAT_STEP` on each thread.
-    reads: AtomicU64,
+    /// The reads that the range served, up to the last fold of each thread, and its last
+    /// access. See the `hits` module.
+    hits: Arc<RangeHits>,
     rate: Mutex<HeatRate>,
 }
 
@@ -330,7 +342,7 @@ struct HeatRate {
 impl Heat {
     fn new(rate: f64, now_ms: i64) -> Self {
         Self {
-            reads: AtomicU64::new(0),
+            hits: Arc::new(RangeHits::default()),
             rate: Mutex::new(HeatRate {
                 reads: 0,
                 at_ms: now_ms,
@@ -339,19 +351,8 @@ impl Heat {
         }
     }
 
-    fn tick(&self) {
-        let step = HEAT_TICKS.with(|ticks| {
-            let next = ticks.get().wrapping_add(1);
-            ticks.set(next);
-            next.is_multiple_of(HEAT_STEP)
-        });
-        if step {
-            self.reads.fetch_add(HEAT_STEP, Ordering::Relaxed);
-        }
-    }
-
     fn reads(&self) -> u64 {
-        self.reads.load(Ordering::Relaxed)
+        self.hits.reads()
     }
 
     /// Returns the decayed reads per second at `now_ms`, with half-life `half_life_ms`.
@@ -375,10 +376,13 @@ struct CachedRange {
     start: Bytes,
     end: Option<Bytes>,
     layers: ArcSwap<Layers>,
-    /// The value of the cache's access clock when a read last used the range.
-    last_access: AtomicU64,
+    /// A small number that no other indexed range has. A removed range's slot goes to a later
+    /// range. Thread blocks of the `hits` module keep the counts of ranges by slot.
+    slot: u32,
     /// True if automatic promotion cached the range.
     auto: bool,
+    /// The reads of the range and its last access (the value of the cache's access clock at the
+    /// last fold that counted a read of it), and its read rate.
     heat: Heat,
     /// The estimated normal-path cost of one read of the range, in nanoseconds. Zero for an
     /// explicit range, which uses the average cost of sampled reads.
@@ -388,7 +392,14 @@ struct CachedRange {
 }
 
 impl CachedRange {
-    fn new(start: Bytes, end: Option<Bytes>, layers: Layers, origin: Origin, now_ms: i64) -> Self {
+    fn new(
+        start: Bytes,
+        end: Option<Bytes>,
+        layers: Layers,
+        origin: Origin,
+        now_ms: i64,
+        slot: u32,
+    ) -> Self {
         let (auto, read_cost_ns, rate) = match origin {
             Origin::Explicit => (false, 0, 0.0),
             Origin::Auto {
@@ -400,7 +411,7 @@ impl CachedRange {
             start,
             end,
             layers: ArcSwap::from_pointee(layers),
-            last_access: AtomicU64::new(0),
+            slot,
             auto,
             heat: Heat::new(rate, now_ms),
             read_cost_ns,
@@ -538,6 +549,32 @@ struct CacheState {
     ghosts: Vec<Ghost>,
     /// Ranges where a promotion failed recently, by start key.
     backoff: BTreeMap<Bytes, Backoff>,
+    slots: Slots,
+}
+
+/// The slot numbers of indexed ranges (see `CachedRange::slot`).
+#[derive(Default)]
+struct Slots {
+    /// The lowest number that no range has had.
+    next: u32,
+    /// Numbers of removed ranges.
+    free: Vec<u32>,
+}
+
+impl Slots {
+    /// Takes the lowest free number, so that the numbers stay as small as the number of indexed
+    /// ranges.
+    fn take(&mut self) -> u32 {
+        if let Some((i, _)) = self.free.iter().enumerate().min_by_key(|(_, slot)| **slot) {
+            return self.free.swap_remove(i);
+        }
+        self.next += 1;
+        self.next - 1
+    }
+
+    fn give_back(&mut self, slot: u32) {
+        self.free.push(slot);
+    }
 }
 
 /// An automatic range that the cache removed. Promoting it again within the ghost time needs
@@ -609,10 +646,11 @@ pub(crate) struct RangeCache {
     inserted_seq: AtomicU64,
     /// Advances each time `register` publishes ranges. See [`RangeCache::register`].
     publish_epoch: AtomicU64,
-    /// Advances by two on each load and rebuild. Reads copy it to the ranges they use. A new
-    /// range gets the value between the old and the new clock, so it counts as used after
-    /// the reads before its load and before the reads after its load.
-    access_clock: AtomicU64,
+    /// The bookkeeping of the reads that the cache serves. Its access clock advances by two on
+    /// each load and rebuild. Folds copy it to the ranges that reads used. A new range gets the
+    /// value between the old and the new clock, so it counts as used after the reads before its
+    /// load and before the reads after its load.
+    hits: HitStats,
     stats: RangeCacheStats,
     /// Automatic promotion, if configured.
     auto: Option<AutoShared>,
@@ -681,6 +719,12 @@ impl RangeCache {
             }
             None => (None, None),
         };
+        let hits = HitStats::new(
+            stats::read_counters(recorder),
+            options.tuning.stats_fold_events,
+            options.tuning.stats_fold_interval,
+            clock.clone(),
+        );
         let cache = Arc::new(Self {
             options,
             index: ArcSwap::from_pointee(RangeIndex::new()),
@@ -690,11 +734,12 @@ impl RangeCache {
                 closed: false,
                 ghosts: Vec::new(),
                 backoff: BTreeMap::new(),
+                slots: Slots::default(),
             }),
             disk_bytes: Arc::new(AtomicU64::new(0)),
             inserted_seq: AtomicU64::new(0),
             publish_epoch: AtomicU64::new(0),
-            access_clock: AtomicU64::new(0),
+            hits,
             stats: RangeCacheStats::new(recorder),
             auto,
             clock,
@@ -924,7 +969,7 @@ impl RangeCache {
             file_seq: seq,
             end: range.end.clone(),
         }));
-        self.access_clock.fetch_add(2, Ordering::Relaxed);
+        self.hits.access_clock().fetch_add(2, Ordering::Relaxed);
         self.enforce_budget_locked(&mut state, None);
     }
 
@@ -956,6 +1001,7 @@ impl RangeCache {
         let mut index = RangeIndex::clone(&self.index.load());
         index.remove(&range.start);
         self.index.store(Arc::new(index));
+        state.slots.give_back(range.slot);
         self.stats.removed(reason);
         self.update_gauges();
         self.remember_removal(state, range, reason);
@@ -1059,7 +1105,7 @@ impl RangeCache {
                 .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)));
             let victim = match &self.auto {
                 None => candidates
-                    .min_by_key(|r| r.last_access.load(Ordering::Relaxed))
+                    .min_by_key(|r| r.heat.hits.last_access())
                     .cloned(),
                 Some(_) => candidates
                     .map(|r| (r, self.eviction_key(r, now)))
@@ -1083,11 +1129,7 @@ impl RangeCache {
         } else {
             0.0
         };
-        (
-            !range.auto,
-            density,
-            range.last_access.load(Ordering::Relaxed),
-        )
+        (!range.auto, density, range.heat.hits.last_access())
     }
 
     /// The decayed normal-path cost per second per byte that `range` saves: its read rate
@@ -1119,31 +1161,41 @@ impl RangeCache {
             .set(self.disk_bytes.load(Ordering::Relaxed) as i64);
     }
 
-    /// Returns true if a read at `seq` can use `layers`. See the sequence number rules.
-    fn usable(layers: &Layers, seq: u64) -> bool {
-        layers.file.is_some()
-            && seq >= layers.file_seq
-            && layers.active.sealed_at.load(Ordering::SeqCst) >= seq
+    /// Checks whether a read at `seq` can use `layers`. See the sequence number rules. Callers
+    /// treat a loading range, which has no file, as uncovered before they call this.
+    fn usable(layers: &Layers, seq: u64) -> Result<(), Unfit> {
+        if layers.file.is_none() || seq < layers.file_seq {
+            return Err(Unfit::TooOld);
+        }
+        if layers.active.sealed_at.load(Ordering::SeqCst) < seq {
+            return Err(Unfit::Sealed);
+        }
+        Ok(())
     }
 
-    /// Records that a read used `cached`.
-    fn touch(&self, cached: &CachedRange) {
-        let now = self.access_clock.load(Ordering::Relaxed);
-        if cached.last_access.load(Ordering::Relaxed) != now {
-            cached.last_access.store(now, Ordering::Relaxed);
-        }
-        if self.auto.is_some() {
-            cached.heat.tick();
-        }
+    /// Counts a read that used `range`, on this thread. See the `hits` module.
+    fn count_read(&self, range: &CachedRange, count: ReadCount) {
+        self.hits.read(range.slot, &range.heat.hits, count);
+    }
+
+    /// Counts an attempt `attempt` (from 1) of `op` that failed the sequence number rules: a
+    /// retry, or after the last attempt a fallback to the normal read path.
+    fn count_unfit(&self, op: PinOp, reason: Unfit, attempt: usize) {
+        self.hits.count(if attempt < PIN_ATTEMPTS {
+            ReadCount::retry(op, reason)
+        } else {
+            ReadCount::unusable(op, reason)
+        });
     }
 
     /// Reads `key` at the last committed sequence number, or at `at` for a read in a snapshot
     /// or a transaction (see [`read_seq`]).
     ///
     /// The common path holds the index and the layers through `arc_swap` guards and takes no
-    /// reference count, so concurrent reads of one range do not write a shared cache line.
+    /// reference count, and it counts the read on its own thread, so concurrent reads of one
+    /// range do not write a shared cache line.
     pub(crate) fn get(&self, key: &[u8], oracle: &dyn Oracle, at: Option<u64>) -> CacheRead {
-        for _ in 0..PIN_ATTEMPTS {
+        for attempt in 1..=PIN_ATTEMPTS {
             let index = self.index.load();
             let Some(cached) = covering(&index, key) else {
                 return CacheRead::Uncovered;
@@ -1153,22 +1205,22 @@ impl RangeCache {
                 return CacheRead::Uncovered;
             }
             let seq = read_seq(oracle, at);
-            if !Self::usable(&layers, seq) {
+            if let Err(reason) = Self::usable(&layers, seq) {
+                self.count_unfit(PinOp::Get, reason, attempt);
                 continue;
             }
-            self.touch(cached);
             return match lookup(&layers, key, seq) {
                 Ok(Some(entry)) => match entry.value {
                     ValueDeletable::Value(_) => {
-                        self.stats.get_hits.increment(1);
+                        self.count_read(cached, ReadCount::GetHit);
                         CacheRead::Answer(Some(KeyValue::from(entry)))
                     }
                     ValueDeletable::Tombstone => {
-                        self.stats.get_absent.increment(1);
+                        self.count_read(cached, ReadCount::GetAbsent);
                         CacheRead::Answer(None)
                     }
                     ValueDeletable::Merge(_) => {
-                        self.stats.get_merges.increment(1);
+                        self.count_read(cached, ReadCount::GetMerge);
                         CacheRead::Resolve(Pinned {
                             layers: arc_swap::Guard::into_inner(layers),
                             seq,
@@ -1176,7 +1228,7 @@ impl RangeCache {
                     }
                 },
                 Ok(None) => {
-                    self.stats.get_absent.increment(1);
+                    self.count_read(cached, ReadCount::GetAbsent);
                     CacheRead::Answer(None)
                 }
                 Err(e) => {
@@ -1231,7 +1283,7 @@ impl RangeCache {
                 &excluded_start
             }
         };
-        for _ in 0..PIN_ATTEMPTS {
+        for attempt in 1..=PIN_ATTEMPTS {
             let index = self.index.load();
             let first = covering(&index, start)?;
             let mut parts = vec![first.layers.load_full()];
@@ -1244,12 +1296,12 @@ impl RangeCache {
                 return None;
             }
             let seq = read_seq(oracle, at);
-            if !parts.iter().all(|l| Self::usable(l, seq)) {
+            if let Some(reason) = parts.iter().find_map(|l| Self::usable(l, seq).err()) {
+                self.count_unfit(PinOp::Scan, reason, attempt);
                 continue;
             }
             // Only the first range counts as read: most scans end in it.
-            self.touch(first);
-            self.stats.scans.increment(1);
+            self.count_read(first, ReadCount::Scan);
             return Some(Ok(PinnedScan { parts, seq }));
         }
         Some(Err(()))
@@ -1316,11 +1368,18 @@ impl RangeCache {
             let kind = if layers.file.is_none() {
                 // A loading range holds no rows yet.
                 PartKind::Gap { sample: true }
-            } else if Self::usable(&layers, seq) {
-                first_cached.get_or_insert(*cached);
-                PartKind::Cached(layers)
             } else {
-                PartKind::Gap { sample: false }
+                match Self::usable(&layers, seq) {
+                    Ok(()) => {
+                        first_cached.get_or_insert(*cached);
+                        PartKind::Cached(layers)
+                    }
+                    Err(reason) => {
+                        self.hits
+                            .count(ReadCount::unusable(PinOp::ScanPart, reason));
+                        PartKind::Gap { sample: false }
+                    }
+                }
             };
             push(kind, from, to);
             cursor = cached.end.clone().map(Included);
@@ -1472,7 +1531,7 @@ impl RangeCache {
         origin: Origin,
         snapshot: impl FnOnce(u64) -> Arc<DbSnapshot>,
     ) -> Result<(Vec<Arc<CachedRange>>, Arc<DbSnapshot>), SlateDBError> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         if state.closed {
             return Err(SlateDBError::Closed);
         }
@@ -1496,6 +1555,7 @@ impl RangeCache {
                 layers,
                 origin,
                 now,
+                state.slots.take(),
             ));
             index.insert(part_start, range.clone());
             ranges.push(range);
@@ -1591,8 +1651,8 @@ impl RangeCache {
         }
         self.stats.loads.increment(1);
         self.stats.load_bytes.increment(file.file_len());
-        let now = self.access_clock.fetch_add(2, Ordering::Relaxed) + 2;
-        range.last_access.store(now - 1, Ordering::Relaxed);
+        let now = self.hits.access_clock().fetch_add(2, Ordering::Relaxed) + 2;
+        range.heat.hits.set_last_access(now - 1);
         range.layers.store(Arc::new(Layers {
             active: layers.active.clone(),
             frozen: None,
@@ -1823,24 +1883,20 @@ impl DbInner {
         if !can_serve_get(options) {
             return GetRoute::Normal(None);
         }
+        // A served read counts in `get_requests` through the cache's bookkeeping, at its folds.
+        cache.hits.bind_db(&self.db_stats);
         match cache.get(key, self.oracle.as_ref(), at) {
             CacheRead::Uncovered => GetRoute::Normal(cache.sample().map(|sample| SampledRead {
                 sample,
                 key: Bytes::copy_from_slice(key),
             })),
             CacheRead::Unusable => GetRoute::Normal(None),
-            CacheRead::Answer(kv) => {
-                self.db_stats.get_requests.increment(1);
-                GetRoute::Served(Ok(kv))
-            }
-            CacheRead::Resolve(pinned) => {
-                self.db_stats.get_requests.increment(1);
-                GetRoute::Served(
-                    pinned
-                        .get(key, self.reader.read_merge_operator.clone())
-                        .await,
-                )
-            }
+            CacheRead::Answer(kv) => GetRoute::Served(Ok(kv)),
+            CacheRead::Resolve(pinned) => GetRoute::Served(
+                pinned
+                    .get(key, self.reader.read_merge_operator.clone())
+                    .await,
+            ),
         }
     }
 
@@ -1859,15 +1915,14 @@ impl DbInner {
         if !can_serve_scan(options) {
             return ScanRoute::Normal(range, None);
         }
+        // A served scan counts in `scan_requests` through the cache's bookkeeping, at its folds.
+        cache.hits.bind_db(&self.db_stats);
         match cache.pin_scan(&range, self.oracle.as_ref(), at) {
-            ScanPin::Pinned(pinned) => {
-                self.db_stats.scan_requests.increment(1);
-                ScanRoute::Served(
-                    pinned
-                        .scan(range, self.reader.read_merge_operator.clone())
-                        .await,
-                )
-            }
+            ScanPin::Pinned(pinned) => ScanRoute::Served(
+                pinned
+                    .scan(range, self.reader.read_merge_operator.clone())
+                    .await,
+            ),
             ScanPin::Uncovered => {
                 for _ in 0..PIN_ATTEMPTS {
                     // The gaps read through the normal path from a state view `V` with
@@ -1896,7 +1951,7 @@ impl DbInner {
                             let frozen =
                                 !Arc::ptr_eq(&view.memtable, self.state.read().memtable().table());
                             if frozen {
-                                cache.stats.mixed_scan_retries.increment(1);
+                                cache.hits.count(ReadCount::MixedScanRetry);
                                 continue;
                             }
                             view
@@ -1904,8 +1959,7 @@ impl DbInner {
                         None => self.state.read().view(),
                     };
                     // As for a fully cached scan, the first cached range counts as read.
-                    cache.touch(&pin.first);
-                    cache.stats.mixed_scans.increment(1);
+                    cache.count_read(&pin.first, ReadCount::MixedScan);
                     let gaps = GapSource {
                         reader: self.reader.clone(),
                         view,
@@ -1920,7 +1974,6 @@ impl DbInner {
                         self.reader.read_merge_operator.clone(),
                         gaps,
                     );
-                    self.db_stats.scan_requests.increment(1);
                     return ScanRoute::Served(
                         DbIterator::new_resolved(range, Box::new(scan), ReadTrace::none()).await,
                     );
@@ -2093,7 +2146,8 @@ mod tests {
     fn index(ranges: &[(&str, Option<&str>)]) -> RangeIndex {
         ranges
             .iter()
-            .map(|(start, end)| {
+            .enumerate()
+            .map(|(slot, (start, end))| {
                 (
                     b(start),
                     Arc::new(CachedRange::new(
@@ -2108,6 +2162,7 @@ mod tests {
                         },
                         Origin::Explicit,
                         0,
+                        slot as u32,
                     )),
                 )
             })
@@ -2184,5 +2239,328 @@ mod tests {
         assert!(range.contains_range(&r(Included("c"), Included("d"))));
         assert!(!range.contains_range(&r(Included("c"), Included("e"))));
         assert!(!range.contains_range(&r(Included("c"), Unbounded)));
+    }
+
+    #[test]
+    fn should_reuse_the_lowest_free_slot() {
+        let mut slots = Slots::default();
+        assert_eq!((slots.take(), slots.take(), slots.take()), (0, 1, 2));
+        slots.give_back(2);
+        slots.give_back(0);
+        assert_eq!((slots.take(), slots.take(), slots.take()), (0, 2, 3));
+    }
+
+    /// Reads through a database with a range cache, checked against the cache's counters.
+    mod reads {
+        use super::super::*;
+        use crate::db_stats::REQUEST_COUNT;
+        use crate::object_store::memory::InMemory;
+        use slatedb_common::clock::MockSystemClock;
+        use slatedb_common::metrics::{lookup_metric_with_labels, DefaultMetricsRecorder};
+
+        struct TestCache {
+            db: Db,
+            recorder: Arc<DefaultMetricsRecorder>,
+            _dir: tempfile::TempDir,
+        }
+
+        impl TestCache {
+            fn cache(&self) -> &Arc<RangeCache> {
+                self.db.inner.range_cache.as_ref().unwrap()
+            }
+
+            fn range(&self, start: &Bytes) -> Arc<CachedRange> {
+                self.cache().index.load().get(start).unwrap().clone()
+            }
+
+            fn metric(&self, name: &str, labels: &[(&str, &str)]) -> i64 {
+                lookup_metric_with_labels(&self.recorder, name, labels).unwrap_or(0)
+            }
+
+            /// Hits, absent reads, scans, and the database's get and scan requests.
+            fn read_metrics(&self) -> [i64; 5] {
+                [
+                    self.metric(stats::GET_COUNT, &[("result", "hit")]),
+                    self.metric(stats::GET_COUNT, &[("result", "absent")]),
+                    self.metric(stats::SCAN_COUNT, &[]),
+                    self.metric(REQUEST_COUNT, &[("op", "get")]),
+                    self.metric(REQUEST_COUNT, &[("op", "scan")]),
+                ]
+            }
+
+            fn unfit(&self, name: &str, op: &str, reason: &str) -> i64 {
+                self.metric(name, &[("op", op), ("reason", reason)])
+            }
+        }
+
+        async fn open(
+            tune: impl FnOnce(&mut RangeCacheOptions),
+            clock: Option<Arc<MockSystemClock>>,
+        ) -> TestCache {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = RangeCacheOptions::new(dir.path());
+            tune(&mut options);
+            let recorder = Arc::new(DefaultMetricsRecorder::new());
+            let mut builder = Db::builder("range_cache_reads", Arc::new(InMemory::new()))
+                .with_range_cache(options)
+                .with_metrics_recorder(recorder.clone());
+            if let Some(clock) = clock {
+                builder = builder.with_system_clock(clock);
+            }
+            TestCache {
+                db: builder.build().await.unwrap(),
+                recorder,
+                _dir: dir,
+            }
+        }
+
+        fn key(i: usize) -> Bytes {
+            Bytes::from(format!("key{i:05}"))
+        }
+
+        /// Puts the even keys below `n`.
+        async fn put_even(db: &Db, n: usize) {
+            for i in (0..n).step_by(2) {
+                db.put(key(i), format!("value-{i}")).await.unwrap();
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn should_count_reads_only_on_their_thread_until_a_fold() {
+            let t = open(
+                |o| {
+                    o.tuning.stats_fold_events = 1_000_000;
+                    o.tuning.stats_fold_interval = Duration::from_secs(3600);
+                },
+                None,
+            )
+            .await;
+            put_even(&t.db, 200).await;
+            t.db.cache_range(key(0)..key(200)).await.unwrap();
+            let range = t.range(&key(0));
+            let before = t.read_metrics();
+            let last_access = range.heat.hits.last_access();
+            let clock = t.cache().hits.access_clock().load(Ordering::Relaxed);
+            assert!(last_access < clock);
+
+            let handle = tokio::runtime::Handle::current();
+            std::thread::scope(|s| {
+                let (main, worker) = hits::Turn::pair();
+                s.spawn(|| {
+                    let worker = worker;
+                    handle.block_on(async {
+                        for i in 0..400 {
+                            t.db.get(key(i % 200)).await.unwrap();
+                        }
+                        for _ in 0..20 {
+                            t.db.scan(key(10)..key(20)).await.unwrap();
+                        }
+                    });
+                    worker.go();
+                    worker.wait();
+                    t.cache().hits.fold_current_thread();
+                    worker.go();
+                });
+                main.wait();
+                // The reader thread served 400 gets and 20 scans from the cache, and none of
+                // them wrote a shared counter, the range's read count or its last access.
+                assert_eq!(t.read_metrics(), before);
+                assert_eq!(range.heat.reads(), 0);
+                assert_eq!(range.heat.hits.last_access(), last_access);
+                main.go();
+                main.wait();
+                // Its fold adds all of them.
+                let [hits, absent, scans, gets, scan_requests] = before;
+                assert_eq!(
+                    t.read_metrics(),
+                    [
+                        hits + 200,
+                        absent + 200,
+                        scans + 20,
+                        gets + 400,
+                        scan_requests + 20
+                    ]
+                );
+                assert_eq!(range.heat.hits.last_access(), clock);
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn should_converge_to_the_true_counts_after_threads_exit() {
+            let t = open(|_| {}, None).await;
+            put_even(&t.db, 200).await;
+            t.db.cache_range(key(0)..key(200)).await.unwrap();
+            let range = t.range(&key(0));
+            let before = t.read_metrics();
+            let handle = tokio::runtime::Handle::current();
+            std::thread::scope(|s| {
+                let threads: Vec<_> = (0..4)
+                    .map(|_| {
+                        s.spawn(|| {
+                            handle.block_on(async {
+                                for i in 0..5_000 {
+                                    t.db.get(key(i % 200)).await.unwrap();
+                                }
+                            })
+                        })
+                    })
+                    .collect();
+                // A thread folds the rest of its counts when it exits, before its join returns.
+                for thread in threads {
+                    thread.join().unwrap();
+                }
+            });
+            let [hits, absent, scans, gets, scan_requests] = before;
+            assert_eq!(
+                t.read_metrics(),
+                [
+                    hits + 10_000,
+                    absent + 10_000,
+                    scans,
+                    gets + 20_000,
+                    scan_requests
+                ]
+            );
+            assert_eq!(range.heat.reads(), 20_000);
+        }
+
+        #[tokio::test]
+        async fn should_count_fallbacks_by_reason() {
+            let t = open(|_| {}, None).await;
+            put_even(&t.db, 200).await;
+            let old = t.db.snapshot().unwrap();
+            // A write after the snapshot, so that the load reads a newer state.
+            t.db.put(key(300), "later").await.unwrap();
+            t.db.cache_range(key(50)..key(150)).await.unwrap();
+
+            // The snapshot is older than the range's file: a point read and a covered scan try
+            // three times, and a mixed scan makes the cached part a gap.
+            assert_eq!(
+                old.get(key(60)).await.unwrap(),
+                Some(Bytes::from("value-60"))
+            );
+            old.scan(key(60)..key(70)).await.unwrap();
+            old.scan(key(40)..key(70)).await.unwrap();
+
+            // A freeze or a removal that a reader races seals the active delta below the
+            // reader's sequence number. Store the seal directly to make every attempt see it.
+            let range = t.range(&key(50));
+            range
+                .layers
+                .load()
+                .active
+                .sealed_at
+                .store(0, Ordering::SeqCst);
+            assert_eq!(
+                t.db.get(key(60)).await.unwrap(),
+                Some(Bytes::from("value-60"))
+            );
+            t.db.scan(key(60)..key(70)).await.unwrap();
+            t.db.scan(key(40)..key(70)).await.unwrap();
+
+            t.cache().hits.fold_current_thread();
+            for reason in ["too_old", "sealed"] {
+                assert_eq!(
+                    t.unfit(stats::PIN_RETRY_COUNT, "get", reason),
+                    2,
+                    "{reason}"
+                );
+                assert_eq!(
+                    t.unfit(stats::PIN_RETRY_COUNT, "scan", reason),
+                    2,
+                    "{reason}"
+                );
+                assert_eq!(t.unfit(stats::UNUSABLE_COUNT, "get", reason), 1, "{reason}");
+                assert_eq!(
+                    t.unfit(stats::UNUSABLE_COUNT, "scan", reason),
+                    1,
+                    "{reason}"
+                );
+                assert_eq!(
+                    t.unfit(stats::UNUSABLE_COUNT, "scan_part", reason),
+                    1,
+                    "{reason}"
+                );
+            }
+            // None of them counts as served.
+            assert_eq!(t.read_metrics()[..3], [0, 0, 0]);
+        }
+
+        #[tokio::test]
+        async fn should_evict_the_least_recently_read_range_by_folded_reads() {
+            // As in the integration test of eviction: the budget holds two ranges of 50 rows.
+            let t = open(
+                |o| {
+                    o.tuning.page_size = 4096;
+                    o.max_disk_bytes = 9000;
+                    // Only the fold size makes a thread fold.
+                    o.tuning.stats_fold_interval = Duration::from_secs(3600);
+                },
+                None,
+            )
+            .await;
+            for i in 0..300 {
+                t.db.put(key(i), format!("value-{i}")).await.unwrap();
+            }
+            t.db.cache_range(key(0)..key(50)).await.unwrap();
+            t.db.cache_range(key(100)..key(150)).await.unwrap();
+            // Enough reads of the first range for a fold at the default fold size. Until a fold,
+            // its last access is older than the second range's.
+            let fold = RangeCacheTuning::default().stats_fold_events;
+            let first = t.range(&key(0));
+            for _ in 0..fold {
+                t.db.get(key(10)).await.unwrap();
+            }
+            assert_eq!(first.heat.reads(), u64::from(fold));
+            t.db.cache_range(key(200)..key(250)).await.unwrap();
+            let starts: Vec<_> = t.db.cached_ranges().into_iter().map(|r| r.start).collect();
+            assert_eq!(starts, vec![key(0), key(200)]);
+        }
+
+        #[tokio::test]
+        async fn should_evict_automatic_ranges_by_folded_read_density() {
+            let clock = Arc::new(MockSystemClock::new());
+            let t = open(
+                |o| {
+                    o.tuning.page_size = 4096;
+                    o.max_disk_bytes = 9000;
+                    o.tuning.stats_fold_interval = Duration::from_secs(3600);
+                    o.auto_promote = Some(AutoPromoteOptions {
+                        heat_half_life: Duration::from_secs(1),
+                        ..AutoPromoteOptions::default()
+                    });
+                },
+                Some(clock.clone()),
+            )
+            .await;
+            for i in 0..300 {
+                t.db.put(key(i), format!("value-{i}")).await.unwrap();
+            }
+            let origin = Origin::Auto {
+                read_cost_ns: 1000,
+                read_rate: 0.0,
+            };
+            let load = |start: usize| {
+                let range = BytesRange::new(Included(key(start)), Excluded(key(start + 50)));
+                t.db.inner.cache_range_with(range, origin)
+            };
+            load(0).await.unwrap();
+            load(100).await.unwrap();
+            // Reads of the first range, one fold's worth. The second range gets none.
+            let fold = RangeCacheTuning::default().stats_fold_events;
+            for _ in 0..fold {
+                t.db.get(key(10)).await.unwrap();
+            }
+            clock.advance(Duration::from_secs(1)).await;
+            let (first, second) = (t.range(&key(0)), t.range(&key(100)));
+            let now = t.cache().now_ms();
+            assert!(t.cache().density(&first, now) > 0.0);
+            assert_eq!(t.cache().density(&second, now), 0.0);
+            // A third automatic range evicts the one with the lowest read density. Without the
+            // folded reads both would have none, and eviction would take the first one.
+            load(200).await.unwrap();
+            let starts: Vec<_> = t.db.cached_ranges().into_iter().map(|r| r.start).collect();
+            assert_eq!(starts, vec![key(0), key(200)]);
+        }
     }
 }

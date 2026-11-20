@@ -1,4 +1,10 @@
 //! Metrics of the range cache.
+//!
+//! The counters of the read path (`get_count`, `scan_count`, `mixed_scan_count`,
+//! `scan_gap_count`, `mixed_scan_retry_count`, `pin_retry_count` and `unusable_count`) are
+//! counted on each thread first and added to the shared counters every few thousand reads or
+//! about every 10 ms, so a read writes no counter that other threads write. They are exact only
+//! after such a fold. See [`crate::RangeCacheTuning::stats_fold_events`].
 
 use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
 use std::sync::Arc;
@@ -23,6 +29,17 @@ pub const SCAN_GAP_COUNT: &str = range_cache_stat_name!("scan_gap_count");
 /// Attempts to plan a mixed scan at the latest state that a memtable freeze made the scan
 /// repeat. After a few, the scan uses the normal read path.
 pub const MIXED_SCAN_RETRY_COUNT: &str = range_cache_stat_name!("mixed_scan_retry_count");
+/// Attempts of a read to use a ready cached range that failed the sequence number rules and that
+/// the read tried again. The `op` label is `get` or `scan` (a scan that cached ranges hold
+/// completely). The `reason` label is `too_old` (the read's sequence number is below the range
+/// file's) or `sealed` (it is above the sequence number at which the cache stopped applying
+/// writes to the active delta: a freeze or a removal happened during the attempt).
+pub const PIN_RETRY_COUNT: &str = range_cache_stat_name!("pin_retry_count");
+/// Reads that a ready cached range holds but that used the normal read path, because the range
+/// failed the sequence number rules. The `reason` label is the reason of the last attempt, as for
+/// `pin_retry_count`. The `op` label is `get` and `scan` (after the last attempt), or
+/// `scan_part` (a part of a mixed scan that the normal read path then reads as a gap).
+pub const UNUSABLE_COUNT: &str = range_cache_stat_name!("unusable_count");
 /// Ranges that the cache loaded.
 pub const LOAD_COUNT: &str = range_cache_stat_name!("load_count");
 /// Bytes of range cache files that loads wrote.
@@ -93,6 +110,152 @@ impl RemoveReason {
             RemoveReason::ExpiringWrite | RemoveReason::Error | RemoveReason::NotWorthIt
         )
     }
+}
+
+/// Why a ready cached range failed the sequence number rules for a read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unfit {
+    /// The read's sequence number is below the sequence number of the range's file.
+    TooOld,
+    /// The read's sequence number is above the sequence number at which the active delta was
+    /// sealed.
+    Sealed,
+}
+
+/// The kind of read that pins cached ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinOp {
+    /// A point read.
+    Get,
+    /// A scan that cached ranges hold completely.
+    Scan,
+    /// One cached part of a mixed scan.
+    ScanPart,
+}
+
+/// A counter of the read path. A read adds to it on its own thread, and the thread adds its
+/// counts to the shared counter at fold points. See the `hits` module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadCount {
+    GetHit,
+    GetAbsent,
+    GetMerge,
+    Scan,
+    MixedScan,
+    ScanGap,
+    MixedScanRetry,
+    RetryGetTooOld,
+    RetryGetSealed,
+    RetryScanTooOld,
+    RetryScanSealed,
+    UnusableGetTooOld,
+    UnusableGetSealed,
+    UnusableScanTooOld,
+    UnusableScanSealed,
+    UnusablePartTooOld,
+    UnusablePartSealed,
+}
+
+/// The number of [`ReadCount`] variants.
+pub(crate) const READ_COUNTS: usize = 17;
+
+impl ReadCount {
+    /// Every variant, in the order of their discriminants.
+    pub(crate) const ALL: [ReadCount; READ_COUNTS] = [
+        ReadCount::GetHit,
+        ReadCount::GetAbsent,
+        ReadCount::GetMerge,
+        ReadCount::Scan,
+        ReadCount::MixedScan,
+        ReadCount::ScanGap,
+        ReadCount::MixedScanRetry,
+        ReadCount::RetryGetTooOld,
+        ReadCount::RetryGetSealed,
+        ReadCount::RetryScanTooOld,
+        ReadCount::RetryScanSealed,
+        ReadCount::UnusableGetTooOld,
+        ReadCount::UnusableGetSealed,
+        ReadCount::UnusableScanTooOld,
+        ReadCount::UnusableScanSealed,
+        ReadCount::UnusablePartTooOld,
+        ReadCount::UnusablePartSealed,
+    ];
+
+    /// The index of the counter in the arrays of the `hits` module.
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+
+    /// A failed attempt of `op` that the read tries again. A part of a mixed scan is never
+    /// tried again, so `op` is `Get` or `Scan`.
+    pub(crate) fn retry(op: PinOp, reason: Unfit) -> Self {
+        match (op, reason) {
+            (PinOp::Get, Unfit::TooOld) => ReadCount::RetryGetTooOld,
+            (PinOp::Get, Unfit::Sealed) => ReadCount::RetryGetSealed,
+            (PinOp::Scan | PinOp::ScanPart, Unfit::TooOld) => ReadCount::RetryScanTooOld,
+            (PinOp::Scan | PinOp::ScanPart, Unfit::Sealed) => ReadCount::RetryScanSealed,
+        }
+    }
+
+    /// A read of `op` that used the normal read path because of `reason`.
+    pub(crate) fn unusable(op: PinOp, reason: Unfit) -> Self {
+        match (op, reason) {
+            (PinOp::Get, Unfit::TooOld) => ReadCount::UnusableGetTooOld,
+            (PinOp::Get, Unfit::Sealed) => ReadCount::UnusableGetSealed,
+            (PinOp::Scan, Unfit::TooOld) => ReadCount::UnusableScanTooOld,
+            (PinOp::Scan, Unfit::Sealed) => ReadCount::UnusableScanSealed,
+            (PinOp::ScanPart, Unfit::TooOld) => ReadCount::UnusablePartTooOld,
+            (PinOp::ScanPart, Unfit::Sealed) => ReadCount::UnusablePartSealed,
+        }
+    }
+
+    /// The metric name and labels of the counter.
+    fn metric(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
+        match self {
+            ReadCount::GetHit => (GET_COUNT, &[("result", "hit")]),
+            ReadCount::GetAbsent => (GET_COUNT, &[("result", "absent")]),
+            ReadCount::GetMerge => (GET_COUNT, &[("result", "merge")]),
+            ReadCount::Scan => (SCAN_COUNT, &[]),
+            ReadCount::MixedScan => (MIXED_SCAN_COUNT, &[]),
+            ReadCount::ScanGap => (SCAN_GAP_COUNT, &[]),
+            ReadCount::MixedScanRetry => (MIXED_SCAN_RETRY_COUNT, &[]),
+            ReadCount::RetryGetTooOld => (PIN_RETRY_COUNT, &[("op", "get"), ("reason", "too_old")]),
+            ReadCount::RetryGetSealed => (PIN_RETRY_COUNT, &[("op", "get"), ("reason", "sealed")]),
+            ReadCount::RetryScanTooOld => {
+                (PIN_RETRY_COUNT, &[("op", "scan"), ("reason", "too_old")])
+            }
+            ReadCount::RetryScanSealed => {
+                (PIN_RETRY_COUNT, &[("op", "scan"), ("reason", "sealed")])
+            }
+            ReadCount::UnusableGetTooOld => {
+                (UNUSABLE_COUNT, &[("op", "get"), ("reason", "too_old")])
+            }
+            ReadCount::UnusableGetSealed => {
+                (UNUSABLE_COUNT, &[("op", "get"), ("reason", "sealed")])
+            }
+            ReadCount::UnusableScanTooOld => {
+                (UNUSABLE_COUNT, &[("op", "scan"), ("reason", "too_old")])
+            }
+            ReadCount::UnusableScanSealed => {
+                (UNUSABLE_COUNT, &[("op", "scan"), ("reason", "sealed")])
+            }
+            ReadCount::UnusablePartTooOld => (
+                UNUSABLE_COUNT,
+                &[("op", "scan_part"), ("reason", "too_old")],
+            ),
+            ReadCount::UnusablePartSealed => {
+                (UNUSABLE_COUNT, &[("op", "scan_part"), ("reason", "sealed")])
+            }
+        }
+    }
+}
+
+/// Registers the counters of the read path, indexed by [`ReadCount::index`].
+pub(crate) fn read_counters(recorder: &MetricsRecorderHelper) -> [Arc<dyn CounterFn>; READ_COUNTS] {
+    ReadCount::ALL.map(|count| {
+        let (name, labels) = count.metric();
+        recorder.counter(name).labels(labels).register()
+    })
 }
 
 /// Why the promoter rejected a candidate.
@@ -176,14 +339,9 @@ impl AutoStats {
     }
 }
 
+/// The metrics of the range cache, except the counters of the read path. Those go through the
+/// `hits` module. See [`read_counters`].
 pub(crate) struct RangeCacheStats {
-    pub(crate) get_hits: Arc<dyn CounterFn>,
-    pub(crate) get_absent: Arc<dyn CounterFn>,
-    pub(crate) get_merges: Arc<dyn CounterFn>,
-    pub(crate) scans: Arc<dyn CounterFn>,
-    pub(crate) mixed_scans: Arc<dyn CounterFn>,
-    pub(crate) scan_gaps: Arc<dyn CounterFn>,
-    pub(crate) mixed_scan_retries: Arc<dyn CounterFn>,
     pub(crate) loads: Arc<dyn CounterFn>,
     pub(crate) load_bytes: Arc<dyn CounterFn>,
     pub(crate) rebuilds: Arc<dyn CounterFn>,
@@ -201,12 +359,6 @@ pub(crate) struct RangeCacheStats {
 
 impl RangeCacheStats {
     pub(crate) fn new(recorder: &MetricsRecorderHelper) -> Self {
-        let get = |result| {
-            recorder
-                .counter(GET_COUNT)
-                .labels(&[("result", result)])
-                .register()
-        };
         let removed = |reason| {
             recorder
                 .counter(REMOVE_COUNT)
@@ -214,13 +366,6 @@ impl RangeCacheStats {
                 .register()
         };
         Self {
-            get_hits: get("hit"),
-            get_absent: get("absent"),
-            get_merges: get("merge"),
-            scans: recorder.counter(SCAN_COUNT).register(),
-            mixed_scans: recorder.counter(MIXED_SCAN_COUNT).register(),
-            scan_gaps: recorder.counter(SCAN_GAP_COUNT).register(),
-            mixed_scan_retries: recorder.counter(MIXED_SCAN_RETRY_COUNT).register(),
             loads: recorder.counter(LOAD_COUNT).register(),
             load_bytes: recorder.counter(LOAD_BYTES).register(),
             rebuilds: recorder.counter(REBUILD_COUNT).register(),
@@ -247,5 +392,48 @@ impl RangeCacheStats {
             RemoveReason::NotWorthIt => &self.removed_not_worth_it,
         };
         counter.increment(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn should_list_each_read_count_once_in_order() {
+        for (i, count) in ReadCount::ALL.iter().enumerate() {
+            assert_eq!(count.index(), i, "{count:?}");
+        }
+        let metrics: BTreeSet<_> = ReadCount::ALL.iter().map(|c| c.metric()).collect();
+        assert_eq!(metrics.len(), READ_COUNTS, "two read counts share a metric");
+    }
+
+    #[test]
+    fn should_map_retries_and_fallbacks_to_their_op_and_reason() {
+        let cases = [
+            (PinOp::Get, Unfit::TooOld, "get", "too_old"),
+            (PinOp::Get, Unfit::Sealed, "get", "sealed"),
+            (PinOp::Scan, Unfit::TooOld, "scan", "too_old"),
+            (PinOp::Scan, Unfit::Sealed, "scan", "sealed"),
+        ];
+        for (op, reason, op_label, reason_label) in cases {
+            let labels = [("op", op_label), ("reason", reason_label)];
+            assert_eq!(
+                ReadCount::retry(op, reason).metric(),
+                (PIN_RETRY_COUNT, &labels[..])
+            );
+            assert_eq!(
+                ReadCount::unusable(op, reason).metric(),
+                (UNUSABLE_COUNT, &labels[..])
+            );
+        }
+        assert_eq!(
+            ReadCount::unusable(PinOp::ScanPart, Unfit::Sealed).metric(),
+            (
+                UNUSABLE_COUNT,
+                &[("op", "scan_part"), ("reason", "sealed")][..]
+            )
+        );
     }
 }

@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::scan::CachedScan;
+use super::stats::ReadCount;
 use super::{scan_start, Layers, RangeCache};
 use crate::bytes_range::BytesRange;
 use crate::config::ScanOptions;
@@ -164,7 +165,7 @@ impl MixedScan {
         };
         let gaps = &self.gaps;
         let sampled = if sample { gaps.cache.sample() } else { None };
-        gaps.cache.stats.scan_gaps.increment(1);
+        gaps.cache.hits.count(ReadCount::ScanGap);
         let iter = gaps
             .reader
             .scan_with_options(
