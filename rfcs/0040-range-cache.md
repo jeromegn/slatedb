@@ -205,7 +205,10 @@ state that was current during the read. It makes a cached read equal the normal 
    a snapshot at the larger of `inserted_seq` and the last committed sequence number; record its
    sequence number as the `file_seq` of the new ranges.
 2. Scan each part from the snapshot into a new file, with `dirty: true` and `cache_blocks: false`.
-   Stop on a row with an expire time, or when the file grows larger than the disk budget.
+   The scan reads ahead like a compaction: requests of about 2 MiB, up to 4 in flight for each
+   SST (`load_fetch_bytes` and `load_fetch_tasks` in the tuning). A load then costs about one
+   request for each 2 MiB, and its time follows its bytes, not the latency of the store. Stop on a
+   row with an expire time, or when the file grows larger than the disk budget.
 3. Under the mutex, if the range is still in the index, attach the file, with the snapshot sequence
    number as `file_seq`. Then apply the disk budget.
 
@@ -268,7 +271,9 @@ hot set that changes over tens of seconds, and need tuning on real workloads.
 - **Sampling.** The read path samples one in `sample_one_in` of the reads that the cache could
   serve but no cached range holds. It times the read with the database's `SystemClock`, and sends
   the key and time to a bounded queue, which drops samples when full. The time is what a cache hit
-  would save. A task, the promoter, reads the queue. Its errors never fail the database.
+  would save. A task, the promoter, reads the queue. Its errors never fail the database. The
+  promoter loads an admitted candidate in a separate task, so it keeps reading the queue during
+  the load. It starts no other load and evaluates no candidate until the load ends.
 - **Candidates.** The promoter forms candidates of about `target_range_bytes` around sampled keys.
   It uses block boundaries from the SST index of the largest sorted run, or bounded scans when the
   database has segments or no sorted run. A candidate stops at, and extends to, cached neighbours.

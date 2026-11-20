@@ -10,10 +10,18 @@
 use std::collections::BTreeMap;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
+use object_store::path::Path as OsPath;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions as OsPutOptions, PutPayload, PutResult, RenameOptions,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use slatedb::config::SizeTieredCompactionSchedulerOptions;
@@ -734,6 +742,307 @@ async fn should_not_lose_writes_that_race_a_load() {
         assert_matches_snapshot(&db, (0..2000).map(key), (Unbounded, Unbounded)).await;
         db.close().await.unwrap();
     }
+}
+
+/// An object store that counts the reads of SST files and their bytes, and that can add a
+/// latency to each of them, like a remote object store.
+#[derive(Debug)]
+struct SlowSstStore {
+    inner: InMemory,
+    latency_us: AtomicU64,
+    sst_gets: AtomicU64,
+    sst_bytes: AtomicU64,
+}
+
+impl SlowSstStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemory::new(),
+            latency_us: AtomicU64::new(0),
+            sst_gets: AtomicU64::new(0),
+            sst_bytes: AtomicU64::new(0),
+        })
+    }
+
+    fn set_latency(&self, latency: Duration) {
+        self.latency_us
+            .store(latency.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    /// Returns the SST reads and their bytes since the last call.
+    fn take_counts(&self) -> (u64, u64) {
+        (
+            self.sst_gets.swap(0, Ordering::SeqCst),
+            self.sst_bytes.swap(0, Ordering::SeqCst),
+        )
+    }
+}
+
+impl std::fmt::Display for SlowSstStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowSstStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for SlowSstStore {
+    async fn put_opts(
+        &self,
+        location: &OsPath,
+        payload: PutPayload,
+        opts: OsPutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &OsPath,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &OsPath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let sst = location.as_ref().ends_with(".sst");
+        if sst {
+            let latency = self.latency_us.load(Ordering::SeqCst);
+            if latency > 0 {
+                tokio::time::sleep(Duration::from_micros(latency)).await;
+            }
+        }
+        let result = self.inner.get_opts(location, options).await?;
+        if sst {
+            self.sst_gets.fetch_add(1, Ordering::SeqCst);
+            self.sst_bytes
+                .fetch_add(result.range.end - result.range.start, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<OsPath>>,
+    ) -> BoxStream<'static, object_store::Result<OsPath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&OsPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&OsPath>,
+        offset: &OsPath,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&OsPath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &OsPath,
+        to: &OsPath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &OsPath,
+        to: &OsPath,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
+/// A 1 KiB value.
+fn kib_value(i: usize, round: usize) -> Bytes {
+    Bytes::from(format!("{round:04}-{i:0>1019}"))
+}
+
+/// Writes `n` rows of 1 KiB values in batches.
+async fn write_kib_rows(db: &Db, keys: impl IntoIterator<Item = usize>, round: usize) {
+    let mut batch = WriteBatch::new();
+    for (j, i) in keys.into_iter().enumerate() {
+        batch.put(key(i), kib_value(i, round));
+        if j % 256 == 255 {
+            db.write(std::mem::take(&mut batch)).await.unwrap();
+        }
+    }
+    if !batch.is_empty() {
+        db.write(batch).await.unwrap();
+    }
+}
+
+/// Opens a database on `store` with no compactor, so that its SSTs stay as written, and no block
+/// cache.
+async fn open_without_compactor(
+    store: Arc<SlowSstStore>,
+    tune: impl FnOnce(&mut RangeCacheOptions),
+) -> TestDb {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    tune(&mut opts);
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let settings = Settings {
+        compactor_options: None,
+        ..Settings::default()
+    };
+    // No block cache: every read of a block goes to the store.
+    let db = Db::builder("range_cache_load_test", store)
+        .with_db_cache_disabled()
+        .with_settings(settings)
+        .with_range_cache(opts)
+        .with_merge_operator(Arc::new(ConcatMergeOperator))
+        .with_metrics_recorder(recorder.clone())
+        .build()
+        .await
+        .unwrap();
+    TestDb { db, recorder, dir }
+}
+
+/// A load reads ahead in large requests, several at a time. One read per block, one at a time,
+/// needs about one request per 4 KiB block: more than 1,000 requests for this range, and more
+/// than 10 s at 10 ms each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_load_a_range_in_few_large_reads() {
+    let store = SlowSstStore::new();
+    let t = open_without_compactor(store.clone(), |_| {}).await;
+    let db = &t.db;
+    // Two L0 SSTs that overlap: 4 MiB of rows, then new versions of a quarter of them.
+    write_kib_rows(db, 0..4096, 0).await;
+    flush_memtable(db).await;
+    write_kib_rows(db, (0..4096).step_by(4), 1).await;
+    flush_memtable(db).await;
+    assert_eq!(db.manifest().l0().len(), 2);
+
+    // A normal scan reads the same blocks and indexes, one block per request.
+    store.take_counts();
+    let rows = collect(db.scan(key(0)..key(4096)).await.unwrap()).await;
+    assert_eq!(rows.len(), 4096);
+    let (scan_gets, scan_bytes) = store.take_counts();
+    assert!(scan_gets > 1000, "{scan_gets} reads for {scan_bytes} bytes");
+
+    store.set_latency(Duration::from_millis(10));
+    let started = std::time::Instant::now();
+    db.cache_range(key(0)..key(4096)).await.unwrap();
+    let elapsed = started.elapsed();
+    store.set_latency(Duration::ZERO);
+    let (gets, bytes) = store.take_counts();
+
+    let ranges = db.cached_ranges();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].file_rows, 4096);
+    // The same bytes in reads of about 2 MiB. Each SST adds the read of its index, and at most
+    // one read for the rounding.
+    assert!(
+        bytes <= scan_bytes,
+        "{bytes} bytes, {scan_bytes} for the scan"
+    );
+    let fetch = 2 * 1024 * 1024;
+    let bound = scan_bytes.div_ceil(fetch) + 2 * 2;
+    assert!(
+        gets <= bound,
+        "the load made {gets} SST reads (bound {bound}) for {bytes} bytes in {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the load took {elapsed:?} for {gets} SST reads"
+    );
+    assert_matches_snapshot(
+        db,
+        (0..4096).step_by(7).map(key),
+        (Included(key(0)), Excluded(key(4096))),
+    )
+    .await;
+    db.close().await.unwrap();
+}
+
+/// Writes, flushes and compactions race loads that read many small requests in parallel. The
+/// cache must still hold exactly the state of the normal path: no lost write, no write applied
+/// twice (merge operands), and no stale version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_not_lose_writes_that_race_a_parallel_load() {
+    let store = SlowSstStore::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    opts.tuning.min_rebuild_delta_bytes = 64 * 1024;
+    // Many reads in flight, so that each load runs long enough to overlap the writes.
+    opts.tuning.load_fetch_bytes = 16 * 1024;
+    opts.tuning.load_fetch_tasks = 4;
+    let settings = Settings {
+        compactor_options: Some(CompactorOptions {
+            poll_interval: Duration::from_millis(5),
+            scheduler_options: SizeTieredCompactionSchedulerOptions {
+                min_compaction_sources: 2,
+                ..Default::default()
+            }
+            .into(),
+            worker: Some(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(5),
+                ..Default::default()
+            }),
+            ..CompactorOptions::default()
+        }),
+        ..Settings::default()
+    };
+    let db = Db::builder("range_cache_parallel_load", store.clone())
+        .with_db_cache_disabled()
+        .with_settings(settings)
+        .with_range_cache(opts)
+        .with_merge_operator(Arc::new(ConcatMergeOperator))
+        .build()
+        .await
+        .unwrap();
+    write_kib_rows(&db, 0..2048, 0).await;
+    flush_memtable(&db).await;
+    write_kib_rows(&db, (0..2048).step_by(3), 1).await;
+    flush_memtable(&db).await;
+    store.set_latency(Duration::from_millis(2));
+
+    let writer = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            for round in 2..8 {
+                mixed_writes(&db, 2048, round).await;
+                if round % 2 == 0 {
+                    flush_memtable(&db).await;
+                }
+            }
+        })
+    };
+    for _ in 0..2 {
+        for start in (0..2048).step_by(256) {
+            db.cache_range(key(start)..key(start + 256)).await.unwrap();
+        }
+        db.uncache_range(key(0)..key(2048)).unwrap();
+    }
+    for start in (0..2048).step_by(256) {
+        db.cache_range(key(start)..key(start + 256)).await.unwrap();
+    }
+    writer.await.unwrap();
+    store.set_latency(Duration::ZERO);
+    wait_for(|| db.cached_ranges().iter().all(|r| !r.rebuilding)).await;
+    assert_eq!(db.cached_ranges().len(), 8);
+    assert_matches_snapshot(&db, (0..2048).map(key), (Unbounded, Unbounded)).await;
+    db.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1860,8 +2169,8 @@ fn should_match_the_normal_path_across_cached_ranges_and_gaps() {
     runner
         .run(&proptest::collection::vec(mixed_op(), 1..150), |ops| {
             let (m, g) = runtime.block_on(run_mixed(ops));
-            mixed.fetch_add(m, std::sync::atomic::Ordering::Relaxed);
-            gaps.fetch_add(g, std::sync::atomic::Ordering::Relaxed);
+            mixed.fetch_add(m, Ordering::Relaxed);
+            gaps.fetch_add(g, Ordering::Relaxed);
             Ok(())
         })
         .unwrap();
@@ -2422,6 +2731,71 @@ async fn should_promote_a_repeatedly_read_range() {
         (Included(key(400)), Excluded(key(600))),
     )
     .await;
+    db.close().await.unwrap();
+}
+
+/// The promoter keeps taking samples while an admitted range loads, so a slow load does not
+/// fill the queue from the read path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_keep_sampling_while_a_promotion_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    set_auto_options(&mut opts);
+    opts.tuning.queue_capacity = 16;
+    let clock = Arc::new(MockSystemClock::new());
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let fp_registry = Arc::new(FailPointRegistry::new());
+    let settings = Settings {
+        compactor_options: None,
+        ..Settings::default()
+    };
+    let db = Db::builder("range_cache_auto_load", Arc::new(InMemory::new()))
+        .with_settings(settings)
+        .with_range_cache(opts)
+        .with_metrics_recorder(recorder.clone())
+        .with_system_clock(clock.clone())
+        .with_fp_registry(fp_registry.clone())
+        .build()
+        .await
+        .unwrap();
+    let t = TestDb { db, recorder, dir };
+    let db = &t.db;
+    load_padded(db, 2000).await;
+
+    // Hold the load of the first admitted range.
+    fail_parallel::cfg(fp_registry.clone(), "range-cache-load", "pause").unwrap();
+    for _ in 0..40 {
+        read_keys(db, 500..510).await;
+        tick(&clock, 200).await;
+        if t.metric(ADMISSION_COUNT, &[("result", "free")]) > 0 {
+            break;
+        }
+    }
+    assert_eq!(t.metric(ADMISSION_COUNT, &[("result", "free")]), 1);
+    let recorded = t.metric(SAMPLE_COUNT, &[("result", "recorded")]);
+    let dropped = t.metric(SAMPLE_COUNT, &[("result", "dropped")]);
+    // Reads of other keys while the load waits: in bursts of half the queue, with time for the
+    // promoter to take them.
+    for burst in 0..20 {
+        read_keys(db, 1000 + burst * 8..1008 + burst * 8).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let dropped_during_load = t.metric(SAMPLE_COUNT, &[("result", "dropped")]) - dropped;
+    let recorded_during_load = t.metric(SAMPLE_COUNT, &[("result", "recorded")]) - recorded;
+    let admissions = t.metric(ADMISSION_COUNT, &[("result", "free")]);
+    let promotions = t.metric(PROMOTION_COUNT, &[]);
+    // Release the load before the checks, so that a failed check does not hang the test.
+    fail_parallel::cfg(fp_registry.clone(), "range-cache-load", "off").unwrap();
+    assert_eq!(
+        dropped_during_load, 0,
+        "the read path dropped samples while a promotion loaded"
+    );
+    assert_eq!(recorded_during_load, 160);
+    // No second admission while the load runs.
+    assert_eq!(admissions, 1);
+    assert_eq!(promotions, 0);
+    wait_for(|| holding(db, 500, 509).is_some()).await;
+    wait_for(|| t.metric(PROMOTION_COUNT, &[]) == 1).await;
     db.close().await.unwrap();
 }
 

@@ -16,6 +16,8 @@
 //!   the reservoir, decayed with the heat half-life. See [`Promoter::admit`].
 //! - A rejected candidate is remembered for a while, so a later seed in it is evaluated again
 //!   from the reservoir without a new index read or scan.
+//! - An admitted candidate loads in its own task, so the promoter keeps reading samples during
+//!   the load. Until the load ends, the promoter evaluates no candidate.
 //!
 //! The cache side (in the parent module) keeps the heat of cached ranges, evicts automatic ranges
 //! by read density, removes an automatic range whose reads do not pay for a rebuild, and
@@ -32,6 +34,7 @@ use futures::stream::BoxStream;
 use log::debug;
 use rand::RngExt;
 use slatedb_common::DbRand;
+use tokio::task::JoinHandle;
 
 use super::stats::{CandidateSource, RejectReason};
 use super::{Origin, RangeCache, RangeCacheTuning};
@@ -44,9 +47,12 @@ use crate::iter::IterationOrder;
 use crate::read_trace::ReadTrace;
 use crate::reader::ScanContext;
 use crate::types::ValueDeletable;
+use crate::utils::spawn_bg_task;
 
 /// The name of the promoter's task on the database's task executor.
 pub(crate) const RANGE_CACHE_PROMOTER_TASK_NAME: &str = "range_cache_promoter";
+/// The name of the task that loads an admitted candidate.
+const RANGE_CACHE_PROMOTION_TASK_NAME: &str = "range_cache_promotion";
 
 /// Options for automatic promotion. See [`super::RangeCacheOptions::auto_promote`].
 ///
@@ -380,6 +386,10 @@ pub(crate) struct Promoter {
     rejected: BTreeMap<Bytes, Rejected>,
     last_evaluation_ms: Option<i64>,
     avg_read_cost_ns: f64,
+    /// The load of the last admitted candidate. It runs as its own task, so the promoter keeps
+    /// taking samples from the queue while it runs. Only one load runs at a time: admission
+    /// counts only the files of loaded ranges against the disk budget.
+    load: Option<JoinHandle<Result<(), SlateDBError>>>,
 }
 
 impl Promoter {
@@ -399,6 +409,7 @@ impl Promoter {
             options,
             rejected: BTreeMap::new(),
             last_evaluation_ms: None,
+            load: None,
         }
     }
 
@@ -425,6 +436,9 @@ impl Promoter {
             );
         }
         self.cache.update_gauges();
+        if self.load.as_ref().is_some_and(|load| !load.is_finished()) {
+            return;
+        }
 
         let max = self.options.max_candidates_per_evaluation;
         let mut evaluated = 0;
@@ -463,12 +477,15 @@ impl Promoter {
                 },
             };
             evaluated += 1;
-            self.decide(candidate, now).await;
+            if self.decide(candidate, now) {
+                break;
+            }
         }
     }
 
-    /// Admits `candidate` and loads it, or remembers it as rejected.
-    async fn decide(&mut self, candidate: Candidate, now: i64) {
+    /// Admits `candidate` and starts its load, or remembers it as rejected. Returns true if it
+    /// started a load.
+    fn decide(&mut self, candidate: Candidate, now: i64) -> bool {
         let ghost = self.cache.ghost_since(&candidate.start, &candidate.end);
         let evidence = self.reservoir.evidence(
             &candidate.start,
@@ -494,6 +511,7 @@ impl Promoter {
                         checked_ms: now,
                     },
                 );
+                false
             }
             Verdict::Admit { evicting } => {
                 self.rejected.remove(&candidate.start);
@@ -516,10 +534,25 @@ impl Promoter {
                 };
                 let end = candidate.end.clone().map_or(Unbounded, Excluded);
                 let range = BytesRange::new(Included(candidate.start.clone()), end);
-                match self.db.cache_range_with(range, origin).await {
-                    Ok(()) => self.stats().promotions.increment(1),
-                    Err(e) => debug!("range cache promotion failed [error={:?}]", e),
-                }
+                let db = self.db.clone();
+                let cache = self.cache.clone();
+                self.load = Some(spawn_bg_task(
+                    RANGE_CACHE_PROMOTION_TASK_NAME.to_string(),
+                    &self.cache.handle,
+                    |_| {},
+                    async move {
+                        match db.cache_range_with(range, origin).await {
+                            Ok(()) => {
+                                if let Some(auto) = &cache.auto {
+                                    auto.stats.promotions.increment(1);
+                                }
+                            }
+                            Err(e) => debug!("range cache promotion failed [error={:?}]", e),
+                        }
+                        Ok(())
+                    },
+                ));
+                true
             }
         }
     }
@@ -761,10 +794,7 @@ impl Promoter {
     ) -> Result<Candidate, SlateDBError> {
         let half = (self.options.target_range_bytes / 2).max(1);
         let db_state = self.db.state.read().view();
-        let options = ScanOptions {
-            cache_blocks: false,
-            ..ScanOptions::default()
-        };
+        let options = self.cache.options.tuning.bulk_scan_options();
         let context = || ScanContext {
             db_state: &db_state,
             write_batch_iter: None,
@@ -864,6 +894,13 @@ impl MessageHandler<PromoterMessage> for Promoter {
         _messages: BoxStream<'async_trait, PromoterMessage>,
         _result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
+        // The database is closed now, so a running load stops at its next check. Wait for it,
+        // as the promoter waited for its loads before they ran as their own task.
+        if let Some(load) = self.load.take() {
+            if let Err(e) = load.await {
+                debug!("range cache promotion task failed [error={:?}]", e);
+            }
+        }
         Ok(())
     }
 }

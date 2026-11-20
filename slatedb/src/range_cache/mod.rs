@@ -181,6 +181,16 @@ pub struct RangeCacheTuning {
     pub min_read_cost: Duration,
     /// The estimated cost of rewriting one byte of a range file in a rebuild, in nanoseconds.
     pub rebuild_cost_ns_per_byte: f64,
+    /// The target size of one object store read when the cache loads a range, and when the
+    /// promoter scans to form a candidate. Each read fetches the fewest consecutive blocks of an
+    /// SST that hold at least this many bytes. See
+    /// [`crate::config::ScanOptions::read_ahead_bytes`].
+    pub load_fetch_bytes: usize,
+    /// The most reads in flight for each SST that a load reads. A load reads all the sorted
+    /// runs and L0 SSTs that overlap its range at the same time, so the bytes in flight are at
+    /// most `load_fetch_bytes * load_fetch_tasks` for each of them. See
+    /// [`crate::config::ScanOptions::max_fetch_tasks`].
+    pub load_fetch_tasks: usize,
 }
 
 impl Default for RangeCacheTuning {
@@ -202,6 +212,23 @@ impl Default for RangeCacheTuning {
             queue_capacity: 4096,
             min_read_cost: Duration::from_micros(1),
             rebuild_cost_ns_per_byte: 5.0,
+            // The values of the compaction worker, which reads SSTs in bulk for the same
+            // reason. See `CompactionWorkerOptions::bytes_to_fetch`.
+            load_fetch_bytes: 2 * 1024 * 1024,
+            load_fetch_tasks: 4,
+        }
+    }
+}
+
+impl RangeCacheTuning {
+    /// The scan options of the bulk reads of the cache: loads and candidate scans. They do not
+    /// put blocks in the block cache.
+    fn bulk_scan_options(&self) -> ScanOptions {
+        ScanOptions {
+            read_ahead_bytes: self.load_fetch_bytes,
+            max_fetch_tasks: self.load_fetch_tasks,
+            cache_blocks: false,
+            ..ScanOptions::default()
         }
     }
 }
@@ -616,6 +643,11 @@ impl RangeCache {
                 "range cache page size {} is not a power of two in 512..=65536",
                 options.tuning.page_size
             )));
+        }
+        if options.tuning.load_fetch_bytes == 0 || options.tuning.load_fetch_tasks == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "range cache load_fetch_bytes and load_fetch_tasks must be positive".to_string(),
+            ));
         }
         std::fs::create_dir_all(&options.root_folder)?;
         for entry in std::fs::read_dir(&options.root_folder)? {
@@ -1512,6 +1544,7 @@ impl RangeCache {
         file_seq: u64,
         check_open: &(dyn Fn() -> Result<(), SlateDBError> + Send + Sync),
     ) -> Result<(), SlateDBError> {
+        fail_point!(Arc::clone(&self.fp_registry), "range-cache-load");
         let file_id = {
             let mut state = self.state.lock();
             state.next_file_id += 1;
@@ -1939,11 +1972,12 @@ impl DbInner {
             let seq = inserted.max(self.oracle.last_committed_seq());
             DbSnapshot::new(self.clone(), Some(seq))
         })?;
+        // Read in large requests, several at a time, so that a load costs about one request
+        // per `load_fetch_bytes` and its time follows the bytes, not the store's latency.
         let options = ScanOptions {
             // The snapshot sequence number can be above the last committed one. See above.
             dirty: true,
-            cache_blocks: false,
-            ..ScanOptions::default()
+            ..cache.options.tuning.bulk_scan_options()
         };
         let mut result = Ok(());
         for range in &ranges {
