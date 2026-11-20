@@ -245,7 +245,10 @@ impl DbInner {
         // Check for transaction conflicts before proceeding with the write batch
         // if this batch is part of a transaction.
         if let Some(txn) = txn {
-            if self.txn_manager.check_has_conflict(&txn.id()) {
+            if self
+                .txn_manager
+                .check_has_conflict_with_reads(&txn.id(), &txn.read_set())
+            {
                 return Ok(Err(SlateDBError::TransactionConflict));
             }
         }
