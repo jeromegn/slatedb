@@ -17,6 +17,15 @@ use crate::transaction_manager::{IsolationLevel, TransactionManager};
 use crate::types::KeyValue;
 use crate::{DbReadOps, DbTransactionOps};
 
+/// The reads of a transaction that its commit checks for read-write conflicts: keys
+/// that a Serializable transaction read or that `mark_read` marked, and the ranges
+/// of its scans, taken at commit.
+#[derive(Default)]
+pub(crate) struct ReadSet {
+    pub(crate) keys: HashSet<Bytes>,
+    pub(crate) ranges: Vec<BytesRange>,
+}
+
 /// A database transaction that provides atomic read-write operations with
 /// configurable isolation levels. This is the main interface for transactional
 /// operations in SlateDB.
@@ -73,6 +82,10 @@ pub struct DbTransaction {
     isolation_level: IsolationLevel,
     /// Range trackers for scanned ranges (used for SSI conflict detection)
     range_trackers: Mutex<Vec<DbIteratorRangeTracker>>,
+    /// The reads that the commit checks for read-write conflicts. Only this
+    /// transaction's commit reads them, so they stay here and not in the shared
+    /// transaction manager.
+    read_set: Mutex<ReadSet>,
     /// Keys that should be excluded from write conflict detection when committing.
     untracked_write_keys: RwLock<HashSet<Bytes>>,
 }
@@ -94,8 +107,15 @@ impl DbTransaction {
             db_inner,
             isolation_level,
             range_trackers: Mutex::new(Vec::new()),
+            read_set: Mutex::new(ReadSet::default()),
             untracked_write_keys: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// The reads that the commit checks for read-write conflicts. The commit
+    /// holds this guard while the transaction manager checks for conflicts.
+    pub(crate) fn read_set(&self) -> parking_lot::MutexGuard<'_, ReadSet> {
+        self.read_set.lock()
     }
 
     /// Get a value from the transaction with default read options.
@@ -149,9 +169,7 @@ impl DbTransaction {
         // Track read key for SSI conflict detection if needed
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
             let key_bytes = Bytes::copy_from_slice(key.as_ref());
-            let mut read_keys = HashSet::new();
-            read_keys.insert(key_bytes);
-            self.txn_manager.track_read_keys(&self.txn_id, read_keys);
+            self.read_set.lock().keys.insert(key_bytes);
         }
 
         // The range cache serves reads at the transaction's sequence number, under the same
@@ -534,7 +552,7 @@ impl DbTransaction {
         // the read keys are tracked in the read set or not.
 
         let read_keys = keys.into_iter().map(|k| Bytes::copy_from_slice(k.as_ref()));
-        self.txn_manager.track_read_keys(&self.txn_id, read_keys);
+        self.read_set.lock().keys.extend(read_keys);
         Ok(())
     }
 
@@ -696,17 +714,25 @@ impl DbTransaction {
         // accumulated during scans. Each tracker carries the requested scan
         // range; the conflict check in `TransactionManager` will then catch
         // any committed write whose key falls inside it.
+        // The ranges are taken now: a scan that goes on after this call does not
+        // add to them.
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
-            for tracker in self.range_trackers.lock().iter() {
-                self.txn_manager
-                    .track_read_range(&self.txn_id, tracker.get_range());
-            }
+            let ranges: Vec<BytesRange> = self
+                .range_trackers
+                .lock()
+                .iter()
+                .map(|tracker| tracker.get_range())
+                .collect();
+            self.read_set.lock().ranges.extend(ranges);
         }
 
         // If the WriteBatch is empty, it's a no-op or read-only batch.
         if write_batch.is_empty() {
             // Check for read conflicts before returning Ok(None).
-            if self.txn_manager.check_has_conflict(&self.txn_id) {
+            if self
+                .txn_manager
+                .check_has_conflict_with_reads(&self.txn_id, &self.read_set())
+            {
                 return Err(SlateDBError::TransactionConflict.into());
             }
             return Ok(None);
