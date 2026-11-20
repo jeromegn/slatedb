@@ -1,4 +1,5 @@
 use crate::bytes_range::BytesRange;
+use crate::db_transaction::ReadSet;
 use crate::oracle::{DbOracle, Oracle};
 use crate::utils::IdGenerator;
 use bytes::Bytes;
@@ -193,7 +194,9 @@ impl TransactionManager {
         }
     }
 
-    /// Track a key read operation (for SSI)
+    /// Track a key read operation (for SSI). Transactions keep their reads in
+    /// their own `ReadSet`; this is for tests of the manager alone.
+    #[cfg(test)]
     pub(crate) fn track_read_keys(
         &self,
         txn_id: &Uuid,
@@ -205,7 +208,9 @@ impl TransactionManager {
         }
     }
 
-    /// Track a range scan operation (for SSI)
+    /// Track a range scan operation (for SSI). Transactions keep their reads in
+    /// their own `ReadSet`; this is for tests of the manager alone.
+    #[cfg(test)]
     pub(crate) fn track_read_range(&self, txn_id: &Uuid, range: BytesRange) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
@@ -218,7 +223,15 @@ impl TransactionManager {
     ///
     /// For Snapshot isolation: Only checks write-write conflicts
     /// For SerializableSnapshot isolation: Checks both write-write and read-write conflicts
+    #[cfg(test)]
     pub(crate) fn check_has_conflict(&self, txn_id: &Uuid) -> bool {
+        self.check_has_conflict_with_reads(txn_id, &ReadSet::default())
+    }
+
+    /// Check for conflicts as [`Self::check_has_conflict`] does, with `reads`, the
+    /// transaction's own read set, as its reads. The caller holds the guard of
+    /// `reads`, so the check sees every read recorded before the commit.
+    pub(crate) fn check_has_conflict_with_reads(&self, txn_id: &Uuid, reads: &ReadSet) -> bool {
         let inner = self.inner.read();
         let txn_state = match inner.active_txns.get(txn_id) {
             None => return false,
@@ -234,12 +247,20 @@ impl TransactionManager {
 
         // for SSI, we need to check read-write conflicts. if a transaction does not
         // track the read keys or ranges at all, this transaction is considered as
-        // same as a SI transaction.
-        inner.has_read_write_conflict(
-            &txn_state.read_keys,
-            txn_state.read_ranges.clone(),
-            txn_state.started_seq,
-        )
+        // same as a SI transaction. The reads come from the transaction's own read
+        // set. Reads tracked in the manager (tests of the manager alone) count too.
+        if txn_state.read_keys.is_empty() && txn_state.read_ranges.is_empty() {
+            return inner.has_read_write_conflict(
+                &reads.keys,
+                reads.ranges.clone(),
+                txn_state.started_seq,
+            );
+        }
+        let mut read_keys = txn_state.read_keys.clone();
+        read_keys.extend(reads.keys.iter().cloned());
+        let mut read_ranges = txn_state.read_ranges.clone();
+        read_ranges.extend(reads.ranges.iter().cloned());
+        inner.has_read_write_conflict(&read_keys, read_ranges, txn_state.started_seq)
     }
 
     /// [`Self::track_recent_committed_txn_with`], ending the transaction's retention too.
