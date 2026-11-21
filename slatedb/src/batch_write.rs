@@ -60,6 +60,10 @@ pub(crate) enum BatchWriterMessage {
     WriteBatch(WriteBatchRequest),
     /// Flush the wal if enabled, and optionally freeze the current active memtable.
     Flush(BatchWriterFlush),
+    /// Apply the range cache's queued requests. A request sends this message so that an idle
+    /// writer applies it. See RFC 0040.
+    #[cfg(feature = "range_cache")]
+    RangeCache,
 }
 
 pub(crate) struct BatchWriterFlush {
@@ -95,6 +99,8 @@ impl std::fmt::Debug for BatchWriterMessage {
                 .debug_struct("Flush")
                 .field("freeze_memtable", freeze_memtable)
                 .finish(),
+            #[cfg(feature = "range_cache")]
+            BatchWriterMessage::RangeCache => f.debug_struct("RangeCache").finish(),
         }
     }
 }
@@ -159,6 +165,13 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                     }
                 }
             }
+            #[cfg(feature = "range_cache")]
+            BatchWriterMessage::RangeCache => {
+                if let Some(range_cache) = &self.db_inner.range_cache {
+                    range_cache.drain(self.db_inner.oracle.as_ref());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -186,6 +199,9 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                     } = flush_msg;
                     let _ = done.send(Err(error.clone()));
                 }
+                // The range cache is closed above. It answered its queued requests.
+                #[cfg(feature = "range_cache")]
+                BatchWriterMessage::RangeCache => {}
             }
         }
         if let Some(wal_writer) = self.wal_writer.as_mut() {
@@ -490,7 +506,7 @@ impl DbInner {
             entries.iter().for_each(|entry| memtable.put(entry.clone()));
             let durable_watcher = memtable.table().durable_watcher();
             drop(guard);
-            range_cache.apply_write(&entries);
+            range_cache.apply_write(&entries, self.oracle.as_ref());
             return durable_watcher;
         }
         entries.into_iter().for_each(|entry| memtable.put(entry));

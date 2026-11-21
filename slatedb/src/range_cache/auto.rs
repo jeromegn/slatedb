@@ -20,8 +20,9 @@
 //!   the load. Until the load ends, the promoter evaluates no candidate.
 //!
 //! The cache side (in the parent module) keeps the heat of cached ranges, evicts automatic ranges
-//! by read density, removes an automatic range whose reads do not pay for a rebuild, and
-//! remembers removed ranges (ghosts) and failed promotions (backoff).
+//! by read density, and removes an automatic range whose reads do not pay for a rebuild. The
+//! writer tells the promoter about each removal of an automatic range ([`Removal`]), and the
+//! promoter remembers removed ranges (ghosts) and failed promotions (backoff).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -146,6 +147,57 @@ impl AutoSettings {
         }
         Ok(())
     }
+}
+
+/// A removal of an automatic range, which the writer sends to the promoter.
+#[derive(Debug)]
+pub(crate) struct Removal {
+    pub(crate) start: Bytes,
+    pub(crate) end: Option<Bytes>,
+    /// True for a failed promotion: a later promotion of the range waits.
+    pub(crate) failure: bool,
+    pub(crate) at_ms: i64,
+}
+
+/// An automatic range that the cache removed. Promoting it again within the ghost time needs
+/// sampled reads after the removal.
+struct Ghost {
+    start: Bytes,
+    end: Option<Bytes>,
+    at_ms: i64,
+}
+
+/// A range where promotion waits after a failure. The wait doubles with each failure, and the
+/// level drops by one every eight base periods.
+struct Backoff {
+    end: Option<Bytes>,
+    level: u32,
+    at_ms: i64,
+}
+
+const MAX_BACKOFF_LEVEL: u32 = 10;
+
+/// How long promotion waits at backoff `level`.
+fn backoff_window_ms(level: u32, base_ms: i64) -> i64 {
+    base_ms.saturating_mul(1 << level.saturating_sub(1).min(20))
+}
+
+/// The backoff level of `backoff` at `now_ms`, after its decay.
+fn decayed_level(backoff: &Backoff, now_ms: i64, base_ms: i64) -> u32 {
+    let steps = (now_ms - backoff.at_ms) / (8 * base_ms).max(1);
+    backoff
+        .level
+        .saturating_sub(steps.clamp(0, i64::from(u32::MAX)) as u32)
+}
+
+fn overlaps(
+    start: &Bytes,
+    end: &Option<Bytes>,
+    other_start: &Bytes,
+    other_end: &Option<Bytes>,
+) -> bool {
+    end.as_ref().is_none_or(|end| other_start < end)
+        && other_end.as_ref().is_none_or(|other_end| start < other_end)
 }
 
 /// A sampled normal-path read.
@@ -390,16 +442,22 @@ pub(crate) struct Promoter {
     /// taking samples from the queue while it runs. Only one load runs at a time: admission
     /// counts only the files of loaded ranges against the disk budget.
     load: Option<JoinHandle<Result<(), SlateDBError>>>,
+    /// Removals of automatic ranges, from the writer.
+    removals: async_channel::Receiver<Removal>,
+    /// Automatic ranges that the cache removed recently.
+    ghosts: Vec<Ghost>,
+    /// Ranges where a promotion failed recently, by start key.
+    backoff: BTreeMap<Bytes, Backoff>,
 }
 
 impl Promoter {
     pub(crate) fn new(db: Arc<DbInner>, cache: Arc<RangeCache>) -> Self {
-        let options = cache
+        let auto = cache
             .auto
             .as_ref()
-            .expect("the promoter runs only with automatic promotion")
-            .options
-            .clone();
+            .expect("the promoter runs only with automatic promotion");
+        let options = auto.options.clone();
+        let removals = auto.removals.1.clone();
         let now = cache.now_ms();
         Self {
             reservoir: Reservoir::new(&options, now),
@@ -410,7 +468,65 @@ impl Promoter {
             rejected: BTreeMap::new(),
             last_evaluation_ms: None,
             load: None,
+            removals,
+            ghosts: Vec::new(),
+            backoff: BTreeMap::new(),
         }
+    }
+
+    /// Takes the removals that the writer sent since the last call into the ghosts and the
+    /// backoff.
+    fn take_removals(&mut self) {
+        let ghost_ms = self.options.ghost_ttl.as_millis() as i64;
+        let base_ms = self.options.backoff_base.as_millis() as i64;
+        while let Ok(removal) = self.removals.try_recv() {
+            let now = removal.at_ms;
+            self.ghosts.retain(|g| now - g.at_ms < ghost_ms);
+            self.ghosts.push(Ghost {
+                start: removal.start.clone(),
+                end: removal.end.clone(),
+                at_ms: now,
+            });
+            if removal.failure {
+                let level = self
+                    .backoff
+                    .get(&removal.start)
+                    .map_or(0, |b| decayed_level(b, now, base_ms));
+                self.backoff.insert(
+                    removal.start,
+                    Backoff {
+                        end: removal.end,
+                        level: (level + 1).min(MAX_BACKOFF_LEVEL),
+                        at_ms: now,
+                    },
+                );
+                self.backoff
+                    .retain(|_, b| decayed_level(b, now, base_ms) > 0 || now - b.at_ms < base_ms);
+            }
+        }
+    }
+
+    /// Returns the time of the latest removal of an automatic range that overlaps
+    /// `[start, end)`, if it is within the ghost time.
+    fn ghost_since(&self, start: &Bytes, end: &Option<Bytes>, now: i64) -> Option<i64> {
+        let ttl_ms = self.options.ghost_ttl.as_millis() as i64;
+        self.ghosts
+            .iter()
+            .filter(|g| now - g.at_ms < ttl_ms && overlaps(&g.start, &g.end, start, end))
+            .map(|g| g.at_ms)
+            .max()
+    }
+
+    /// Returns true if a recent failed promotion of a range that holds `key` asks to wait.
+    fn backed_off(&self, key: &[u8], now: i64) -> bool {
+        let base_ms = self.options.backoff_base.as_millis() as i64;
+        self.backoff
+            .range::<[u8], _>((Unbounded, Included(key)))
+            .next_back()
+            .is_some_and(|(_, b)| {
+                b.end.as_ref().is_none_or(|end| key < end.as_ref())
+                    && now - b.at_ms < backoff_window_ms(b.level, base_ms)
+            })
     }
 
     fn stats(&self) -> &super::stats::AutoStats {
@@ -427,6 +543,7 @@ impl Promoter {
             return;
         }
         self.reservoir.expire(now);
+        self.take_removals();
         let ttl_ms = self.options.candidate_ttl.as_millis() as i64;
         self.rejected.retain(|_, r| now - r.found_ms < ttl_ms);
         if let Some(auto) = &self.cache.auto {
@@ -453,7 +570,7 @@ impl Promoter {
             if self.cache.covers(&seed) {
                 continue;
             }
-            if self.cache.backed_off(&seed) {
+            if self.backed_off(&seed, now) {
                 self.stats().rejected(RejectReason::Backoff);
                 continue;
             }
@@ -486,7 +603,7 @@ impl Promoter {
     /// Admits `candidate` and starts its load, or remembers it as rejected. Returns true if it
     /// started a load.
     fn decide(&mut self, candidate: Candidate, now: i64) -> bool {
-        let ghost = self.cache.ghost_since(&candidate.start, &candidate.end);
+        let ghost = self.ghost_since(&candidate.start, &candidate.end, now);
         let evidence = self.reservoir.evidence(
             &candidate.start,
             &candidate.end,

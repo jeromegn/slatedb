@@ -476,8 +476,10 @@ async fn should_scan_across_adjacent_ranges() {
     );
     assert_eq!(t.metric(SCAN_COUNT, &[]), before + 4);
 
-    // So does a scan across a removed part.
+    // So does a scan across a removed part. The removal takes effect at the writer's next
+    // boundary.
     db.uncache_range(key(150)..key(151)).unwrap();
+    db.wait_for_range_cache().await.unwrap();
     assert_matches_snapshot(db, [], (Included(key(50)), Excluded(key(240)))).await;
     assert_eq!(t.metric(SCAN_COUNT, &[]), before + 4);
     db.close().await.unwrap();
@@ -636,10 +638,13 @@ async fn should_uncache_and_clear_ranges() {
     db.cache_range(key(5)..key(25)).await.unwrap();
     assert_eq!(db.cached_ranges().len(), 4);
 
+    // Removals take effect at the writer's next boundary.
     db.uncache_range(key(8)..key(9)).unwrap();
+    db.wait_for_range_cache().await.unwrap();
     let starts: Vec<_> = db.cached_ranges().into_iter().map(|r| r.start).collect();
     assert_eq!(starts, vec![key(10), key(20), key(40)]);
     db.clear_range_cache().unwrap();
+    db.wait_for_range_cache().await.unwrap();
     assert!(db.cached_ranges().is_empty());
     assert_eq!(t.cache_files(), 0);
     assert_eq!(t.metric(REMOVE_COUNT, &[("reason", "explicit")]), 4);
@@ -1089,13 +1094,19 @@ async fn should_not_serve_a_write_before_it_commits() {
     assert_eq!(rows.len(), 1);
     let hits = lookup_metric_with_labels(&recorder, GET_COUNT, &[("result", "hit")]);
     assert_eq!(hits, Some(1));
-    // A load while the write is in flight includes the write. Its range serves no read until
-    // the write commits.
-    db.cache_range(&b"x"[..]..&b"y"[..]).await.unwrap();
+    // A load registers its range at a writer boundary, so it waits until the write in flight
+    // commits, and then holds it.
+    let load = {
+        let db = db.clone();
+        tokio::spawn(async move { db.cache_range(&b"x"[..]..&b"y"[..]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!load.is_finished());
     assert_eq!(db.get(b"x1").await.unwrap(), None);
 
     fail_parallel::cfg(fp_registry.clone(), "write-batch-pre-commit", "off").unwrap();
     writer.await.unwrap();
+    load.await.unwrap().unwrap();
     assert_eq!(
         db.get(b"a1").await.unwrap(),
         Some(Bytes::from_static(b"new"))
@@ -1113,14 +1124,15 @@ async fn should_not_serve_a_write_before_it_commits() {
     db.close().await.unwrap();
 }
 
-/// A load registers its range in two steps: it publishes the range in the index, then it picks
-/// its snapshot. The test pauses the load before and after the publish, and writes a key in the
-/// range during the pause. A write before the publish does not find the range, so the snapshot
-/// must include it. A write after the publish finds the range and waits to apply itself to the
-/// delta. In both cases the cache must serve the write.
+/// A load takes its retention guard, then the writer registers its range at a boundary, then the
+/// load reads the state at that boundary. The test pauses the load before the registration and
+/// after it, and writes a key in the range during the pause. The write commits during both
+/// pauses: the writer never waits for a load. A write before the registration is in the state
+/// that the load reads. A write after it finds the range and goes to its delta. In both cases
+/// the cache must serve the write.
 #[rstest::rstest]
 #[case::before_publish("range-cache-register-publish", true)]
-#[case::after_publish("range-cache-register-snapshot", false)]
+#[case::after_publish("range-cache-register-snapshot", true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn should_not_lose_a_write_that_races_registration(
     #[case] fail_point: &str,

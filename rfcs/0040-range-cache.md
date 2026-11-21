@@ -111,9 +111,9 @@ there is no cache, if the range has expiring rows, or if a part is larger than t
 
 ### Structure of a cached range
 
-The cache keeps an index of cached ranges by start key, which readers load without a lock. One
-mutex guards every change. Each cached range has three layers, newest first, which the cache
-replaces together: the active delta, which receives writes; the frozen delta, only during a
+The cache keeps an index of cached ranges by start key, which readers load without a lock. Only
+the batch writer task changes the index and the layers (see [Writer requests](#writer-requests)).
+Each cached range has three layers, newest first, which the cache replaces together: the active delta, which receives writes; the frozen delta, only during a
 rebuild; and the file with its `file_seq`, absent while the range loads. A delta's `sealed_at` is
 `u64::MAX` until the cache seals it at the last sequence number that it applied to the delta.
 
@@ -123,18 +123,19 @@ rebuild; and the file with its `file_seq`, absent while the range loads. A delta
 memtable, then advances the last committed sequence number, which makes the batch visible. With a
 cache, the writer runs these steps after the memtable insert and before that advance:
 
-1. Advance the cache's `inserted_seq` counter to the batch sequence number. Then load its
-   `publish_epoch` counter. Both operations are `SeqCst`.
-2. Load the index without a lock. If no entry falls in a cached range, return.
-3. Take the mutex. Put each covered entry, tombstones and merge operands included, in its delta,
-   unless its sequence number is at or below the range's `file_seq`: the file holds it already.
+1. If the request queue is not empty, apply the queued requests (see
+   [Writer requests](#writer-requests)).
+2. Load the index without a lock. If no entry falls in a cached range, go to step 6.
+3. Put each covered entry, tombstones and merge operands included, in its delta. Store the batch
+   sequence number as the range's last write.
 4. If an entry has an expire time, remove its range. Seal its delta one below the batch sequence
    number, because the delta does not hold this write.
 5. If an active delta is larger than its rebuild threshold, freeze it (see [Rebuild](#rebuild)).
+6. Store the batch sequence number as the applied watermark.
 
 The hook runs before the advance, so a write is in its delta before a read can use its sequence
-number. Steps 1 and 2 pair with the order of a load (see [Loading a range](#loading-a-range)). A
-write that fails after the memtable insert is fatal: the writer's cleanup closes the cache.
+number. It takes no lock. A write that fails after the memtable insert is fatal: the writer's
+cleanup closes the cache.
 
 ### Read path
 
@@ -142,8 +143,9 @@ The cache serves a read only if its durability filter is `Memory`, it is not dir
 filter context or tracing option. A scan must also be ascending.
 
 A point read takes no lock, and awaits only for a merge operand. It loads the index, the layers of
-its range, and then the last committed sequence number, called `seq`. If the sequence number rules
-fail, it retries up to three times, then uses the normal read path. It returns the newest version
+its range, and then the last committed sequence number, called `seq`. If the delta was sealed below
+`seq`, it retries up to three times, then uses the normal read path. A read older than the file
+uses the normal read path at once. It returns the newest version
 at or below `seq` from the active delta, the frozen delta, then the file. A tombstone or no version
 is a definite miss. For a merge operand, the read runs the normal iterator stack over the pinned
 layers.
@@ -190,50 +192,60 @@ like the others.
 A read pins layers `L`, then loads `seq` (for a snapshot, the smaller of it and `S`). It uses `L`
 only if both rules hold:
 
-- `seq >= L.file_seq`. Right after a load or a rebuild, `seq` can be lower for a short time. The
-  file holds the state at `file_seq`, so without this rule a read could see an uncommitted write.
-  The file has no older versions, so a snapshot older than the file uses the normal path.
+- `seq >= L.file_seq`. The file holds the state at `file_seq` and no older versions, so a snapshot
+  older than the file uses the normal path. The writer publishes a file at a boundary at or above
+  its `file_seq`, so a read at the latest state always passes this rule.
 - `seq <= L.active.sealed_at`. Otherwise a write after the seal can be missing from the delta.
 
 The second rule is stronger than linearizability needs: without it, a read could return an older
 state that was current during the read. It makes a cached read equal the normal read path at `seq`.
 
+### Writer requests
+
+Loads, rebuilds and removals prepare their change on their own task and send it to the batch
+writer through a lock-free queue. The writer applies the queued requests at a *boundary* `W`: in
+a batch before it applies the batch's entries, or on a `BatchWriterMessage::RangeCache` message
+that each request sends so that an idle writer applies it. At a boundary no batch is between its
+memtable insert and its commit, so `W` is the last committed sequence number. Each request checks
+that the range is still indexed (and for an install, that its frozen delta is the one rebuilt), and
+changes nothing otherwise. A removal seals the range's active delta at `W`. When the writer stops,
+it seals every active delta at the applied watermark, empties the index, and refuses every queued
+and later request. `uncache_range` and `clear_range_cache` return before the removal takes effect;
+reads stay exact meanwhile.
+
 ### Loading a range
 
-1. Under the mutex, in this order: publish a loading range with an empty active delta for each part
-   that no range holds; advance `publish_epoch`, then read `inserted_seq`, both `SeqCst`; register
-   a snapshot at the larger of `inserted_seq` and the last committed sequence number; record its
-   sequence number as the `file_seq` of the new ranges.
-2. Scan each part from the snapshot into a new file, with `dirty: true` and `cache_blocks: false`.
-   The scan reads ahead like a compaction: requests of about 2 MiB, up to 4 in flight for each
-   SST (`load_fetch_bytes` and `load_fetch_tasks` in the tuning). A load then costs about one
-   request for each 2 MiB, and its time follows its bytes, not the latency of the store. Stop on a
-   row with an expire time, or when the file grows larger than the disk budget.
-3. Under the mutex, if the range is still in the index, attach the file, with the snapshot sequence
-   number as `file_seq`. Then apply the disk budget.
+1. Register a snapshot at the last committed sequence number. It keeps compaction from dropping
+   the versions that the load reads.
+2. Send a registration request. At a boundary `W`, the writer publishes a loading range with an
+   empty active delta for each part that no range holds, with `file_seq = W`, and answers `W`.
+3. Scan each part at `W` into a new file, with `cache_blocks: false`. The scan reads ahead like a
+   compaction: requests of about 2 MiB, up to 4 in flight for each SST (`load_fetch_bytes` and
+   `load_fetch_tasks` in the tuning). A load then costs about one request for each 2 MiB, and its
+   time follows its bytes, not the latency of the store. Stop on a row with an expire time, or
+   when the file grows larger than the disk budget.
+4. Send an attach request. The writer attaches the file if the range is still in the index and
+   still loading at `W`. Then apply the disk budget.
 
-The order of step 1 makes sure that no write is lost. The writer and the load each update one
-counter and then read the other, all with `SeqCst`, so at least one side sees the other. If the
-writer sees the new `publish_epoch`, it finds the new range and puts the write in its delta.
-Otherwise the load sees the writer's `inserted_seq`, so the write is in the snapshot. Both can
-happen to one write. Every write at or below the snapshot is in the memtable and visible to the
-load, so the writer skips it (step 3 of the write path); a merge operand in both would apply twice.
-The snapshot is dirty because a write at `inserted_seq` can still be in flight; that write commits,
-or the database closes. The snapshot also keeps compaction from dropping the versions that the load
-reads.
+The boundary makes sure that no write is lost or applied twice. Every batch at or below `W` is
+committed and in the state that the load reads. Every batch above `W` runs after the registration,
+finds the new range, and goes to its delta. No batch is on both sides, so a merge operand applies
+once. `W` is at or above the snapshot of step 1, so the newest version at or below `W` of each key
+is still there.
 
 ### Rebuild
 
 When the active delta is larger than a quarter of its file and than a minimum size (1 MiB by
-default), the writer seals it under the mutex, makes it the frozen delta, and installs a new empty
-active delta. A background task merges the frozen delta and the file with the merge operator,
-drops tombstones, writes a new file, and installs it under the mutex. A failed rebuild removes the
+default), the writer seals it, makes it the frozen delta, and installs a new empty active delta.
+A background task merges the frozen delta and the file with the merge operator, drops tombstones,
+writes a new file, and sends an install request. A failed rebuild removes the
 range. A rebuild absorbs at least a quarter of the file, so write amplification is at most about 4.
 
 ### Disk budget and eviction
 
-After each load and rebuild, if the files are larger than `max_disk_bytes`, the cache removes
-ranges until they fit, least recently read first. With automatic promotion, it removes automatic
+After each load and rebuild, if the files are larger than `max_disk_bytes`, the loading or
+rebuilding task orders the ranges for eviction and sends them to the writer, which removes them in
+that order until the files fit, least recently read first. With automatic promotion, it removes automatic
 ranges first, lowest read density first, and explicit ranges last. It never removes the range that
 a load just installed. A read counts its range's reads and recency on its own thread. Each thread
 adds them to the range every 4096 reads or about every 10 ms, so eviction and promotion use counts
@@ -487,19 +499,20 @@ For a snapshot, `seq` is at most the last committed sequence number that the rea
 
 1. The writer puts a write `w` in its delta before a `SeqCst` store makes `w` committed. A read
    loads `seq` (`SeqCst`) after it loads `L`, so if `w <= seq`, it sees the write in the delta.
-2. Seals and writes to deltas happen under one mutex, in sequence number order. So a delta sealed
-   at `s` holds each write to its range up to `s` that the older layers lack, and none above `s`.
-   The seal comes before any write above `s` commits, so a read with `seq > s` retries.
-3. A file holds the state of its range at `file_seq`: for a load, through the counter pair in
-   [Loading a range](#loading-a-range); for a rebuild, at the seal of the frozen delta. Deltas
-   hold only versions above `file_seq`. Reads filter delta versions with `max_seq = seq`, and use
-   the file only if `file_seq <= seq`, since it lacks the versions that an older `seq` needs.
-4. A removal seals the active delta, under the mutex, at the last sequence number that the writer
-   applied. A read that pinned the range earlier then needs `seq` at or below that number. A writer
-   that saw the range before the removal finds it gone under the mutex, and applies nothing.
-5. Only the writer task freezes a delta, so a freeze never races its unlocked check. An install
-   replaces the file and the frozen delta, and keeps the active delta. Automatic promotion adds
-   and removes ranges only through the same load and removal code.
+2. Only the writer task writes to deltas and seals them, in sequence number order. So a delta
+   sealed at `s` holds each write to its range up to `s` that the older layers lack, and none above
+   `s`. The seal comes before any write above `s` commits, so a read with `seq > s` retries. The
+   seal is on the delta, so every set of layers that holds the delta sees it.
+3. A file holds the state of its range at `file_seq`: for a load, the state at the writer boundary
+   of its registration (see [Loading a range](#loading-a-range)); for a rebuild, at the seal of the
+   frozen delta. Deltas hold only versions above `file_seq`. Reads filter delta versions with
+   `max_seq = seq`, and use the file only if `file_seq <= seq`, since it lacks the versions that
+   an older `seq` needs.
+4. The writer removes a range at a boundary `W`, and seals the active delta at `W` first. A read
+   that pinned the range earlier then needs `seq` at or below `W`. Every later batch finds the
+   range gone.
+5. An attach and an install keep the active delta, so they create no new copy of a seal. Automatic
+   promotion adds and removes ranges only through the same requests.
 6. A scan pins every range before it loads `seq`, and checks the rules for each. The ranges hold
    disjoint keys that cover the scan range, so their answers together are the answer at `seq`. A
    mixed scan's gaps hold the other keys. Their view holds every version at or below `seq`: a

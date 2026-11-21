@@ -14,9 +14,9 @@
 //!   state read the deltas with that sequence number as the bound, so a write becomes visible
 //!   in the cache and in the memtable at the same time. Reads in a snapshot or a transaction
 //!   use the snapshot's sequence number as the bound instead: deltas keep every version.
-//! - All changes to the set of ranges and to the layers of a range happen under one mutex. The
-//!   batch writer takes the same mutex when it applies a write to a non-empty cache. Reads take
-//!   no lock.
+//! - Only the batch writer changes the set of ranges and the layers of a range. Loads,
+//!   rebuilds and removals send it requests, which it applies between batches (see the `writer`
+//!   module). Neither reads nor writes take a lock.
 //!
 //! # Sequence number rules
 //!
@@ -27,18 +27,21 @@
 //! - `seq >= layers.file_seq`. The file holds the state at `file_seq`, without older versions.
 //! - `seq <= layers.active.sealed_at`. When the cache stops applying writes to a delta (a
 //!   freeze or a removal), it seals the delta at the last sequence number that it applied.
-//!   The delta then holds every version up to that number and none after it.
+//!   The delta then holds every version up to that number and none after it. The word is on
+//!   the delta, not on the layers, so a read that holds an earlier set of layers with the same
+//!   active delta sees the seal too.
 //!
-//! If a rule fails, the read tries again or uses the normal read path. The first rule keeps
-//! writes that are not committed invisible. The second rule makes the answer exactly the state
-//! at `seq`, which is the answer of the normal read path at `seq`.
+//! If the first rule fails, the read is in a snapshot older than the file and uses the normal
+//! read path. If the second fails, the read tries again, a few times, then uses the normal read
+//! path. The first rule keeps versions that the file folded out of reach. The second rule makes
+//! the answer exactly the state at `seq`, which is the answer of the normal read path at `seq`.
 //!
 //! # Automatic promotion
 //!
 //! With [`RangeCacheOptions::auto_promote`], a background task chooses ranges from sampled
 //! normal-path reads (see the `auto` module). This module keeps the parts that the cache core
-//! needs: the read heat of each range, eviction by read density, the payback check of rebuilds,
-//! and the memory of removed ranges and failed promotions.
+//! needs: the read heat of each range, eviction by read density, and the payback check of
+//! rebuilds. The promoter keeps the memory of removed ranges and failed promotions.
 //!
 //! # Read bookkeeping
 //!
@@ -53,6 +56,7 @@ mod hits;
 mod mixed;
 mod scan;
 pub mod stats;
+mod writer;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -86,7 +90,6 @@ use crate::oracle::Oracle;
 use crate::read_trace::ReadTrace;
 use crate::reader::ScanContext;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
-use crate::utils::spawn_bg_task;
 
 pub use auto::AutoPromoteOptions;
 use auto::AutoSettings;
@@ -97,6 +100,7 @@ use hits::{HitStats, RangeHits};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
 use stats::{AutoStats, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
+use writer::{Padded, Target, WriterQueue};
 
 /// The number of times a read tries to pin a range before it uses the normal read path.
 const PIN_ATTEMPTS: usize = 3;
@@ -389,6 +393,9 @@ struct CachedRange {
     read_cost_ns: u64,
     /// `heat.reads` when the current file was written, for the payback check of rebuilds.
     reads_at_build: AtomicU64,
+    /// The sequence number of the last batch that wrote to the range. Only the writer stores
+    /// it. Nothing reads it yet: persistence will (design 01 section 15, R3).
+    last_write_seq: Padded<AtomicU64>,
 }
 
 impl CachedRange {
@@ -416,6 +423,7 @@ impl CachedRange {
             heat: Heat::new(rate, now_ms),
             read_cost_ns,
             reads_at_build: AtomicU64::new(0),
+            last_write_seq: Padded(AtomicU64::new(0)),
         }
     }
 
@@ -539,85 +547,6 @@ fn half_open(range: &BytesRange) -> Option<(Bytes, Option<Bytes>)> {
     }
 }
 
-/// State that only changes under the cache mutex.
-struct CacheState {
-    /// The sequence number of the last write that the writer applied to the cache.
-    last_applied_seq: u64,
-    next_file_id: u64,
-    closed: bool,
-    /// Automatic ranges that the cache removed recently. Only automatic promotion uses it.
-    ghosts: Vec<Ghost>,
-    /// Ranges where a promotion failed recently, by start key.
-    backoff: BTreeMap<Bytes, Backoff>,
-    slots: Slots,
-}
-
-/// The slot numbers of indexed ranges (see `CachedRange::slot`).
-#[derive(Default)]
-struct Slots {
-    /// The lowest number that no range has had.
-    next: u32,
-    /// Numbers of removed ranges.
-    free: Vec<u32>,
-}
-
-impl Slots {
-    /// Takes the lowest free number, so that the numbers stay as small as the number of indexed
-    /// ranges.
-    fn take(&mut self) -> u32 {
-        if let Some((i, _)) = self.free.iter().enumerate().min_by_key(|(_, slot)| **slot) {
-            return self.free.swap_remove(i);
-        }
-        self.next += 1;
-        self.next - 1
-    }
-
-    fn give_back(&mut self, slot: u32) {
-        self.free.push(slot);
-    }
-}
-
-/// An automatic range that the cache removed. Promoting it again within the ghost time needs
-/// sampled reads after the removal.
-struct Ghost {
-    start: Bytes,
-    end: Option<Bytes>,
-    at_ms: i64,
-}
-
-/// A range where promotion waits after a failure. The wait doubles with each failure, and the
-/// level drops by one every eight base periods.
-struct Backoff {
-    end: Option<Bytes>,
-    level: u32,
-    at_ms: i64,
-}
-
-const MAX_BACKOFF_LEVEL: u32 = 10;
-
-/// How long promotion waits at backoff `level`.
-fn backoff_window_ms(level: u32, base_ms: i64) -> i64 {
-    base_ms.saturating_mul(1 << level.saturating_sub(1).min(20))
-}
-
-/// The backoff level of `backoff` at `now_ms`, after its decay.
-fn decayed_level(backoff: &Backoff, now_ms: i64, base_ms: i64) -> u32 {
-    let steps = (now_ms - backoff.at_ms) / (8 * base_ms).max(1);
-    backoff
-        .level
-        .saturating_sub(steps.clamp(0, i64::from(u32::MAX)) as u32)
-}
-
-fn overlaps(
-    start: &Bytes,
-    end: &Option<Bytes>,
-    other_start: &Bytes,
-    other_end: &Option<Bytes>,
-) -> bool {
-    end.as_ref().is_none_or(|end| other_start < end)
-        && other_end.as_ref().is_none_or(|other_end| start < other_end)
-}
-
 /// The parts of the cache that only automatic promotion uses.
 struct AutoShared {
     options: AutoSettings,
@@ -626,6 +555,11 @@ struct AutoShared {
     /// The average normal-path cost of sampled reads in nanoseconds, which the promoter
     /// updates. Explicit ranges use it as their read cost.
     avg_read_cost_ns: AtomicU64,
+    /// Removals of automatic ranges, from the writer to the promoter.
+    removals: (
+        async_channel::Sender<auto::Removal>,
+        async_channel::Receiver<auto::Removal>,
+    ),
 }
 
 /// A normal-path read that automatic promotion samples. See [`RangeCache::sample`].
@@ -636,16 +570,15 @@ pub(crate) struct ReadSample {
 /// The range cache of one database. See the module documentation.
 pub(crate) struct RangeCache {
     options: RangeCacheOptions,
+    /// Only the writer stores it. See the `writer` module.
     index: ArcSwap<RangeIndex>,
-    state: Mutex<CacheState>,
+    /// The queue of requests to the writer, and the writer's own state.
+    writer: WriterQueue,
     /// The bytes of all open range cache files, including files that only a reader or a
     /// rebuild keeps open.
     disk_bytes: Arc<AtomicU64>,
-    /// The sequence number of the last write that the writer put in the memtable. The writer
-    /// advances it before it checks the index. See [`RangeCache::register`].
-    inserted_seq: AtomicU64,
-    /// Advances each time `register` publishes ranges. See [`RangeCache::register`].
-    publish_epoch: AtomicU64,
+    /// The number of the next range cache file. Loads and rebuilds take one each.
+    next_file_id: AtomicU64,
     /// The bookkeeping of the reads that the cache serves. Its access clock advances by two on
     /// each load and rebuild. Folds copy it to the ranges that reads used. A new range gets the
     /// value between the old and the new clock, so it counts as used after the reads before its
@@ -713,6 +646,7 @@ impl RangeCache {
                     tx,
                     stats: AutoStats::new(recorder),
                     avg_read_cost_ns: AtomicU64::new(auto_options.min_read_cost.as_nanos() as u64),
+                    removals: async_channel::unbounded(),
                     options: auto_options,
                 };
                 (Some(auto), Some(rx))
@@ -728,17 +662,9 @@ impl RangeCache {
         let cache = Arc::new(Self {
             options,
             index: ArcSwap::from_pointee(RangeIndex::new()),
-            state: Mutex::new(CacheState {
-                last_applied_seq: 0,
-                next_file_id: 0,
-                closed: false,
-                ghosts: Vec::new(),
-                backoff: BTreeMap::new(),
-                slots: Slots::default(),
-            }),
+            writer: WriterQueue::new(),
             disk_bytes: Arc::new(AtomicU64::new(0)),
-            inserted_seq: AtomicU64::new(0),
-            publish_epoch: AtomicU64::new(0),
+            next_file_id: AtomicU64::new(0),
             hits,
             stats: RangeCacheStats::new(recorder),
             auto,
@@ -753,122 +679,6 @@ impl RangeCache {
 
     fn now_ms(&self) -> i64 {
         self.clock.now().timestamp_millis()
-    }
-
-    /// Applies one write batch. The batch writer calls this after it puts the entries in the
-    /// memtable and before it advances the last committed sequence number. All entries have
-    /// the same sequence number.
-    pub(crate) fn apply_write(self: &Arc<Self>, entries: &[RowEntry]) {
-        let Some(seq) = entries.first().map(|e| e.seq) else {
-            return;
-        };
-        // Check the index without the mutex first. This pairs with `register`: the writer
-        // updates `inserted_seq` and then loads `publish_epoch`, and `register` updates
-        // `publish_epoch` and then loads `inserted_seq`, all `SeqCst`. So either this check
-        // finds the new range, or the snapshot of the range includes this write. See RFC 0040,
-        // "Loading a range".
-        self.inserted_seq.fetch_max(seq, Ordering::SeqCst);
-        self.publish_epoch.load(Ordering::SeqCst);
-        {
-            let index = self.index.load();
-            if index.is_empty() || !entries.iter().any(|e| covering(&index, &e.key).is_some()) {
-                return;
-            }
-        }
-        let mut state = self.state.lock();
-        let index = self.index.load_full();
-        let mut touched: Vec<Arc<CachedRange>> = Vec::new();
-        let mut expiring: Vec<Arc<CachedRange>> = Vec::new();
-        for entry in entries {
-            let Some(range) = covering(&index, &entry.key) else {
-                continue;
-            };
-            if entry.expire_ts.is_some() {
-                // The cache does not hold rows that expire. See RFC 0040, "TTL".
-                if !expiring.iter().any(|r| Arc::ptr_eq(r, range)) {
-                    expiring.push(range.clone());
-                }
-                continue;
-            }
-            let layers = range.layers.load();
-            if entry.seq <= layers.file_seq {
-                // The file, or the snapshot that a load reads, holds this write already. This
-                // happens to the write in flight when `register` ran. See `register`.
-                continue;
-            }
-            layers.active.table.put(entry.clone());
-            if !touched.iter().any(|r| Arc::ptr_eq(r, range)) {
-                touched.push(range.clone());
-            }
-        }
-        state.last_applied_seq = seq;
-        for range in &expiring {
-            // The delta does not hold this write, so seal it before the write.
-            self.remove_locked(&mut state, range, seq - 1, RemoveReason::ExpiringWrite);
-        }
-        for range in &touched {
-            if !expiring.iter().any(|r| Arc::ptr_eq(r, range)) {
-                self.maybe_freeze_locked(&mut state, range, seq);
-            }
-        }
-    }
-
-    /// Starts a rebuild if the active delta of `range` is large enough.
-    fn maybe_freeze_locked(
-        self: &Arc<Self>,
-        state: &mut CacheState,
-        range: &Arc<CachedRange>,
-        seq: u64,
-    ) {
-        let layers = range.layers.load_full();
-        let Some(file) = layers.file.clone() else {
-            return;
-        };
-        if layers.frozen.is_some() {
-            return;
-        }
-        let threshold = self
-            .options
-            .tuning
-            .min_rebuild_delta_bytes
-            .max((file.file_len() / 4) as usize);
-        if layers.active.size() < threshold {
-            return;
-        }
-        if !self.rebuild_pays(range, file.file_len()) {
-            // The delta holds this write, so it is complete up to `seq`.
-            self.remove_locked(state, range, seq, RemoveReason::NotWorthIt);
-            return;
-        }
-        range
-            .reads_at_build
-            .store(range.heat.reads(), Ordering::Relaxed);
-        let frozen = layers.active.clone();
-        frozen.sealed_at.store(seq, Ordering::SeqCst);
-        range.layers.store(Arc::new(Layers {
-            active: Arc::new(Delta::new()),
-            frozen: Some(frozen.clone()),
-            file: Some(file.clone()),
-            file_seq: layers.file_seq,
-            end: range.end.clone(),
-        }));
-        let file_id = state.next_file_id;
-        state.next_file_id += 1;
-        let cache = self.clone();
-        let failed_cache = self.clone();
-        let failed_range = range.clone();
-        let range = range.clone();
-        spawn_bg_task(
-            "range_cache_rebuild".to_string(),
-            &self.handle,
-            move |result: &Result<(), SlateDBError>| {
-                if let Err(e) = result {
-                    warn!("range cache rebuild failed [error={:?}]", e);
-                    failed_cache.remove(&failed_range, RemoveReason::Error);
-                }
-            },
-            async move { cache.rebuild(range, frozen, file, seq, file_id).await },
-        );
     }
 
     /// Returns true if a rebuild of `range`, whose file has `file_bytes`, pays for itself: the
@@ -936,41 +746,10 @@ impl RangeCache {
             self.options.page_source,
             self.disk_bytes.clone(),
         )?);
-        self.install(&range, &frozen, new_file, frozen_seq);
+        if self.install(&range, &frozen, new_file, frozen_seq).await {
+            self.evict(None).await;
+        }
         Ok(())
-    }
-
-    /// Replaces the file and the frozen delta of `range` with `file`.
-    fn install(
-        &self,
-        range: &Arc<CachedRange>,
-        frozen: &Arc<Delta>,
-        file: Arc<RangeFile>,
-        seq: u64,
-    ) {
-        let mut state = self.state.lock();
-        if !self.is_indexed(range) {
-            return;
-        }
-        let layers = range.layers.load_full();
-        if !layers
-            .frozen
-            .as_ref()
-            .is_some_and(|f| Arc::ptr_eq(f, frozen))
-        {
-            return;
-        }
-        self.stats.rebuilds.increment(1);
-        self.stats.rebuild_bytes.increment(file.file_len());
-        range.layers.store(Arc::new(Layers {
-            active: layers.active.clone(),
-            frozen: None,
-            file: Some(file),
-            file_seq: seq,
-            end: range.end.clone(),
-        }));
-        self.hits.access_clock().fetch_add(2, Ordering::Relaxed);
-        self.enforce_budget_locked(&mut state, None);
     }
 
     fn is_indexed(&self, range: &Arc<CachedRange>) -> bool {
@@ -980,145 +759,45 @@ impl RangeCache {
             .is_some_and(|r| Arc::ptr_eq(r, range))
     }
 
-    /// Removes `range` and seals its active delta at `sealed_at`. The caller must hold the
-    /// mutex.
-    fn remove_locked(
-        &self,
-        state: &mut CacheState,
-        range: &Arc<CachedRange>,
-        sealed_at: u64,
-        reason: RemoveReason,
-    ) {
-        if !self.is_indexed(range) {
-            return;
-        }
-        range
-            .layers
-            .load()
-            .active
-            .sealed_at
-            .store(sealed_at, Ordering::SeqCst);
-        let mut index = RangeIndex::clone(&self.index.load());
-        index.remove(&range.start);
-        self.index.store(Arc::new(index));
-        state.slots.give_back(range.slot);
-        self.stats.removed(reason);
-        self.update_gauges();
-        self.remember_removal(state, range, reason);
-    }
-
-    /// Records the removal of an automatic range for later promotions.
-    fn remember_removal(&self, state: &mut CacheState, range: &CachedRange, reason: RemoveReason) {
-        let Some(auto) = &self.auto else {
-            return;
-        };
-        if !range.auto || reason == RemoveReason::Closed {
-            return;
+    /// The ranges that eviction removes, in order, if the range files are larger than the
+    /// budget, never `skip`. Without automatic promotion, the least recently read range comes
+    /// first. With automatic promotion, automatic ranges come first by increasing read density,
+    /// then explicit ranges, least recently read first. Returns nothing if the files fit.
+    ///
+    /// The caller computes the order, off the writer: read densities take each range's rate
+    /// lock. The writer applies it (see [`writer::Request::Evict`]).
+    fn eviction_order(&self, skip: Option<&Arc<CachedRange>>) -> Vec<Arc<CachedRange>> {
+        if self.attached_bytes() <= self.options.max_disk_bytes {
+            return Vec::new();
         }
         let now = self.now_ms();
-        let ghost_ms = auto.options.ghost_ttl.as_millis() as i64;
-        state.ghosts.retain(|g| now - g.at_ms < ghost_ms);
-        state.ghosts.push(Ghost {
-            start: range.start.clone(),
-            end: range.end.clone(),
-            at_ms: now,
-        });
-        if reason.is_failure() {
-            let base_ms = auto.options.backoff_base.as_millis() as i64;
-            let level = state
-                .backoff
-                .get(&range.start)
-                .map_or(0, |b| decayed_level(b, now, base_ms));
-            state.backoff.insert(
-                range.start.clone(),
-                Backoff {
-                    end: range.end.clone(),
-                    level: (level + 1).min(MAX_BACKOFF_LEVEL),
-                    at_ms: now,
-                },
-            );
-            state
-                .backoff
-                .retain(|_, b| decayed_level(b, now, base_ms) > 0 || now - b.at_ms < base_ms);
-        }
-    }
-
-    fn remove(&self, range: &Arc<CachedRange>, reason: RemoveReason) {
-        let mut state = self.state.lock();
-        let seq = state.last_applied_seq;
-        self.remove_locked(&mut state, range, seq, reason);
-    }
-
-    /// Removes every range that overlaps `range`.
-    pub(crate) fn remove_overlapping(&self, range: &BytesRange, reason: RemoveReason) {
-        let mut state = self.state.lock();
-        let ranges: Vec<_> = self
+        let candidates = self
             .index
             .load()
             .values()
-            .filter(|r| r.bounds().intersect(range).is_some())
+            .filter(|r| r.layers.load().file.is_some())
+            .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)))
             .cloned()
-            .collect();
-        let seq = state.last_applied_seq;
-        for r in ranges {
-            self.remove_locked(&mut state, &r, seq, reason);
-        }
-    }
-
-    /// Removes all ranges.
-    pub(crate) fn clear(&self, reason: RemoveReason) {
-        let mut state = self.state.lock();
-        self.clear_locked(&mut state, reason);
-    }
-
-    fn clear_locked(&self, state: &mut CacheState, reason: RemoveReason) {
-        let ranges: Vec<_> = self.index.load().values().cloned().collect();
-        let seq = state.last_applied_seq;
-        for r in ranges {
-            self.remove_locked(state, &r, seq, reason);
-        }
-    }
-
-    /// Removes all ranges and rejects later loads. The batch writer calls this when it stops,
-    /// on close and on errors such as fencing.
-    pub(crate) fn close(&self) {
-        let mut state = self.state.lock();
-        self.clear_locked(&mut state, RemoveReason::Closed);
-        state.closed = true;
-    }
-
-    /// Removes ranges until the range files fit the budget, never `skip`. Without automatic
-    /// promotion, it removes the least recently read range first. With automatic promotion, it
-    /// removes automatic ranges by increasing read density, and explicit ranges only after all
-    /// automatic ones, least recently read first.
-    fn enforce_budget_locked(&self, state: &mut CacheState, skip: Option<&Arc<CachedRange>>) {
-        let now = self.now_ms();
-        loop {
-            let index = self.index.load_full();
-            let attached: u64 = index.values().map(|r| r.file_bytes()).sum();
-            if attached <= self.options.max_disk_bytes {
-                break;
+            .collect::<Vec<_>>();
+        // Stable sorts, so ranges with equal keys keep the index order, as the previous
+        // one-at-a-time minimum did.
+        match &self.auto {
+            None => {
+                let mut candidates = candidates;
+                candidates.sort_by_key(|r| r.heat.hits.last_access());
+                candidates
             }
-            let candidates = index
-                .values()
-                .filter(|r| r.layers.load().file.is_some())
-                .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)));
-            let victim = match &self.auto {
-                None => candidates
-                    .min_by_key(|r| r.heat.hits.last_access())
-                    .cloned(),
-                Some(_) => candidates
-                    .map(|r| (r, self.eviction_key(r, now)))
-                    .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(r, _)| r.clone()),
-            };
-            let Some(victim) = victim else {
-                break;
-            };
-            let seq = state.last_applied_seq;
-            self.remove_locked(state, &victim, seq, RemoveReason::Evicted);
+            Some(_) => {
+                let mut keyed: Vec<_> = candidates
+                    .into_iter()
+                    .map(|r| (self.eviction_key(&r, now), r))
+                    .collect();
+                keyed.sort_by(|(a, _), (b, _)| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                keyed.into_iter().map(|(_, r)| r).collect()
+            }
         }
-        self.update_gauges();
     }
 
     /// The eviction order with automatic promotion: automatic ranges before explicit ones,
@@ -1178,14 +857,19 @@ impl RangeCache {
         self.hits.read(range.slot, &range.heat.hits, count);
     }
 
-    /// Counts an attempt `attempt` (from 1) of `op` that failed the sequence number rules: a
-    /// retry, or after the last attempt a fallback to the normal read path.
-    fn count_unfit(&self, op: PinOp, reason: Unfit, attempt: usize) {
-        self.hits.count(if attempt < PIN_ATTEMPTS {
+    /// Counts an attempt `attempt` (from 1) of `op` that failed the sequence number rules, and
+    /// returns true if the read tries again. A read whose sequence number is below the file's
+    /// can only be in a snapshot or a transaction older than the file: its sequence number
+    /// never grows, so it falls back at once. A sealed delta can be replaced by a newer one, so
+    /// such a read tries again, up to [`PIN_ATTEMPTS`] attempts.
+    fn count_unfit(&self, op: PinOp, reason: Unfit, attempt: usize) -> bool {
+        let retry = reason == Unfit::Sealed && attempt < PIN_ATTEMPTS;
+        self.hits.count(if retry {
             ReadCount::retry(op, reason)
         } else {
             ReadCount::unusable(op, reason)
         });
+        retry
     }
 
     /// Reads `key` at the last committed sequence number, or at `at` for a read in a snapshot
@@ -1206,8 +890,10 @@ impl RangeCache {
             }
             let seq = read_seq(oracle, at);
             if let Err(reason) = Self::usable(&layers, seq) {
-                self.count_unfit(PinOp::Get, reason, attempt);
-                continue;
+                if self.count_unfit(PinOp::Get, reason, attempt) {
+                    continue;
+                }
+                return CacheRead::Unusable;
             }
             return match lookup(&layers, key, seq) {
                 Ok(Some(entry)) => match entry.value {
@@ -1233,10 +919,7 @@ impl RangeCache {
                 }
                 Err(e) => {
                     warn!("range cache read failed [error={:?}]", e);
-                    let cached = cached.clone();
-                    drop(layers);
-                    drop(index);
-                    self.remove(&cached, RemoveReason::Error);
+                    self.request_removal(Target::Range(cached.clone()), RemoveReason::Error);
                     CacheRead::Uncovered
                 }
             };
@@ -1296,9 +979,17 @@ impl RangeCache {
                 return None;
             }
             let seq = read_seq(oracle, at);
-            if let Some(reason) = parts.iter().find_map(|l| Self::usable(l, seq).err()) {
-                self.count_unfit(PinOp::Scan, reason, attempt);
-                continue;
+            if let Some(first) = parts.iter().find_map(|l| Self::usable(l, seq).err()) {
+                // One part that is too old makes every attempt fail.
+                let too_old = first == Unfit::TooOld
+                    || parts
+                        .iter()
+                        .any(|l| Self::usable(l, seq) == Err(Unfit::TooOld));
+                let reason = if too_old { Unfit::TooOld } else { first };
+                if self.count_unfit(PinOp::Scan, reason, attempt) {
+                    continue;
+                }
+                return Some(Err(()));
             }
             // Only the first range counts as read: most scans end in it.
             self.count_read(first, ReadCount::Scan);
@@ -1480,123 +1171,10 @@ impl RangeCache {
         (freed >= need).then_some(densest)
     }
 
-    /// Returns the time of the latest removal of an automatic range that overlaps
-    /// `[start, end)`, if it is within the ghost time.
-    fn ghost_since(&self, start: &Bytes, end: &Option<Bytes>) -> Option<i64> {
-        let auto = self.auto.as_ref()?;
-        let now = self.now_ms();
-        let ttl_ms = auto.options.ghost_ttl.as_millis() as i64;
-        let state = self.state.lock();
-        state
-            .ghosts
-            .iter()
-            .filter(|g| now - g.at_ms < ttl_ms && overlaps(&g.start, &g.end, start, end))
-            .map(|g| g.at_ms)
-            .max()
-    }
-
-    /// Returns true if a recent failed promotion of a range that holds `key` asks to wait.
-    fn backed_off(&self, key: &[u8]) -> bool {
-        let Some(auto) = &self.auto else {
-            return false;
-        };
-        let now = self.now_ms();
-        let base_ms = auto.options.backoff_base.as_millis() as i64;
-        let state = self.state.lock();
-        state
-            .backoff
-            .range::<[u8], _>((Unbounded, Included(key)))
-            .next_back()
-            .is_some_and(|(_, b)| {
-                b.end.as_ref().is_none_or(|end| key < end.as_ref())
-                    && now - b.at_ms < backoff_window_ms(b.level, base_ms)
-            })
-    }
-
-    /// Registers loading ranges for the parts of `[start, end)` that no range holds, and calls
-    /// `snapshot` with the value of `inserted_seq` to pick the state that they load.
-    ///
-    /// The order matters. The new ranges go into the index first, and `publish_epoch`
-    /// advances. Then the cache reads `inserted_seq`, and calls `snapshot`. The writer
-    /// does the mirror image in `apply_write`: it advances `inserted_seq` after its memtable
-    /// insert, and then loads `publish_epoch` before it checks the index. All four operations
-    /// are `SeqCst`, so at least one side sees the other. If the writer misses the new epoch,
-    /// this side reads its `inserted_seq` and synchronizes with its memtable insert, so the
-    /// snapshot includes the write. If the writer sees the new epoch, it also sees the new
-    /// index, finds the range, and waits for the mutex to apply the write to the delta.
-    fn register(
-        &self,
-        start: &Bytes,
-        end: Option<&Bytes>,
-        origin: Origin,
-        snapshot: impl FnOnce(u64) -> Arc<DbSnapshot>,
-    ) -> Result<(Vec<Arc<CachedRange>>, Arc<DbSnapshot>), SlateDBError> {
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err(SlateDBError::Closed);
-        }
-        let now = self.now_ms();
-        let mut index = RangeIndex::clone(&self.index.load());
-        let parts = uncovered(&index, start, end);
-        let mut ranges = Vec::with_capacity(parts.len());
-        for (part_start, part_end) in parts {
-            let layers = Layers {
-                active: Arc::new(Delta::new()),
-                frozen: None,
-                file: None,
-                // A loading range serves no read. The value is set below, before the mutex
-                // is released, so `apply_write` never sees this one.
-                file_seq: 0,
-                end: part_end.clone(),
-            };
-            let range = Arc::new(CachedRange::new(
-                part_start.clone(),
-                part_end,
-                layers,
-                origin,
-                now,
-                state.slots.take(),
-            ));
-            index.insert(part_start, range.clone());
-            ranges.push(range);
-        }
-        fail_point!(
-            Arc::clone(&self.fp_registry),
-            "range-cache-register-publish"
-        );
-        if !ranges.is_empty() {
-            self.index.store(Arc::new(index));
-            self.update_gauges();
-        }
-        self.publish_epoch.fetch_add(1, Ordering::SeqCst);
-        fail_point!(
-            Arc::clone(&self.fp_registry),
-            "range-cache-register-snapshot"
-        );
-        // Synchronizes with the writer: every write up to `inserted` is in the memtable.
-        let inserted = self.inserted_seq.load(Ordering::SeqCst);
-        let snapshot = snapshot(inserted);
-        debug_assert!(snapshot.seq() >= inserted);
-        // The snapshot holds exactly the writes up to its sequence number (see
-        // `DbInner::cache_range_with`), and each later write finds the new ranges. Record the
-        // number now, under the mutex, so that `apply_write` puts no write that the file holds
-        // in a delta too. A merge operand in both would apply twice.
-        for range in &ranges {
-            let layers = range.layers.load_full();
-            range.layers.store(Arc::new(Layers {
-                active: layers.active.clone(),
-                frozen: None,
-                file: None,
-                file_seq: snapshot.seq(),
-                end: range.end.clone(),
-            }));
-        }
-        drop(state);
-        Ok((ranges, snapshot))
-    }
-
-    /// Writes the rows of a loading range to a file and publishes the range. It stops with an
-    /// error when `check_open` fails, which it calls every 1024 rows.
+    /// Writes the rows of a loading range to a file, has the writer publish it, then evicts
+    /// ranges if the files no longer fit the budget. It stops with an error when `check_open`
+    /// fails, which it calls every 1024 rows. A range that was removed meanwhile gets no file,
+    /// and the file is deleted when it drops.
     async fn load(
         &self,
         range: &Arc<CachedRange>,
@@ -1605,11 +1183,7 @@ impl RangeCache {
         check_open: &(dyn Fn() -> Result<(), SlateDBError> + Send + Sync),
     ) -> Result<(), SlateDBError> {
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-load");
-        let file_id = {
-            let mut state = self.state.lock();
-            state.next_file_id += 1;
-            state.next_file_id - 1
-        };
+        let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
         let mut writer = RangeFileWriter::create(
             &self.options.root_folder,
             &format!("{file_id:020}"),
@@ -1640,30 +1214,11 @@ impl RangeCache {
         )?);
         debug_assert_eq!(rows, file.rows());
 
-        let mut state = self.state.lock();
-        if !self.is_indexed(range) {
-            // A removal or a close won the race. The file is deleted on drop.
-            return Ok(());
+        if self.attach(range, file, file_seq).await {
+            // An automatic range won admission against the ranges it displaces, so the budget
+            // never evicts it right after its load.
+            self.evict(range.auto.then_some(range)).await;
         }
-        let layers = range.layers.load_full();
-        if layers.file.is_some() {
-            return Ok(());
-        }
-        self.stats.loads.increment(1);
-        self.stats.load_bytes.increment(file.file_len());
-        let now = self.hits.access_clock().fetch_add(2, Ordering::Relaxed) + 2;
-        range.heat.hits.set_last_access(now - 1);
-        range.layers.store(Arc::new(Layers {
-            active: layers.active.clone(),
-            frozen: None,
-            file: Some(file),
-            file_seq,
-            end: range.end.clone(),
-        }));
-        // An automatic range won admission against the ranges it displaces, so the budget never
-        // evicts it right after its load.
-        let skip = range.auto.then_some(range);
-        self.enforce_budget_locked(&mut state, skip);
         Ok(())
     }
 }
@@ -2014,30 +1569,36 @@ impl DbInner {
         let Some((start, end)) = half_open(&range) else {
             return Ok(());
         };
-        // `register` calls this after it publishes the new ranges, with the `inserted_seq`
-        // that it read after the publish. Every write up to `inserted` or up to the last
-        // committed sequence number is in the memtable and visible here, so the snapshot holds
-        // exactly the writes up to its sequence number. A write above it advances
-        // `inserted_seq` after `register` read it, so it finds the new ranges and goes to their
-        // deltas. `inserted` can be one more than the last committed sequence number while a
-        // write is in flight. See RFC 0040, "Loading a range".
-        let (ranges, snapshot) = cache.register(&start, end.as_ref(), origin, |inserted| {
-            let seq = inserted.max(self.oracle.last_committed_seq());
-            DbSnapshot::new(self.clone(), Some(seq))
-        })?;
-        // Read in large requests, several at a time, so that a load costs about one request
-        // per `load_fetch_bytes` and its time follows the bytes, not the store's latency.
-        let options = ScanOptions {
-            // The snapshot sequence number can be above the last committed one. See above.
-            dirty: true,
-            ..cache.options.tuning.bulk_scan_options()
-        };
+        cache.bind_writer(&self.write_notifier);
+        // The retention guard comes first (design 01 section 6.3). The snapshot registers at the
+        // last committed sequence number `S_L`, before the request. The writer registers the
+        // ranges at its boundary `W >= S_L`. Flush and compaction keep every version above the
+        // oldest registered snapshot and the newest at or below it, so the newest version at or
+        // below `W` of each key stays readable. The snapshot manager's lock is taken here, on
+        // this task, never on the writer.
+        let guard = DbSnapshot::new(self.clone(), None);
+        fail_point!(
+            Arc::clone(&cache.fp_registry),
+            "range-cache-register-publish"
+        );
+        let registered = cache.register(start, end, origin).await?;
+        debug_assert!(registered.seq >= guard.seq());
+        fail_point!(
+            Arc::clone(&cache.fp_registry),
+            "range-cache-register-snapshot"
+        );
+        // `W` is committed, so the load reads no dirty state. Read in large requests, several at
+        // a time, so that a load costs about one request per `load_fetch_bytes` and its time
+        // follows the bytes, not the store's latency.
+        let options = cache.options.tuning.bulk_scan_options();
         let mut result = Ok(());
-        for range in &ranges {
+        for range in &registered.ranges {
             if result.is_err() {
-                cache.remove(range, RemoveReason::Error);
+                cache.remove_and_wait(range, RemoveReason::Error).await;
                 continue;
             }
+            // Every batch at or below `W` committed before the registration, so this view, taken
+            // after it, holds it.
             let db_state = self.state.read().view();
             let iter = self
                 .reader
@@ -2047,7 +1608,7 @@ impl DbInner {
                     ScanContext {
                         db_state: &db_state,
                         write_batch_iter: None,
-                        max_seq: Some(snapshot.seq()),
+                        max_seq: Some(registered.seq),
                         prefix: None,
                     },
                 )
@@ -2055,16 +1616,16 @@ impl DbInner {
             result = match iter {
                 Ok(iter) => {
                     cache
-                        .load(range, iter, snapshot.seq(), &|| self.check_closed())
+                        .load(range, iter, registered.seq, &|| self.check_closed())
                         .await
                 }
                 Err(e) => Err(e),
             };
             if result.is_err() {
-                cache.remove(range, RemoveReason::Error);
+                cache.remove_and_wait(range, RemoveReason::Error).await;
             }
         }
-        drop(snapshot);
+        drop(guard);
         result
     }
 
@@ -2102,6 +1663,11 @@ impl Db {
     }
 
     /// Removes every cached range that overlaps `range` from the range cache.
+    ///
+    /// The call returns before the removal takes effect: the batch writer removes the ranges
+    /// at its next batch, or soon after when no write comes. Reads stay exact meanwhile, and
+    /// [`Db::cached_ranges`] can still list the ranges. A later [`Db::cache_range`] call takes
+    /// effect after the removal.
     pub fn uncache_range<T>(&self, range: T) -> Result<(), crate::Error>
     where
         T: ByteRangeBounds,
@@ -2110,16 +1676,31 @@ impl Db {
         let start = range.start_bound().map(Bytes::copy_from_slice);
         let end = range.end_bound().map(Bytes::copy_from_slice);
         if let Some(range) = BytesRange::try_new(start, end) {
-            cache.remove_overlapping(&range, RemoveReason::Explicit);
+            cache.bind_writer(&self.inner.write_notifier);
+            cache.request_removal(Target::Overlapping(range), RemoveReason::Explicit);
         }
         Ok(())
     }
 
-    /// Removes all ranges from the range cache.
+    /// Removes all ranges from the range cache. Like [`Db::uncache_range`], the call returns
+    /// before the removal takes effect.
     pub fn clear_range_cache(&self) -> Result<(), crate::Error> {
-        self.inner
-            .range_cache_or_err()?
-            .clear(RemoveReason::Explicit);
+        let cache = self.inner.range_cache_or_err()?;
+        cache.bind_writer(&self.inner.write_notifier);
+        cache.request_removal(Target::All, RemoveReason::Explicit);
+        Ok(())
+    }
+
+    /// Waits until the range cache applied every change requested before the call: removals
+    /// from [`Db::uncache_range`] and [`Db::clear_range_cache`], and the queued steps of loads
+    /// and rebuilds. Returns at once if the cache is closed.
+    ///
+    /// For tests and tools that check [`Db::cached_ranges`] after a removal.
+    #[doc(hidden)]
+    pub async fn wait_for_range_cache(&self) -> Result<(), crate::Error> {
+        let cache = self.inner.range_cache_or_err()?;
+        cache.bind_writer(&self.inner.write_notifier);
+        cache.barrier().await;
         Ok(())
     }
 
@@ -2239,15 +1820,6 @@ mod tests {
         assert!(range.contains_range(&r(Included("c"), Included("d"))));
         assert!(!range.contains_range(&r(Included("c"), Included("e"))));
         assert!(!range.contains_range(&r(Included("c"), Unbounded)));
-    }
-
-    #[test]
-    fn should_reuse_the_lowest_free_slot() {
-        let mut slots = Slots::default();
-        assert_eq!((slots.take(), slots.take(), slots.take()), (0, 1, 2));
-        slots.give_back(2);
-        slots.give_back(0);
-        assert_eq!((slots.take(), slots.take(), slots.take()), (0, 2, 3));
     }
 
     /// Reads through a database with a range cache, checked against the cache's counters.
@@ -2433,8 +2005,9 @@ mod tests {
             t.db.put(key(300), "later").await.unwrap();
             t.db.cache_range(key(50)..key(150)).await.unwrap();
 
-            // The snapshot is older than the range's file: a point read and a covered scan try
-            // three times, and a mixed scan makes the cached part a gap.
+            // The snapshot is older than the range's file: a point read and a covered scan fall
+            // back at once, since a retry cannot succeed, and a mixed scan makes the cached
+            // part a gap.
             assert_eq!(
                 old.get(key(60)).await.unwrap(),
                 Some(Bytes::from("value-60"))
@@ -2459,15 +2032,15 @@ mod tests {
             t.db.scan(key(40)..key(70)).await.unwrap();
 
             t.cache().hits.fold_current_thread();
-            for reason in ["too_old", "sealed"] {
+            for (reason, retries) in [("too_old", 0), ("sealed", 2)] {
                 assert_eq!(
                     t.unfit(stats::PIN_RETRY_COUNT, "get", reason),
-                    2,
+                    retries,
                     "{reason}"
                 );
                 assert_eq!(
                     t.unfit(stats::PIN_RETRY_COUNT, "scan", reason),
-                    2,
+                    retries,
                     "{reason}"
                 );
                 assert_eq!(t.unfit(stats::UNUSABLE_COUNT, "get", reason), 1, "{reason}");
