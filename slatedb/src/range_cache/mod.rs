@@ -69,6 +69,9 @@ mod merge;
 mod mixed;
 mod scan;
 pub mod stats;
+mod view;
+#[cfg(test)]
+mod view_bench;
 mod writer;
 
 use std::collections::BTreeMap;
@@ -119,6 +122,7 @@ pub(crate) use maintain::{Maintainer, RANGE_CACHE_MAINTENANCE_TASK_NAME};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
 use stats::{AutoStats, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
+use view::{BuildCost, DeltaView, ViewMemory};
 use writer::{Padded, Target, WriterQueue};
 
 /// The number of times a read tries to pin a range before it uses the normal read path.
@@ -127,6 +131,10 @@ const PIN_ATTEMPTS: usize = 3;
 /// The values that [`RangeCacheTuning::max_runs`] may take. Nothing in the read path is sized by
 /// it: reads walk the runs that a range holds.
 pub(crate) const MAX_RUNS_RANGE: std::ops::RangeInclusive<usize> = 4..=8;
+
+/// The values that [`RangeCacheTuning::max_runs`] may take with [`RangeCacheTuning::delta_view`]:
+/// a view holds at most 64 runs, one per slot of its selector byte.
+pub(crate) const MAX_VIEW_RUNS_RANGE: std::ops::RangeInclusive<usize> = 4..=view::VIEW_SLOTS;
 
 /// Options for the range cache. See [`crate::DbBuilder::with_range_cache`].
 ///
@@ -296,6 +304,16 @@ pub struct RangeCacheTuning {
     /// time at the 1st, 2nd, 4th, 8th and so on counted event after it last added them, so a
     /// thread that keeps reading adds its counts within about twice this time.
     pub stats_fold_interval: Duration,
+    /// The delta view (prototype, off by default): each range keeps one sorted view over the
+    /// versions of all its runs in memory, which a scan reads with one cursor however many runs
+    /// the range holds (see the `view` module). With it on, runs never merge with each other: no
+    /// minor merge and no flush-merge. A flush builds the view of its run from the range's view
+    /// and installs both in one store; a major merge absorbs every run of the range and installs a
+    /// view without them. `max_runs` may then be up to 64. A range that holds `max_runs` runs
+    /// waits for its major merge before it flushes, and a major merge is due when the runs reach
+    /// half of `max_runs`, whatever their bytes. Point reads still probe the runs' filters, newest
+    /// first.
+    pub delta_view: bool,
 }
 
 impl Default for RangeCacheTuning {
@@ -332,11 +350,21 @@ impl Default for RangeCacheTuning {
             load_fetch_tasks: 4,
             stats_fold_events: 4096,
             stats_fold_interval: Duration::from_millis(10),
+            delta_view: false,
         }
     }
 }
 
 impl RangeCacheTuning {
+    /// The values that `max_runs` may take.
+    fn max_runs_range(&self) -> std::ops::RangeInclusive<usize> {
+        if self.delta_view {
+            MAX_VIEW_RUNS_RANGE
+        } else {
+            MAX_RUNS_RANGE
+        }
+    }
+
     /// How the cache's write buffers size themselves.
     fn delta_shape(&self) -> DeltaShape {
         DeltaShape {
@@ -468,6 +496,9 @@ pub(crate) struct Layers {
     /// Runs, newest first, at most [`RangeCacheTuning::max_runs`]: run `i` covers
     /// `(lo_i, hi_i]` with `hi_{i+1} = lo_i`, and the oldest one's `lo` is `base_seq`.
     runs: Vec<Arc<Run>>,
+    /// With [`RangeCacheTuning::delta_view`], the view of exactly `runs` once the range has a run;
+    /// scans read the runs through it. `None` otherwise.
+    view: Option<Arc<DeltaView>>,
     /// `None` while the range loads.
     base: Option<Arc<RangeFile>>,
     /// The base holds the state of the range at this sequence number.
@@ -504,6 +535,22 @@ impl Layers {
             to = run.lo;
         }
         assert_eq!(to, self.base_seq, "the runs do not reach the base");
+        if let Some(view) = &self.view {
+            let in_view = view.runs().count();
+            assert_eq!(in_view, self.runs.len(), "the view does not hold the runs");
+            assert!(
+                self.runs
+                    .iter()
+                    .all(|r| view.runs().any(|v| Arc::ptr_eq(r, v))),
+                "the view holds other runs"
+            );
+            let rows: u64 = self.runs.iter().map(|r| r.file.rows()).sum();
+            assert_eq!(
+                view.len() as u64,
+                rows,
+                "the view does not list the runs' rows"
+            );
+        }
         let mut lo = self.covered_to;
         for buffer in self.sealed.iter().rev() {
             assert_eq!(buffer.lo(), lo, "sealed buffers are not contiguous");
@@ -710,7 +757,12 @@ impl CachedRange {
             + size_of::<Layers>()
             + (layers.sealed.capacity() + layers.runs.capacity()) * size_of::<usize>()
             + layers.runs.len() * size_of::<Run>();
-        files + handles as u64
+        files + handles as u64 + self.view_bytes()
+    }
+
+    /// The heap bytes of the range's delta view, which are part of its metadata.
+    fn view_bytes(&self) -> u64 {
+        self.layers.load().view.as_ref().map_or(0, |v| v.bytes())
     }
 }
 
@@ -822,6 +874,8 @@ pub(crate) struct RangeCache {
     files: Arc<FileBudget>,
     /// The memory of all write buffers, including buffers that only a reader or a flush holds.
     delta_memory: Arc<DeltaMemory>,
+    /// The memory of all delta views, including views that only a reader or a job holds.
+    views: Arc<ViewMemory>,
     /// The queue to the maintenance task.
     maintenance: maintain::MaintenanceQueue,
     /// The number of the next range cache file. Loads, flushes and merges take one each.
@@ -867,12 +921,13 @@ impl RangeCache {
                 "range cache load_fetch_bytes and load_fetch_tasks must be positive".to_string(),
             ));
         }
-        if !MAX_RUNS_RANGE.contains(&options.tuning.max_runs) {
+        let runs_range = options.tuning.max_runs_range();
+        if !runs_range.contains(&options.tuning.max_runs) {
             return Err(SlateDBError::InvalidConfiguration(format!(
                 "range cache max_runs {} is not in {}..={}",
                 options.tuning.max_runs,
-                MAX_RUNS_RANGE.start(),
-                MAX_RUNS_RANGE.end()
+                runs_range.start(),
+                runs_range.end()
             )));
         }
         let ratio = options.tuning.minor_merge_ratio;
@@ -933,6 +988,7 @@ impl RangeCache {
             writer: WriterQueue::new(),
             files: Arc::new(FileBudget::default()),
             delta_memory: DeltaMemory::new(recorder.gauge(stats::DELTA_ALLOCATED_BYTES).register()),
+            views: Arc::new(ViewMemory::default()),
             maintenance: maintain::MaintenanceQueue::new(),
             next_file_id: AtomicU64::new(0),
             hits,
@@ -1072,13 +1128,19 @@ impl RangeCache {
         self.stats.delta_bytes.set(delta_bytes as i64);
         self.delta_memory.publish();
         self.stats.file_bytes.set(self.files.disk() as i64);
+        // Files and views count while anything holds them; layer sets while they are indexed.
         let layers: u64 = index
             .values()
-            .map(|r| r.meta_bytes().saturating_sub(r.files_meta_bytes()))
+            .map(|r| {
+                r.meta_bytes()
+                    .saturating_sub(r.files_meta_bytes() + r.view_bytes())
+            })
             .sum();
+        let views = self.views.bytes();
+        self.stats.view_bytes.set(views as i64);
         self.stats
             .meta_bytes
-            .set((self.files.meta() + layers) as i64);
+            .set((self.files.meta() + views + layers) as i64);
     }
 
     /// Returns true if the cached ranges fit the disk budget and the metadata budget. Only
@@ -1639,6 +1701,55 @@ fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
     })
 }
 
+/// [`lookup`] with the runs searched through the delta view, when the layers have one: one seek in
+/// the view for all runs, in place of a filter probe per run and a search of each run whose filter
+/// passes. Reads do not use it; tests check it and the view benchmark measures it against
+/// `lookup`.
+#[cfg(test)]
+fn lookup_view(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
+    let Some(view) = &layers.view else {
+        return lookup(layers, key, seq);
+    };
+    let mut hash = None;
+    let mut hash_of = || *hash.get_or_insert_with(|| hash_key(key));
+    for delta in layers.buffers() {
+        if delta.is_empty() || delta.lo() >= seq {
+            continue;
+        }
+        if let Some(filter) = delta.filter() {
+            if !filter.may_contain(hash_of()) {
+                continue;
+            }
+        }
+        if let Some(version) = delta.newest(key, seq) {
+            return Ok(match version.kind {
+                Kind::Value => Found::Value(KeyValue::from(delta::to_row(&version))),
+                Kind::Tombstone => Found::Absent,
+                Kind::Merge => Found::Merge,
+            });
+        }
+    }
+    if let Some((i, span)) = view.newest(key, seq)? {
+        return Ok(match span.kind() {
+            Kind::Value => Found::Value(KeyValue::from(view.run_of(i).file.decode_span(&span)?)),
+            Kind::Tombstone => Found::Absent,
+            Kind::Merge => Found::Merge,
+        });
+    }
+    let row = match &layers.base {
+        Some(file) => file.get(key)?,
+        None => None,
+    };
+    Ok(match row {
+        Some(row) => match row.value {
+            ValueDeletable::Value(_) => Found::Value(KeyValue::from(row)),
+            ValueDeletable::Merge(_) => Found::Merge,
+            ValueDeletable::Tombstone => Found::Absent,
+        },
+        None => Found::Absent,
+    })
+}
+
 /// Returns an iterator over `range` of `layers` at `seq`, through the iterator stack of the
 /// normal read path. So merge operands resolve the same way as in the normal path.
 async fn stack_iterator(
@@ -2142,6 +2253,7 @@ mod tests {
                             active: Arc::new(Delta::for_test(&DeltaMemory::detached(), 0)),
                             sealed: Vec::new(),
                             runs: Vec::new(),
+                            view: None,
                             base: None,
                             base_seq: 0,
                             covered_to: 0,

@@ -107,6 +107,29 @@ pub const META_BYTES: &str = range_cache_stat_name!("meta_bytes");
 /// free room. It never exceeds `max_recent_bytes`.
 pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_bytes");
 
+// The delta view (`RangeCacheTuning::delta_view`).
+
+/// Delta views that flushes and major merges built. The `job` label is `flush` or `major`. A
+/// build that the writer rejected because the view moved on and that its job built again counts
+/// twice.
+pub const VIEW_BUILD_COUNT: &str = range_cache_stat_name!("view_build_count");
+/// Wall time of the view builds in nanoseconds, by `job`. A build runs on one blocking thread and
+/// does no I/O wait when the files are in the page cache, so this is about its CPU time.
+pub const VIEW_BUILD_NANOS: &str = range_cache_stat_name!("view_build_nanos");
+/// Rows of new runs that view builds read in file order, by `job`.
+pub const VIEW_BUILD_ROWS: &str = range_cache_stat_name!("view_build_rows");
+/// Keys of older runs that view builds read from their files by locator, by `job`.
+pub const VIEW_BUILD_KEYS: &str = range_cache_stat_name!("view_build_keys");
+/// Bytes that view builds read: the data bytes of the new runs, and the row header and key of each
+/// older key read. By `job`.
+pub const VIEW_BUILD_BYTES: &str = range_cache_stat_name!("view_build_bytes");
+/// Installs that the writer rejected because the range's view moved on, and that their job sent
+/// again with a view built on the new one. By `job`.
+pub const VIEW_RETRY_COUNT: &str = range_cache_stat_name!("view_retry_count");
+/// The heap bytes of all delta views, including views that only a reader still holds. They are
+/// part of `meta_bytes` too.
+pub const VIEW_BYTES: &str = range_cache_stat_name!("view_bytes");
+
 // Automatic promotion. The cache registers these metrics only when automatic promotion is on.
 
 /// Normal-path reads that automatic promotion sampled. The `result` label is `recorded` or
@@ -427,6 +450,42 @@ pub(crate) struct RangeCacheStats {
     pub(crate) file_bytes: Arc<dyn GaugeFn>,
     pub(crate) delta_bytes: Arc<dyn GaugeFn>,
     pub(crate) meta_bytes: Arc<dyn GaugeFn>,
+    /// View builds by job: flush, then major.
+    pub(crate) view: [ViewStats; 2],
+    pub(crate) view_bytes: Arc<dyn GaugeFn>,
+}
+
+/// The counters of the view builds of one kind of job.
+pub(crate) struct ViewStats {
+    builds: Arc<dyn CounterFn>,
+    nanos: Arc<dyn CounterFn>,
+    rows: Arc<dyn CounterFn>,
+    keys: Arc<dyn CounterFn>,
+    bytes: Arc<dyn CounterFn>,
+    pub(crate) retries: Arc<dyn CounterFn>,
+}
+
+impl ViewStats {
+    fn new(recorder: &MetricsRecorderHelper, job: &'static str) -> Self {
+        let labeled = |name| recorder.counter(name).labels(&[("job", job)]).register();
+        Self {
+            builds: labeled(VIEW_BUILD_COUNT),
+            nanos: labeled(VIEW_BUILD_NANOS),
+            rows: labeled(VIEW_BUILD_ROWS),
+            keys: labeled(VIEW_BUILD_KEYS),
+            bytes: labeled(VIEW_BUILD_BYTES),
+            retries: labeled(VIEW_RETRY_COUNT),
+        }
+    }
+
+    /// Counts one build and its cost.
+    pub(crate) fn built(&self, cost: &super::view::BuildCost) {
+        self.builds.increment(1);
+        self.nanos.increment(cost.nanos);
+        self.rows.increment(cost.rows_read);
+        self.keys.increment(cost.keys_read);
+        self.bytes.increment(cost.bytes_read);
+    }
 }
 
 impl RangeCacheStats {
@@ -465,6 +524,11 @@ impl RangeCacheStats {
             file_bytes: recorder.gauge(FILE_BYTES).register(),
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
             meta_bytes: recorder.gauge(META_BYTES).register(),
+            view: [
+                ViewStats::new(recorder, "flush"),
+                ViewStats::new(recorder, "major"),
+            ],
+            view_bytes: recorder.gauge(VIEW_BYTES).register(),
         }
     }
 

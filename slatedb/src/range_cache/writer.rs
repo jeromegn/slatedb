@@ -37,7 +37,9 @@ use tokio::sync::oneshot;
 use super::auto::Removal;
 use super::file::RangeFile;
 use super::stats::RemoveReason;
-use super::{covering, uncovered, CachedRange, Delta, Layers, Origin, RangeCache, RangeIndex, Run};
+use super::{
+    covering, uncovered, CachedRange, Delta, DeltaView, Layers, Origin, RangeCache, RangeIndex, Run,
+};
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
@@ -77,6 +79,8 @@ pub(super) enum Request {
         run: Arc<Run>,
         buffers: Vec<Arc<Delta>>,
         replaces: Vec<Arc<Run>>,
+        /// With the delta view: the view with the run, and the view it was built on.
+        view: Option<ViewSwap>,
         reply: oneshot::Sender<bool>,
     },
     /// Replace `inputs`, runs of `range` (newest first), with `output`, which a minor merge wrote
@@ -95,6 +99,8 @@ pub(super) enum Request {
         absorbed: Vec<Arc<Run>>,
         base: Arc<RangeFile>,
         base_seq: u64,
+        /// With the delta view: the view without the absorbed runs, and the view it was built on.
+        view: Option<ViewSwap>,
         reply: oneshot::Sender<bool>,
     },
     /// Seal `buffer` if it is still the active buffer of `range` and holds a version.
@@ -141,6 +147,24 @@ impl Request {
                 let _ = reply.send(());
             }
         }
+    }
+}
+
+/// The view that an install publishes with its runs, and the view that it was built from, which
+/// must still be the range's: the writer publishes both or rejects both. A job whose install the
+/// writer rejected only because the view moved on builds its view again on the new one; its file
+/// stays good (see the `maintain` module).
+pub(super) struct ViewSwap {
+    pub(super) new: Option<Arc<DeltaView>>,
+    pub(super) was: Option<Arc<DeltaView>>,
+}
+
+/// True if `a` and `b` are both `None` or the same view.
+pub(super) fn same_view(a: &Option<Arc<DeltaView>>, b: &Option<Arc<DeltaView>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
     }
 }
 
@@ -334,6 +358,7 @@ impl RangeCache {
         run: Arc<Run>,
         buffers: Vec<Arc<Delta>>,
         replaces: Vec<Arc<Run>>,
+        view: Option<ViewSwap>,
     ) -> bool {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::InstallRun {
@@ -341,6 +366,7 @@ impl RangeCache {
             run,
             buffers,
             replaces,
+            view,
             reply,
         });
         answer.await.unwrap_or(false)
@@ -366,6 +392,7 @@ impl RangeCache {
 
     /// Installs a base that a major merge wrote from `base_was` and `absorbed`. Returns false if
     /// the state moved on (see [`RangeCache::install_major_at`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn install_major(
         &self,
         range: &Arc<CachedRange>,
@@ -373,6 +400,7 @@ impl RangeCache {
         absorbed: Vec<Arc<Run>>,
         base: Arc<RangeFile>,
         base_seq: u64,
+        view: Option<ViewSwap>,
     ) -> bool {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::InstallMajor {
@@ -381,6 +409,7 @@ impl RangeCache {
             absorbed,
             base,
             base_seq,
+            view,
             reply,
         });
         answer.await.unwrap_or(false)
@@ -605,6 +634,7 @@ impl RangeCache {
                 active: self.new_buffer(seq),
                 sealed: buffers,
                 runs: layers.runs.clone(),
+                view: layers.view.clone(),
                 base: layers.base.clone(),
                 base_seq: layers.base_seq,
                 covered_to: layers.covered_to,
@@ -672,9 +702,10 @@ impl RangeCache {
                 run,
                 buffers,
                 replaces,
+                view,
                 reply,
             } => {
-                let _ = reply.send(self.install_run_at(&range, run, &buffers, &replaces));
+                let _ = reply.send(self.install_run_at(&range, run, &buffers, &replaces, view));
             }
             Request::InstallMinor {
                 range,
@@ -690,9 +721,11 @@ impl RangeCache {
                 absorbed,
                 base,
                 base_seq,
+                view,
                 reply,
             } => {
-                let installed = self.install_major_at(&range, &base_was, &absorbed, base, base_seq);
+                let installed =
+                    self.install_major_at(&range, &base_was, &absorbed, base, base_seq, view);
                 let _ = reply.send(installed);
             }
             Request::Seal { range, buffer } => {
@@ -751,6 +784,7 @@ impl RangeCache {
                 active: self.new_buffer(w),
                 sealed: Vec::new(),
                 runs: Vec::new(),
+                view: None,
                 // A loading range serves no read.
                 base: None,
                 base_seq: w,
@@ -797,6 +831,7 @@ impl RangeCache {
                 active: layers.active.clone(),
                 sealed: layers.sealed.clone(),
                 runs: layers.runs.clone(),
+                view: layers.view.clone(),
                 base: Some(base),
                 base_seq,
                 covered_to: layers.covered_to,
@@ -817,12 +852,16 @@ impl RangeCache {
     /// buffer's seal; the range holds at most `max_runs` runs afterwards. Otherwise the run is
     /// rejected, and its file is deleted when it drops. A merge in flight that holds other runs,
     /// anywhere in the range, does not matter: the run goes first and the other runs stay.
+    ///
+    /// With the delta view, `view` must be the range's view with the run and nothing else, built
+    /// on the view that the range still holds (see [`ViewSwap`]); a flush then replaces no run.
     pub(super) fn install_run_at(
         &self,
         range: &Arc<CachedRange>,
         run: Arc<Run>,
         buffers: &[Arc<Delta>],
         replaces: &[Arc<Run>],
+        view: Option<ViewSwap>,
     ) -> bool {
         if !self.is_indexed(range) {
             self.stats.installs_rejected.increment(1);
@@ -835,6 +874,10 @@ impl RangeCache {
         let newest = replaces.len() <= layers.runs.len()
             && same_arcs(&layers.runs[..replaces.len()], replaces);
         let lo = replaces.last().map_or(layers.covered_to, |r| r.lo);
+        let Some(view) = self.view_after(&layers, view, replaces.is_empty()) else {
+            self.stats.installs_rejected.increment(1);
+            return false;
+        };
         if !oldest
             || !newest
             || run.lo != lo
@@ -867,6 +910,7 @@ impl RangeCache {
                 active: layers.active.clone(),
                 sealed,
                 runs,
+                view,
                 base: layers.base.clone(),
                 base_seq: layers.base_seq,
                 covered_to,
@@ -907,7 +951,8 @@ impl RangeCache {
             .first()
             .zip(inputs.last())
             .is_some_and(|(newest, oldest)| output.hi == newest.hi && output.lo == oldest.lo);
-        let Some(at) = slice.filter(|_| union) else {
+        // The delta view takes no minor merge.
+        let Some(at) = slice.filter(|_| union && layers.view.is_none()) else {
             self.stats.installs_rejected.increment(1);
             return false;
         };
@@ -924,6 +969,7 @@ impl RangeCache {
                 active: layers.active.clone(),
                 sealed: layers.sealed.clone(),
                 runs,
+                view: None,
                 base: layers.base.clone(),
                 base_seq: layers.base_seq,
                 covered_to: layers.covered_to,
@@ -931,6 +977,22 @@ impl RangeCache {
             },
         );
         true
+    }
+
+    /// The view that an install publishes: with the delta view, the new view of `swap` if the
+    /// range still holds the view it was built on, and `None` (reject) otherwise or for an install
+    /// that replaces runs; without it, no view (and `None` for a request that carries one).
+    fn view_after(
+        &self,
+        layers: &Layers,
+        swap: Option<ViewSwap>,
+        plain: bool,
+    ) -> Option<Option<Arc<DeltaView>>> {
+        match (self.options.tuning.delta_view, swap) {
+            (false, None) => Some(None),
+            (true, Some(swap)) if plain && same_view(&layers.view, &swap.was) => Some(swap.new),
+            _ => None,
+        }
     }
 
     /// Installs a base from a major merge (`InstallMajor`, design 01 section 6.2): the new base
@@ -941,6 +1003,9 @@ impl RangeCache {
     ///
     /// Preconditions: the range is indexed; its base is still `base_was`; `absorbed` are still
     /// its oldest runs; `base_seq` is the newest absorbed run's `hi`.
+    ///
+    /// With the delta view, `view` must be the range's view without the absorbed runs, built on the
+    /// view that the range still holds (see [`ViewSwap`]).
     pub(super) fn install_major_at(
         &self,
         range: &Arc<CachedRange>,
@@ -948,6 +1013,7 @@ impl RangeCache {
         absorbed: &[Arc<Run>],
         base: Arc<RangeFile>,
         base_seq: u64,
+        view: Option<ViewSwap>,
     ) -> bool {
         if !self.is_indexed(range) {
             self.stats.installs_rejected.increment(1);
@@ -965,6 +1031,10 @@ impl RangeCache {
                 .zip(absorbed)
                 .all(|(a, b)| Arc::ptr_eq(a, b))
         });
+        let Some(view) = self.view_after(&layers, view, true) else {
+            self.stats.installs_rejected.increment(1);
+            return false;
+        };
         if !same_base || !oldest || absorbed.first().is_none_or(|r| r.hi != base_seq) {
             self.stats.installs_rejected.increment(1);
             return false;
@@ -978,6 +1048,7 @@ impl RangeCache {
                 active: layers.active.clone(),
                 sealed: layers.sealed.clone(),
                 runs: layers.runs[..kept].to_vec(),
+                view,
                 base: Some(base),
                 base_seq,
                 covered_to: layers.covered_to,

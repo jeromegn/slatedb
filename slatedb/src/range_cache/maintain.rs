@@ -50,6 +50,19 @@
 //! Flushes and merges have their own limits on concurrent jobs, so a long merge never holds back
 //! the flushes that free memory.
 //!
+//! **With the delta view** (`RangeCacheTuning::delta_view`, see the `view` module), runs never
+//! merge with each other: a flush writes only its sealed buffers, and a major merge absorbs every
+//! run that the range holds when it starts. A major merge is due when the run bytes reach the
+//! threshold above, or when the runs reach half of `max_runs`; a range that holds `max_runs` runs
+//! flushes only after its major merge. Each job builds its view on a blocking thread, after its
+//! file: a flush merges its run into the range's view, a major merge drops the absorbed runs from
+//! it. The writer installs the view with the file only if the range still holds the view that the
+//! job built on. A flush and a major merge of one range can race, and each changes the view: the
+//! one that installs second is rejected, builds its view again on the new one, and sends its
+//! install again, at most [`VIEW_ATTEMPTS`] times. Its file stays good, so a race costs a view
+//! build, not a file, and neither job's work is lost: a flush that lands during a major merge
+//! keeps its run, and the merge drops only the runs it absorbed.
+//!
 //! The writer notifies the task of a range when it seals one of its buffers or attaches its
 //! base, and a job notifies it of its range when it ends. The task looks only at the notified
 //! range, and queues the jobs it calls for until a slot is free, in the order it found them: so
@@ -75,8 +88,11 @@ use super::delta::Delta;
 use super::file::{RangeFile, RangeFileIterator, RangeFileWriter};
 use super::merge::merge_versions;
 use super::stats::RemoveReason;
-use super::writer::Target;
-use super::{CachedRange, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run, MAX_RUNS_RANGE};
+use super::writer::{same_view, Target, ViewSwap};
+use super::{
+    BuildCost, CachedRange, DeltaView, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run,
+    MAX_RUNS_RANGE,
+};
 use crate::bytes_range::BytesRange;
 use crate::db::DbInner;
 use crate::db_iter::DbIterator;
@@ -112,6 +128,9 @@ pub(super) const FLUSH_MERGE_RUNS: usize = 2;
 /// bounded by them.
 pub(super) const F_MIN: f64 = 0.05;
 pub(super) const F_MAX: f64 = 1.0;
+/// With the delta view, the most times that a job builds its view and sends its install, when the
+/// writer rejects it because the range's view moved on.
+pub(super) const VIEW_ATTEMPTS: usize = 8;
 // With the default minor rule a merge holds the two oldest runs, so a flush-merge always finds
 // the two newest free, as in stage 2c; and a merge of two runs always fits rule 1.
 const _: () = assert!(MERGE_RUNS + FLUSH_MERGE_RUNS <= *MAX_RUNS_RANGE.start());
@@ -256,6 +275,16 @@ async fn off_workers<T: Send + 'static>(
         .map_err(|e| SlateDBError::BackgroundTaskPanic(format!("range cache file work: {e}")))?
 }
 
+/// The nanoseconds since `started` on `clock`.
+fn elapsed_nanos(
+    clock: &dyn slatedb_common::clock::SystemClock,
+    started: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    (clock.now() - started)
+        .num_nanoseconds()
+        .map_or(0, |n| n.max(0) as u64)
+}
+
 /// The merge that a range's layers call for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Merge {
@@ -364,6 +393,19 @@ pub(super) fn plan_merge(
     flush_held: usize,
 ) -> Option<MergePlan> {
     let n = layers.runs.len();
+    if tuning.delta_view {
+        // No minor merge: a major merge absorbs every run, when their bytes call for one or when
+        // they reach half of the most runs.
+        let base = layers.base.as_ref()?;
+        let run_bytes: u64 = layers.runs.iter().map(|r| r.file_bytes()).sum();
+        let due = n > 0
+            && (run_bytes >= major_threshold(range, base.file_len(), tuning)
+                || n >= view_major_runs(tuning));
+        return due.then_some(MergePlan {
+            merge: Merge::Major,
+            runs: 0..n,
+        });
+    }
     let first = mergeable_from(n, flush_held, tuning.max_runs);
     if first == n {
         return None;
@@ -383,6 +425,12 @@ pub(super) fn plan_merge(
         merge: Merge::Minor,
         runs,
     })
+}
+
+/// With the delta view, the runs at which a major merge of a range is due whatever their bytes:
+/// half of `max_runs`, so that flushes have room while it runs.
+pub(super) fn view_major_runs(tuning: &RangeCacheTuning) -> usize {
+    (tuning.max_runs / 2).max(1)
 }
 
 /// The merge that `layers`, the layers of `range`, call for when no flush is in flight. A flush
@@ -421,11 +469,77 @@ impl RangeCache {
         let added = run.file_bytes().saturating_sub(replaced);
         // Checkers keep the sealed buffers pinned by this job across many batches.
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-install-run");
-        if self.install_run(range, run, buffers, replaces).await {
+        let installed = if self.options.tuning.delta_view {
+            debug_assert!(replaces.is_empty(), "a flush-merge with the delta view");
+            self.install_run_with_view(range, run, buffers).await?
+        } else {
+            self.install_run(range, run, buffers, replaces, None).await
+        };
+        if installed {
             range.jobs.record_flush(added);
             self.evict(None).await;
         }
         Ok(())
+    }
+
+    /// Builds the view of `range` with `run`, which a flush wrote from `buffers`, on the view that
+    /// the range holds, and installs both. Builds and sends again while the writer rejects the
+    /// install because the view moved on (a major merge installed meanwhile).
+    async fn install_run_with_view(
+        self: &Arc<Self>,
+        range: &Arc<CachedRange>,
+        run: Arc<Run>,
+        buffers: Vec<Arc<Delta>>,
+    ) -> Result<bool, SlateDBError> {
+        for attempt in 0..VIEW_ATTEMPTS {
+            let (was, runs) = {
+                let layers = range.layers.load();
+                (layers.view.clone(), layers.runs.clone())
+            };
+            let view = {
+                let (cache, run, was) = (self.clone(), run.clone(), was.clone());
+                off_workers(move || {
+                    let mut cost = BuildCost::default();
+                    let started = cache.clock.now();
+                    let view = match &was {
+                        Some(view) => view.with_run(&run, &mut cost)?,
+                        None => {
+                            let mut all = vec![run];
+                            all.extend(runs);
+                            DeltaView::from_runs(&all, &cache.views, &mut cost)?
+                        }
+                    };
+                    cost.nanos = elapsed_nanos(&*cache.clock, started);
+                    cache.stats.view[0].built(&cost);
+                    Ok(view)
+                })
+                .await?
+            };
+            if attempt > 0 {
+                self.stats.view[0].retries.increment(1);
+            }
+            // Checkers stretch the window in which a major merge can change the view.
+            fail_point!(
+                Arc::clone(&self.fp_registry),
+                "range-cache-install-run-view"
+            );
+            let swap = ViewSwap {
+                new: Some(Arc::new(view)),
+                was: was.clone(),
+            };
+            if self
+                .install_run(range, run.clone(), buffers.clone(), Vec::new(), Some(swap))
+                .await
+            {
+                return Ok(true);
+            }
+            // Only a view that moved on calls for another build: the writer rejects anything else
+            // again.
+            if same_view(&range.layers.load().view, &was) || !self.is_indexed(range) {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     /// Writes the versions of `buffers` (newest first, each up to its seal) and of `runs`
@@ -506,13 +620,77 @@ impl RangeCache {
                     .await?,
             )
         };
-        if self
-            .install_major(range, &base, absorbed, new_base, base_seq)
-            .await
-        {
+        let installed = if self.options.tuning.delta_view {
+            self.install_major_with_view(range, &base, absorbed, new_base, base_seq)
+                .await?
+        } else {
+            self.install_major(range, &base, absorbed, new_base, base_seq, None)
+                .await
+        };
+        if installed {
             self.evict(None).await;
         }
         Ok(())
+    }
+
+    /// Builds the view of `range` without `absorbed`, on the view that the range holds, and
+    /// installs it with `new_base`. Builds and sends again while the writer rejects the install
+    /// because the view moved on (a flush installed meanwhile).
+    async fn install_major_with_view(
+        self: &Arc<Self>,
+        range: &Arc<CachedRange>,
+        base: &Arc<RangeFile>,
+        absorbed: Vec<Arc<Run>>,
+        new_base: Arc<RangeFile>,
+        base_seq: u64,
+    ) -> Result<bool, SlateDBError> {
+        for attempt in 0..VIEW_ATTEMPTS {
+            let was = range.layers.load().view.clone();
+            let Some(old) = was.clone() else {
+                return Ok(false);
+            };
+            let view = {
+                let (cache, absorbed) = (self.clone(), absorbed.clone());
+                off_workers(move || {
+                    let mut cost = BuildCost::default();
+                    let started = cache.clock.now();
+                    let view = old.without(&absorbed, &mut cost)?;
+                    cost.nanos = elapsed_nanos(&*cache.clock, started);
+                    cache.stats.view[1].built(&cost);
+                    Ok(view)
+                })
+                .await?
+            };
+            if attempt > 0 {
+                self.stats.view[1].retries.increment(1);
+            }
+            // Checkers stretch the window in which a flush can change the view.
+            fail_point!(
+                Arc::clone(&self.fp_registry),
+                "range-cache-install-major-view"
+            );
+            let swap = ViewSwap {
+                new: view.map(Arc::new),
+                was: was.clone(),
+            };
+            if self
+                .install_major(
+                    range,
+                    base,
+                    absorbed.clone(),
+                    new_base.clone(),
+                    base_seq,
+                    Some(swap),
+                )
+                .await
+            {
+                return Ok(true);
+            }
+            if same_view(&range.layers.load().view, &was) || !self.is_indexed(range) {
+                return Ok(false);
+            }
+        }
+        Ok(false)
     }
 
     /// Writes the state at `base_seq` of `runs` (newest first) over `base` to a new base: newest
@@ -691,6 +869,18 @@ impl Maintainer {
         let newest = layers.sealed.first()?;
         let hi = newest.sealed_at().load(Ordering::Acquire);
         let (runs, max_runs) = (layers.runs.len(), self.cache.options.tuning.max_runs);
+        if self.cache.options.tuning.delta_view {
+            // No flush-merge: a full range waits for its major merge, whose end notifies the task.
+            if runs >= max_runs {
+                return None;
+            }
+            return Some(Job::Flush {
+                buffers: layers.sealed.clone(),
+                replaces: Vec::new(),
+                lo: layers.covered_to,
+                hi,
+            });
+        }
         let free = range.jobs.free_newest(&layers.runs);
         debug_assert!(
             runs < max_runs || free > 0,
@@ -917,7 +1107,8 @@ mod tests {
         FLUSH_MERGE_RUN_COUNT, INSTALL_REJECTED_COUNT, LOAD_REJECTED_COUNT, MINOR_MERGE_COUNT,
         MINOR_MERGE_RUNS_COUNT, MULTI_BUFFER_FLUSH_COUNT, REBUILD_COUNT, REMOVE_COUNT, SEAL_COUNT,
     };
-    use crate::range_cache::{CachedRangeInfo, RangeCacheOptions};
+    use crate::range_cache::stats::{VIEW_BUILD_COUNT, VIEW_BYTES, VIEW_RETRY_COUNT};
+    use crate::range_cache::{CachedRangeInfo, RangeCacheOptions, MAX_VIEW_RUNS_RANGE};
 
     /// How long a test waits for something that must happen promptly.
     const PROMPT: Duration = Duration::from_secs(20);
@@ -1202,20 +1393,28 @@ mod tests {
         let r = run(std::slice::from_ref(&newer), newer.lo(), seal(&newer));
         assert!(
             !cache
-                .install_run(&range, r, vec![newer.clone()], vec![])
+                .install_run(&range, r, vec![newer.clone()], vec![], None)
                 .await
         );
         // Not from `covered_to`, or not to the newest buffer's seal.
         let r = run(&both, lo - 1, seal(&newer));
-        assert!(!cache.install_run(&range, r, both.clone(), vec![]).await);
+        assert!(
+            !cache
+                .install_run(&range, r, both.clone(), vec![], None)
+                .await
+        );
         let r = run(&both, lo, seal(&newer) - 1);
-        assert!(!cache.install_run(&range, r, both.clone(), vec![]).await);
+        assert!(
+            !cache
+                .install_run(&range, r, both.clone(), vec![], None)
+                .await
+        );
         // Runs to replace that the range does not hold.
         let stray = run(std::slice::from_ref(&oldest), lo, seal(&oldest));
         let r = run(&both, lo, seal(&newer));
         assert!(
             !cache
-                .install_run(&range, r, both.clone(), vec![stray])
+                .install_run(&range, r, both.clone(), vec![stray], None)
                 .await
         );
         // A rejected run's file is deleted when it drops.
@@ -1225,7 +1424,7 @@ mod tests {
         let first = run(&both, lo, seal(&newer));
         assert!(
             cache
-                .install_run(&range, first.clone(), both.clone(), vec![])
+                .install_run(&range, first.clone(), both.clone(), vec![], None)
                 .await
         );
         let after = range.layers.load_full();
@@ -1308,13 +1507,21 @@ mod tests {
                     &other,
                     absorbed.clone(),
                     merged(short.hi).await,
-                    short.hi
+                    short.hi,
+                    None
                 )
                 .await
         );
         assert!(
             !cache
-                .install_major(&range, &base, vec![], merged(short.hi).await, short.hi)
+                .install_major(
+                    &range,
+                    &base,
+                    vec![],
+                    merged(short.hi).await,
+                    short.hi,
+                    None
+                )
                 .await
         );
         assert!(
@@ -1324,7 +1531,8 @@ mod tests {
                     &base,
                     vec![first.clone()],
                     merged(short.hi).await,
-                    short.hi
+                    short.hi,
+                    None
                 )
                 .await
         );
@@ -1335,13 +1543,21 @@ mod tests {
                     &base,
                     absorbed.clone(),
                     merged(short.hi).await,
-                    short.hi + 1
+                    short.hi + 1,
+                    None
                 )
                 .await
         );
         assert!(
             cache
-                .install_major(&range, &base, absorbed, merged(short.hi).await, short.hi)
+                .install_major(
+                    &range,
+                    &base,
+                    absorbed,
+                    merged(short.hi).await,
+                    short.hi,
+                    None
+                )
                 .await
         );
         let after = range.layers.load_full();
@@ -1362,14 +1578,14 @@ mod tests {
             let rejected = t.metric(INSTALL_REJECTED_COUNT, &[]);
             assert!(
                 !cache
-                    .install_run(&range, stale.clone(), held.clone(), vec![])
+                    .install_run(&range, stale.clone(), held.clone(), vec![], None)
                     .await
             );
             t.db.cache_range(span(0, 100)).await.unwrap();
             assert!(!Arc::ptr_eq(&t.range(&key(0)), &range));
             assert!(
                 !cache
-                    .install_run(&range, stale.clone(), held.clone(), vec![])
+                    .install_run(&range, stale.clone(), held.clone(), vec![], None)
                     .await
             );
             assert!(
@@ -1694,6 +1910,7 @@ mod tests {
                 )),
                 sealed: Vec::new(),
                 runs: Vec::new(),
+                view: None,
                 base: None,
                 base_seq: 0,
                 covered_to: 0,
@@ -2254,13 +2471,162 @@ mod tests {
         t.db.close().await.unwrap();
     }
 
+    /// Views of the delta view tests: the range's view lists exactly its runs, every version once.
+    fn assert_view(range: &CachedRange) -> usize {
+        let layers = range.layers.load_full();
+        match &layers.view {
+            None => assert!(layers.runs.is_empty(), "runs without a view"),
+            Some(view) => view.check().unwrap(),
+        }
+        layers.check(MAX_VIEW_RUNS_RANGE.end().to_owned());
+        layers.runs.len()
+    }
+
+    fn view_counter(t: &TestDb, name: &str, job: &str) -> i64 {
+        t.metric(name, &[("job", job)])
+    }
+
+    /// With the delta view, runs never merge with each other: a range holds many runs, up to
+    /// `max_runs`, through one view, and reads stay exact. At `max_runs` flushes wait for the
+    /// major merge, which absorbs every run it found and leaves the runs flushed meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_hold_many_runs_through_the_delta_view() {
+        let t = open(|o| {
+            o.tuning.range_seal_bytes = 16 * 1024;
+            o.tuning.delta_view = true;
+            o.tuning.max_runs = 12;
+        })
+        .await;
+        load(&t, 0, 100).await;
+        let range = t.range(&key(0));
+        let snapshot = t.db.snapshot().unwrap();
+        // The major merge, due at 6 runs, waits.
+        t.fail("range-cache-rebuild", "pause");
+        for runs in 1..=12 {
+            seal_and_flush(&t, 0, 100).await;
+            assert_eq!(assert_view(&range), runs);
+            if runs % 4 == 0 {
+                t.assert_reads(0, 100, Some(&snapshot)).await;
+            }
+        }
+        assert_eq!(t.metric(MINOR_MERGE_COUNT, &[]), 0);
+        assert_eq!(t.metric(FLUSH_MERGE_COUNT, &[]), 0);
+        assert_eq!(view_counter(&t, VIEW_BUILD_COUNT, "flush"), 12);
+        // A full range does not flush: its sealed buffer waits.
+        let seals = t.seals();
+        t.write_until(0, 100, |t| t.seals() > seals).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(t.info(&key(0)).runs, 12);
+        assert_eq!(t.info(&key(0)).sealed_buffers, 1);
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        // The major merge took the 6 runs it found; the 6 later ones stay, and the waiting flush
+        // goes ahead.
+        t.fail("range-cache-rebuild", "off");
+        t.wait("the major merge and the flush", |t| {
+            t.metric(REBUILD_COUNT, &[]) >= 1 && t.info(&key(0)).sealed_buffers == 0
+        })
+        .await;
+        t.wait("quiet", |t| !t.info(&key(0)).rebuilding).await;
+        let runs = assert_view(&range);
+        assert!(runs < 12, "{runs} runs after the major merge");
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 0);
+        assert!(view_counter(&t, VIEW_BUILD_COUNT, "major") >= 1);
+        t.assert_reads(0, 100, None).await;
+        // The view's memory is metadata, about seven bytes per version and the anchors.
+        t.cache().update_gauges();
+        let views = t.metric(VIEW_BYTES, &[]);
+        let versions: u64 = range.layers.load().runs.iter().map(|r| r.file.rows()).sum();
+        assert!(
+            views as u64 >= 7 * versions,
+            "{views} bytes, {versions} versions"
+        );
+        assert!(t.metric(crate::range_cache::stats::META_BYTES, &[]) >= views);
+        t.db.close().await.unwrap();
+    }
+
+    /// A flush and a major merge of one range race: each changes the view, so the one that
+    /// installs second is rejected, builds its view again on the new one, and installs. No run is
+    /// lost and no file is written twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn should_rebuild_the_view_of_a_job_that_lost_a_race() {
+        let t = open(|o| {
+            o.tuning.range_seal_bytes = 16 * 1024;
+            o.tuning.delta_view = true;
+            o.tuning.max_runs = 16;
+            // A major merge is due at the first run.
+            o.tuning.min_rebuild_delta_bytes = 0;
+            o.tuning.major_merge_factor = Some(1e-6);
+        })
+        .await;
+        load(&t, 0, 100).await;
+        let range = t.range(&key(0));
+        let snapshot = t.db.snapshot().unwrap();
+
+        // A major merge waits to install its view while flushes install theirs.
+        t.fail("range-cache-install-major-view", "pause");
+        seal_and_flush(&t, 0, 100).await;
+        t.wait("the first major merge", |_| range.jobs.merging())
+            .await;
+        for _ in 0..3 {
+            seal_and_flush(&t, 0, 100).await;
+        }
+        assert_eq!(t.metric(FLUSH_COUNT, &[]), 4);
+        assert_eq!(assert_view(&range), 4);
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        // The next major merge waits at its start.
+        t.fail("range-cache-rebuild", "pause");
+        t.fail("range-cache-install-major-view", "off");
+        t.wait("the first install", |t| t.metric(REBUILD_COUNT, &[]) == 1)
+            .await;
+        assert_eq!(view_counter(&t, VIEW_RETRY_COUNT, "major"), 1);
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 1);
+        // The merge absorbed the one run it found; the three flushed meanwhile stay.
+        assert_eq!(assert_view(&range), 3);
+        t.assert_reads(0, 100, None).await;
+
+        // The second major merge holds those three runs. A flush waits to install its view while
+        // that merge absorbs every run.
+        t.wait("the second major merge", |_| range.jobs.merging())
+            .await;
+        t.fail("range-cache-install-run-view", "pause");
+        let seals = t.seals();
+        t.write_until(0, 100, |t| t.seals() > seals).await;
+        t.wait("the flush", |_| range.jobs.flushing()).await;
+        t.fail("range-cache-rebuild", "off");
+        t.wait("the second install", |t| t.metric(REBUILD_COUNT, &[]) == 2)
+            .await;
+        assert_eq!(assert_view(&range), 0);
+        // The next major merge waits again, so the flushed run stays to be looked at.
+        t.fail("range-cache-rebuild", "pause");
+        t.fail("range-cache-install-run-view", "off");
+        t.wait("the flush", |t| t.info(&key(0)).sealed_buffers == 0)
+            .await;
+        assert_eq!(view_counter(&t, VIEW_RETRY_COUNT, "flush"), 1);
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 2);
+        assert_eq!(assert_view(&range), 1);
+        t.assert_reads(0, 100, None).await;
+        t.fail("range-cache-rebuild", "off");
+        t.wait("quiet", |t| !t.info(&key(0)).rebuilding).await;
+        assert_view(&range);
+        t.assert_reads(0, 100, None).await;
+        t.db.close().await.unwrap();
+    }
+
     /// Run settings out of their bounds fail the build.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_reject_run_settings_out_of_bounds() {
         type Tune = fn(&mut RangeCacheTuning);
-        let cases: [(&str, Tune); 8] = [
+        let cases: [(&str, Tune); 10] = [
             ("max_runs 3", |t| t.max_runs = 3),
             ("max_runs 9", |t| t.max_runs = 9),
+            ("max_runs 65 with the view", |t| {
+                t.delta_view = true;
+                t.max_runs = 65;
+            }),
+            ("max_runs 3 with the view", |t| {
+                t.delta_view = true;
+                t.max_runs = 3;
+            }),
             ("ratio 0.5", |t| t.minor_merge_ratio = 0.5),
             ("ratio NaN", |t| t.minor_merge_ratio = f64::NAN),
             ("factor 0", |t| t.major_merge_factor = Some(0.0)),
@@ -2283,13 +2649,17 @@ mod tests {
         for (name, tune) in cases {
             assert!(build(tune).await.0.is_err(), "{name} was accepted");
         }
-        let bounds: [Tune; 3] = [
+        let bounds: [Tune; 4] = [
             |t| t.max_runs = 4,
             |t| {
                 t.max_runs = 8;
                 t.minor_merge_ratio = 1.0;
             },
             |t| t.major_merge_factor = Some(2.0),
+            |t| {
+                t.delta_view = true;
+                t.max_runs = 64;
+            },
         ];
         for tune in bounds {
             let (db, _dir) = build(tune).await;

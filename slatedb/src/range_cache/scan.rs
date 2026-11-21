@@ -17,6 +17,13 @@
 //!
 //! The cursors hold positions, not references: they read their buffer or file through the layers
 //! that the scan holds. So a scan takes one reference count, on its layers, and none per source.
+//!
+//! With the delta view (see the `view` module), the runs have one cursor, on the view, instead of
+//! one each: it walks the view's entries and reads each row from its run file by its locator. The
+//! versions of a key are adjacent in the view, newest first, so the cursor finds the newest visible
+//! version of a key, and leaves the key, with no key comparison between runs. A run whose versions
+//! are all above the scan's sequence number is skipped by its interval, without reading its rows,
+//! and only a run whose interval holds that number has its rows' sequence numbers read.
 
 use std::collections::VecDeque;
 use std::io;
@@ -29,6 +36,8 @@ use bytes::Bytes;
 
 use super::buffer::{Cursor, Kind, Version};
 use super::delta::{past_end, to_row, Delta};
+use super::file::RowSpan;
+use super::view::DeltaView;
 use super::{Layers, Run};
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
@@ -193,11 +202,199 @@ impl RunCursor {
     }
 }
 
-/// A cursor over one buffer or run of the current part, with its place in the layers. A run's
-/// cursor is large (it holds a page copy and the page's row offsets), so it is boxed.
+/// The key of a view cursor's version: a span of a mapped run file, or a copy (positional reads,
+/// whose files the cursor cannot borrow).
+enum ViewKey {
+    None,
+    Mapped { slot: u8, at: usize, len: usize },
+    Owned(Bytes),
+}
+
+/// A cursor over the versions of all runs of a range that are visible at one sequence number,
+/// through the range's delta view. Like the other cursors, it is a position: it reads the view and
+/// the run files through the layers that the scan holds.
+struct ViewCursor {
+    /// The entry of the view.
+    pos: usize,
+    seq: u64,
+    /// `pos` is at the newest visible version of its key, which the scan has not used yet.
+    peeked: bool,
+    /// The cursor passed the end of the part, or of the view.
+    done: bool,
+    /// The row and the key of the peeked version.
+    row: Option<RowSpan>,
+    key: ViewKey,
+}
+
+/// The view of `layers`. A view cursor exists only for layers with a view.
+fn view_of(layers: &Layers) -> &DeltaView {
+    layers
+        .view
+        .as_deref()
+        .expect("a view cursor on layers without a view")
+}
+
+impl ViewCursor {
+    fn new(view: &DeltaView, start: Bound<&[u8]>, seq: u64) -> io::Result<Self> {
+        Ok(Self {
+            pos: view.seek(start)?,
+            seq,
+            peeked: false,
+            done: false,
+            row: None,
+            key: ViewKey::None,
+        })
+    }
+
+    /// Moves to the newest visible version of the next key, unless the cursor is at one. Versions
+    /// of runs whose interval is above `seq` are skipped without a read; the first remaining one at
+    /// or below `seq` is the newest visible version of its key.
+    fn fill(&mut self, view: &DeltaView, end: &Bound<Bytes>) -> io::Result<()> {
+        while !self.peeked && !self.done {
+            if self.pos >= view.len() {
+                self.done = true;
+                break;
+            }
+            let run = view.run_of(self.pos);
+            if run.lo >= self.seq {
+                self.pos += 1;
+                continue;
+            }
+            let row = run.file.row_at(view.offset(self.pos))?;
+            if run.hi > self.seq && row.seq > self.seq {
+                self.pos += 1;
+                continue;
+            }
+            let (at, len) = row.key;
+            let key = match run.file.mapped() {
+                Some(map) => {
+                    let at = usize::try_from(at).map_err(|_| io::Error::other("key offset"))?;
+                    let key = map
+                        .get(at..at + len)
+                        .ok_or_else(|| io::Error::other("range cache view: key past the file"))?;
+                    if past_end(end, key) {
+                        self.done = true;
+                        break;
+                    }
+                    ViewKey::Mapped {
+                        slot: view.slot_of(self.pos),
+                        at,
+                        len,
+                    }
+                }
+                None => {
+                    let key = Bytes::copy_from_slice(&run.file.bytes_at(at, len)?);
+                    if past_end(end, &key) {
+                        self.done = true;
+                        break;
+                    }
+                    ViewKey::Owned(key)
+                }
+            };
+            self.row = Some(row);
+            self.key = key;
+            self.peeked = true;
+        }
+        Ok(())
+    }
+
+    fn key<'a>(&'a self, view: &'a DeltaView) -> Option<&'a [u8]> {
+        if !self.peeked {
+            return None;
+        }
+        match &self.key {
+            ViewKey::Mapped { slot, at, len } => view
+                .run_in(*slot)
+                .file
+                .mapped()
+                .and_then(|map| map.get(*at..*at + *len)),
+            ViewKey::Owned(key) => Some(key),
+            ViewKey::None => None,
+        }
+    }
+
+    /// The key of the peeked version for a step: borrowed from the mapping, or the copy.
+    fn step_key<'a>(&self, view: &'a DeltaView) -> Option<StepKey<'a>> {
+        if !self.peeked {
+            return None;
+        }
+        match &self.key {
+            ViewKey::Mapped { slot, at, len } => view
+                .run_in(*slot)
+                .file
+                .mapped()
+                .and_then(|map| map.get(*at..*at + *len))
+                .map(StepKey::Buffer),
+            ViewKey::Owned(key) => Some(StepKey::Run(key.clone())),
+            ViewKey::None => None,
+        }
+    }
+
+    /// Leaves the current key: moves to the first entry of the next key.
+    fn leave(&mut self, view: &DeltaView) {
+        self.pos = view.next_key(self.pos);
+        self.peeked = false;
+        self.row = None;
+        self.key = ViewKey::None;
+    }
+
+    /// The version that `fill` found, copied out, then leaves its key.
+    fn take(&mut self, view: &DeltaView) -> io::Result<RowEntry> {
+        let row = self
+            .row
+            .ok_or_else(|| io::Error::other("range cache view cursor has no current row"))?;
+        let entry = view.run_of(self.pos).file.decode_span(&row)?;
+        self.leave(view);
+        Ok(entry)
+    }
+
+    /// Leaves `key` if the cursor is at one of its versions, visible or not.
+    fn skip_key(&mut self, view: &DeltaView, key: &[u8]) -> io::Result<()> {
+        if self.done || self.pos >= view.len() {
+            return Ok(());
+        }
+        let here = match self.key(view) {
+            Some(current) => current == key,
+            None => view_key_at(view, self.pos)?.as_ref() == key,
+        };
+        if here {
+            self.leave(view);
+        }
+        Ok(())
+    }
+
+    /// Moves forward to the first key at or after `key`. It never moves backwards.
+    fn seek(&mut self, view: &DeltaView, key: &[u8]) -> io::Result<()> {
+        if self.done || self.key(view).is_some_and(|current| current >= key) {
+            return Ok(());
+        }
+        let to = view.seek(Included(key))?;
+        if to > self.pos {
+            self.pos = to;
+            self.peeked = false;
+            self.row = None;
+            self.key = ViewKey::None;
+        }
+        Ok(())
+    }
+}
+
+/// The key of entry `i` of `view`, read from its run file.
+fn view_key_at(view: &DeltaView, i: usize) -> io::Result<Bytes> {
+    let row = view.row(i)?;
+    let file = &view.run_of(i).file;
+    Ok(Bytes::copy_from_slice(
+        &file.bytes_at(row.key.0, row.key.1)?,
+    ))
+}
+
+/// A cursor over one buffer or run of the current part, or over its delta view, with its place in
+/// the layers. A run's cursor is large (it holds a page copy and the page's row offsets), so it is
+/// boxed.
 enum Source {
     Buffer(usize, DeltaCursor),
     Run(usize, Box<RunCursor>),
+    View(ViewCursor),
 }
 
 impl Source {
@@ -208,6 +405,7 @@ impl Source {
                 Ok(())
             }
             Source::Run(i, cursor) => cursor.fill(&layers.runs[*i].file),
+            Source::View(cursor) => cursor.fill(view_of(layers), end),
         }
     }
 
@@ -216,6 +414,7 @@ impl Source {
         match self {
             Source::Buffer(i, cursor) => cursor.key(buffer_of(layers, *i)),
             Source::Run(_, cursor) => cursor.key(),
+            Source::View(cursor) => cursor.key(view_of(layers)),
         }
     }
 
@@ -226,6 +425,7 @@ impl Source {
                 Ok(())
             }
             Source::Run(i, cursor) => cursor.skip_key(&layers.runs[*i].file, key),
+            Source::View(cursor) => cursor.skip_key(view_of(layers), key),
         }
     }
 
@@ -236,6 +436,7 @@ impl Source {
                 Ok(())
             }
             Source::Run(i, cursor) => cursor.seek(&layers.runs[*i].file, key),
+            Source::View(cursor) => cursor.seek(view_of(layers), key),
         }
     }
 }
@@ -367,10 +568,21 @@ impl CachedScan {
                     .push(Source::Buffer(i, DeltaCursor::new(delta, start, seq)));
             }
         }
-        for (i, run) in layers.runs.iter().enumerate() {
-            if run.lo < seq && run.file.rows() > 0 && run_meets(run, start, &end) {
-                let cursor = RunCursor::new(run, start, end.clone(), seq)?;
-                self.sources.push(Source::Run(i, Box::new(cursor)));
+        match &layers.view {
+            // One cursor for every run.
+            Some(view) => {
+                if !view.is_empty() && view.has_visible(seq) {
+                    self.sources
+                        .push(Source::View(ViewCursor::new(view, start, seq)?));
+                }
+            }
+            None => {
+                for (i, run) in layers.runs.iter().enumerate() {
+                    if run.lo < seq && run.file.rows() > 0 && run_meets(run, start, &end) {
+                        let cursor = RunCursor::new(run, start, end.clone(), seq)?;
+                        self.sources.push(Source::Run(i, Box::new(cursor)));
+                    }
+                }
             }
         }
         self.part_end = end;
@@ -452,6 +664,7 @@ impl CachedScan {
             let key = match &self.sources[b] {
                 Source::Buffer(i, cursor) => cursor.key(buffer_of(layers, *i)).map(StepKey::Buffer),
                 Source::Run(_, cursor) => cursor.cursor.key_bytes().map(StepKey::Run),
+                Source::View(cursor) => cursor.step_key(view_of(layers)),
             };
             let Some(key) = key else {
                 return Ok(Step::End);
@@ -481,6 +694,22 @@ impl CachedScan {
                         ValueDeletable::Value(_) => Some(Step::Row(row)),
                         ValueDeletable::Tombstone => None,
                         ValueDeletable::Merge(_) => Some(Step::Resolve(row.key)),
+                    }
+                }
+                Source::View(cursor) => {
+                    let view = view_of(layers);
+                    // A tombstone or a merge operand needs no copy of its value.
+                    match cursor.row.map(|row| row.kind()) {
+                        Some(Kind::Tombstone) => {
+                            cursor.leave(view);
+                            None
+                        }
+                        Some(Kind::Merge) => {
+                            let key = Bytes::copy_from_slice(key.as_bytes());
+                            cursor.leave(view);
+                            Some(Step::Resolve(key))
+                        }
+                        _ => Some(Step::Row(cursor.take(view)?)),
                     }
                 }
             };
@@ -588,6 +817,7 @@ mod tests {
     use crate::db_iter::DbIterator;
     use crate::range_cache::delta::DeltaMemory;
     use crate::range_cache::file::{RangeCachePageSource, RangeFileWriter};
+    use crate::range_cache::view::{BuildCost, ViewMemory};
     use crate::read_trace::ReadTrace;
     use crate::test_utils::StringConcatMergeOperator;
     use proptest::prelude::*;
@@ -656,6 +886,10 @@ mod tests {
     struct Shape {
         cuts: Vec<u64>,
         runs: usize,
+        /// How the delta view of the runs is built, if any: 0 no view (per-run cursors), 1 from
+        /// all runs at once, 2 run by run as flushes build it, 3 run by run on top of two older
+        /// runs below the base that a major merge then drops, as `without` does.
+        view: u8,
         /// How run `i` is written, by the three bits at `3 * i`: 0 straight from its versions,
         /// 1 as a flush of two sealed buffers that split its interval, 2 as a minor merge of two
         /// runs that split it, 3 as a flush-merge of a buffer with a run, 4 and 5 as minor merges
@@ -681,10 +915,13 @@ mod tests {
         proptest::collection::btree_set(BASE_SEQ + 1..MAX_SEQ, 0..10).prop_flat_map(|cuts| {
             let cuts: Vec<u64> = cuts.into_iter().collect();
             let most = cuts.len().min(*crate::range_cache::MAX_RUNS_RANGE.end());
-            (Just(cuts), 0..=most, any::<u32>()).prop_map(|(cuts, runs, writes)| Shape {
-                cuts,
-                runs,
-                writes,
+            (Just(cuts), 0..=most, any::<u32>(), 0u8..4).prop_map(|(cuts, runs, writes, view)| {
+                Shape {
+                    cuts,
+                    runs,
+                    view,
+                    writes,
+                }
             })
         })
     }
@@ -704,6 +941,7 @@ mod tests {
             active: Arc::new(all),
             sealed: Vec::new(),
             runs: Vec::new(),
+            view: None,
             base: None,
             base_seq: 0,
             covered_to: 0,
@@ -732,6 +970,8 @@ mod tests {
             .collect();
         let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
         let disk = crate::range_cache::file::FileBudget::detached();
+        let memory = Arc::new(ViewMemory::default());
+        let mut cost = BuildCost::default();
         let mut writer = RangeFileWriter::create(dir, &format!("{name}-base"), 512).unwrap();
         let mut rows = crate::range_cache::stack_iterator(
             &all_of(&history, make),
@@ -833,6 +1073,38 @@ mod tests {
             drop(writer);
             Arc::new(delta)
         };
+        let view = match shape.view {
+            _ if runs.is_empty() => None,
+            0 => None,
+            1 => Some(DeltaView::from_runs(&runs, &memory, &mut cost).unwrap()),
+            how => {
+                // Oldest first, as flushes build it; with `how == 3`, on top of two older runs
+                // that hold versions below the base, which a major merge then absorbs.
+                let older: Vec<Arc<Run>> = if how == 3 {
+                    vec![
+                        Arc::new(file_of(format!("{name}-gone0"), 0, BASE_SEQ / 2)),
+                        Arc::new(file_of(format!("{name}-gone1"), BASE_SEQ / 2, BASE_SEQ)),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let mut all = older.iter().chain(runs.iter().rev());
+                let first = all.next().unwrap();
+                let mut view =
+                    DeltaView::from_runs(std::slice::from_ref(first), &memory, &mut cost).unwrap();
+                for run in all {
+                    view = view.with_run(run, &mut cost).unwrap();
+                }
+                if how == 3 {
+                    let gone: Vec<Arc<Run>> = older.iter().rev().cloned().collect();
+                    view = view.without(&gone, &mut cost).unwrap().unwrap();
+                }
+                Some(view)
+            }
+        };
+        if let Some(view) = &view {
+            view.check().unwrap();
+        }
         let mut sealed = Vec::new();
         for i in shape.runs..intervals - 1 {
             let delta = buffer(bounds[i], bounds[i + 1]);
@@ -844,6 +1116,7 @@ mod tests {
             active: buffer(bounds[intervals - 1], MAX_SEQ),
             sealed,
             runs,
+            view: view.map(Arc::new),
             base: Some(Arc::new(base)),
             base_seq: BASE_SEQ,
             covered_to: bounds[shape.runs],
@@ -1016,6 +1289,19 @@ mod tests {
                         .unwrap(),
                     };
                     assert_eq!(got, want, "key {k} at {seq} in {shape:?}");
+                    // The same read with the runs searched through the view.
+                    let through_view = match crate::range_cache::lookup_view(&layers, &key(k), seq).unwrap() {
+                        crate::range_cache::Found::Value(kv) => Some(kv),
+                        crate::range_cache::Found::Absent => None,
+                        crate::range_cache::Found::Merge => crate::range_cache::Pinned {
+                            layers: layers.clone(),
+                            seq,
+                        }
+                        .get(&key(k), Some(merge.clone()))
+                        .await
+                        .unwrap(),
+                    };
+                    assert_eq!(through_view, want, "view read of key {k} at {seq} in {shape:?}");
                 }
             });
         }

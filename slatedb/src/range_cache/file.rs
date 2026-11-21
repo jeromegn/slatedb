@@ -1237,6 +1237,100 @@ impl RangeFile {
             Ok((pages, 0))
         }
     }
+
+    /// The whole file, if the page source maps it.
+    pub(super) fn mapped(&self) -> Option<&[u8]> {
+        self.source.mapped()
+    }
+
+    /// Reads `len` bytes at `offset`. A mapped file returns them without a copy.
+    pub(super) fn bytes_at(&self, offset: u64, len: usize) -> io::Result<Cow<'_, [u8]>> {
+        self.read(offset, len)
+    }
+
+    /// Decodes the header of the row at `offset`, an offset that [`RangeFile::for_each_row`]
+    /// gave. Pages start at multiples of the page size, so the offset alone finds the page. The
+    /// key and the value come back as spans of the file. With positional reads this reads the
+    /// whole page.
+    pub(super) fn row_at(&self, offset: u64) -> io::Result<RowSpan> {
+        let page_size = self.page_size as u64;
+        let page_start = offset - offset % page_size;
+        if page_start + page_size > self.data_end {
+            return Err(corrupt("row offset past the pages"));
+        }
+        let at = (offset - page_start) as usize;
+        let raw = match self.source.mapped() {
+            Some(map) => parse_row_at(slice_at(map, page_start, self.page_size)?, at)?,
+            None => parse_row_at(&self.read(page_start, self.page_size)?, at)?,
+        };
+        let span = |r: &Ref| match r {
+            Ref::Inline(range) => (page_start + range.start as u64, range.len()),
+            Ref::OutOfLine { offset, len } => (*offset, *len),
+        };
+        Ok(RowSpan {
+            flags: raw.flags,
+            seq: raw.seq,
+            create_ts: raw.create_ts,
+            key: span(&raw.key),
+            value: span(&raw.value),
+        })
+    }
+
+    /// Copies the row of `span` out of the file, its key and value in one allocation.
+    pub(super) fn decode_span(&self, span: &RowSpan) -> io::Result<RowEntry> {
+        let kind = span.kind();
+        let key = self.read(span.key.0, span.key.1)?;
+        let value = match kind {
+            Kind::Tombstone => Cow::Borrowed(&[][..]),
+            _ => self.read(span.value.0, span.value.1)?,
+        };
+        let (key, value) = copy_key_value(&key, &value);
+        Ok(RowEntry {
+            key,
+            value: value_of(kind, value),
+            seq: span.seq,
+            create_ts: (span.flags & FLAG_CREATE_TS != 0).then_some(span.create_ts),
+            expire_ts: None,
+        })
+    }
+
+    /// Calls `f` with the offset, the key and the sequence number of every row, in file order.
+    pub(super) fn for_each_row(
+        &self,
+        mut f: impl FnMut(u64, &[u8], u64) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for p in 0..self.page_count() {
+            let page = self.page(p)?;
+            let rows = Self::row_count(&page);
+            if PAGE_HEADER_LEN + (ROW_OFFSET_LEN + ROW_HINT_LEN) * rows > page.len() {
+                return Err(corrupt("bad page header"));
+            }
+            for i in 0..rows {
+                let off = u16_at(&page, PAGE_HEADER_LEN + ROW_OFFSET_LEN * i);
+                let raw = parse_row_at(&page, off)?;
+                let key = self.resolve(&page, &raw.key)?;
+                f(self.page_offsets[p] + off as u64, &key, raw.seq)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The header of one row of a file and where its key and value are, as offsets of the file and
+/// lengths. See [`RangeFile::row_at`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RowSpan {
+    flags: u8,
+    pub(super) seq: u64,
+    create_ts: i64,
+    pub(super) key: (u64, usize),
+    value: (u64, usize),
+}
+
+impl RowSpan {
+    pub(super) fn kind(&self) -> Kind {
+        kind_of(self.flags)
+    }
 }
 
 impl Drop for RangeFile {
