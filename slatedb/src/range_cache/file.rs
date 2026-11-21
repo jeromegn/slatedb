@@ -1,10 +1,17 @@
 //! Range cache files: the on-disk part of a cached range.
 //!
-//! A range cache file holds the live rows of one cached range at one sequence number. Rows are
-//! sorted by key. A file never holds tombstones or rows with an expire time. The cache writes a
-//! file once, into a temporary file that it renames into place, and then only reads it. The
-//! file is deleted when the last reference to its [`RangeFile`] is dropped. The cache does not
-//! sync files, because it can rebuild them from the database.
+//! A file is one of two kinds, written by the same writer and read by the same reader:
+//!
+//! - A *base* holds the live rows of one cached range at one sequence number, one row per key.
+//!   It never holds tombstones.
+//! - A *run* holds every version of a cached range in one interval of sequence numbers: several
+//!   versions of a key (newest first), tombstones and merge operands included. It also holds a
+//!   filter of its keys (see the `filter` module), which [`RangeFile::open`] copies to the heap.
+//!
+//! Rows are sorted by key, then by sequence number descending. No file holds rows with an expire
+//! time. The cache writes a file once, into a temporary file that it renames into place, and then
+//! only reads it. The file is deleted when the last reference to its [`RangeFile`] is dropped.
+//! The cache does not sync files, because it can rebuild them from the database.
 //!
 //! Only the fence index (the first key and the offset of each page) is kept in memory. A
 //! [`PageSource`] reads the pages. The memory-mapped source and the positional-read source
@@ -15,9 +22,15 @@
 //! ```text
 //! [blob run][pad] page 0 [blob run][pad] page 1 ... page N-1
 //! fence region:   for each page: u64 page offset | u32 key length | first key
-//! trailer (64 B): magic u64 | version u32 | page size u32 | page count u64 | row count u64 |
-//!                 fence offset u64 | fence length u64 | data bytes u64 | max seq u64
+//! filter region:  the run's filter (empty in a base)
+//! trailer (80 B): magic u64 | version u32 | page size u32 | page count u64 | row count u64 |
+//!                 fence offset u64 | fence length u64 | data bytes u64 | max seq u64 |
+//!                 filter length u64 | flags u64
+//! flags:          bit 0: a run (several versions of a key, tombstones)
 //! ```
+//!
+//! No file outlives the process (the cache deletes its files when the database opens), so the
+//! layout changes without a new version number until files persist.
 //!
 //! Each page is `page_size` bytes long and starts at a multiple of `page_size`:
 //!
@@ -30,6 +43,8 @@
 //! ref:   inline:      u32 length | bytes
 //!        out of line: u64 file offset | u32 length  (when the flag bit is set)
 //! ```
+//!
+//! A tombstone has an empty inline value.
 //!
 //! A key longer than `page_size / 8`, and a value that makes its row longer than
 //! `page_size / 4`, go out of line, into the blob run before the page that refers to them. So
@@ -47,6 +62,8 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use slatedb_common::file_handle_cache::read_exact_at_offset;
 
+use super::buffer::Kind;
+use super::filter::{hash_key, Filter};
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::iter::RowEntryIterator;
@@ -59,7 +76,9 @@ pub(crate) const TEMP_FILE_EXTENSION: &str = "rcf.tmp";
 
 const MAGIC: u64 = u64::from_le_bytes(*b"SLATERCF");
 const VERSION: u32 = 2;
-const TRAILER_LEN: usize = 64;
+const TRAILER_LEN: usize = 80;
+/// The trailer flag of a run.
+const FILE_FLAG_RUN: u64 = 1;
 /// Row count (u16) and the length of the key prefix that the hints skip (u16).
 const PAGE_HEADER_LEN: usize = 4;
 const ROW_OFFSET_LEN: usize = 2;
@@ -75,10 +94,32 @@ const OUT_OF_LINE_REF_LEN: usize = 12;
 
 const FLAG_KEY_OUT_OF_LINE: u8 = 1;
 const FLAG_VALUE_OUT_OF_LINE: u8 = 2;
-/// The row is a merge operand with no base value below it.
+/// The row is a merge operand. In a base, it has no base value below it.
 const FLAG_MERGE: u8 = 4;
 /// The row has a create timestamp.
 const FLAG_CREATE_TS: u8 = 8;
+/// The row is a tombstone. Only runs hold tombstones.
+const FLAG_TOMBSTONE: u8 = 16;
+
+/// The kind of a row with these flags.
+fn kind_of(flags: u8) -> Kind {
+    if flags & FLAG_TOMBSTONE != 0 {
+        Kind::Tombstone
+    } else if flags & FLAG_MERGE != 0 {
+        Kind::Merge
+    } else {
+        Kind::Value
+    }
+}
+
+/// A row's value of `kind`, from its value bytes.
+fn value_of(kind: Kind, value: Bytes) -> ValueDeletable {
+    match kind {
+        Kind::Value => ValueDeletable::Value(value),
+        Kind::Merge => ValueDeletable::Merge(value),
+        Kind::Tombstone => ValueDeletable::Tombstone,
+    }
+}
 
 pub(crate) const MIN_PAGE_SIZE: usize = 512;
 pub(crate) const MAX_PAGE_SIZE: usize = 65536;
@@ -293,7 +334,8 @@ fn open_page_source(
     }
 }
 
-/// Writes one range cache file from rows in strictly ascending key order.
+/// Writes one range cache file: a base from rows in strictly ascending key order, or a run from
+/// versions in ascending key order and, for one key, descending sequence number order.
 ///
 /// The writer writes `<name>.rcf.tmp` and [`RangeFileWriter::finish`] renames it to
 /// `<name>.rcf`. A writer that is dropped before it finishes removes its temporary file.
@@ -302,6 +344,10 @@ pub(crate) struct RangeFileWriter {
     final_path: PathBuf,
     out: Option<BufWriter<File>>,
     page_size: usize,
+    /// For a run: the hashes of its distinct keys, for its filter. `None` for a base.
+    run_keys: Option<Vec<u64>>,
+    /// The sequence number of the previous row.
+    prev_seq: u64,
     /// Bytes written to the file so far.
     pos: u64,
     /// Rows of the open page, without the page header and the row offsets.
@@ -323,8 +369,17 @@ pub(crate) struct RangeFileWriter {
 }
 
 impl RangeFileWriter {
-    /// Starts `dir/<name>.rcf.tmp`.
+    /// Starts the base `dir/<name>.rcf.tmp`.
     pub(crate) fn create(dir: &Path, name: &str, page_size: usize) -> io::Result<Self> {
+        Self::create_kind(dir, name, page_size, false)
+    }
+
+    /// Starts the run `dir/<name>.rcf.tmp`.
+    pub(crate) fn create_run(dir: &Path, name: &str, page_size: usize) -> io::Result<Self> {
+        Self::create_kind(dir, name, page_size, true)
+    }
+
+    fn create_kind(dir: &Path, name: &str, page_size: usize, run: bool) -> io::Result<Self> {
         if !valid_page_size(page_size) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -339,6 +394,8 @@ impl RangeFileWriter {
             final_path,
             out: Some(BufWriter::with_capacity(256 * 1024, file)),
             page_size,
+            run_keys: run.then(Vec::new),
+            prev_seq: 0,
             pos: 0,
             body: Vec::with_capacity(page_size),
             offsets: Vec::new(),
@@ -390,34 +447,60 @@ impl RangeFileWriter {
         Ok(())
     }
 
-    /// Appends one row. The row must be a value or a merge operand, must not expire, and its
-    /// key must be greater than the key of the previous row.
+    /// Appends one row. The row must not expire. In a base, it must be a value or a merge
+    /// operand, and its key must be greater than the key of the previous row. In a run, it can
+    /// also be a tombstone, and its key can equal the previous row's if its sequence number is
+    /// smaller.
     pub(crate) fn push(&mut self, row: &RowEntry) -> io::Result<()> {
-        let (value, merge) = match &row.value {
-            ValueDeletable::Value(v) => (v, false),
-            ValueDeletable::Merge(v) => (v, true),
-            ValueDeletable::Tombstone => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "range cache files do not hold tombstones",
-                ))
-            }
-        };
         if row.expire_ts.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "range cache files do not hold rows with an expire time",
             ));
         }
-        let key = row.key.as_ref();
-        if let Some(prev) = &self.prev_key {
-            if key <= prev.as_slice() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "range cache file rows must be in strictly ascending key order",
-                ));
-            }
+        let (kind, value): (Kind, &[u8]) = match &row.value {
+            ValueDeletable::Value(v) => (Kind::Value, v),
+            ValueDeletable::Merge(v) => (Kind::Merge, v),
+            ValueDeletable::Tombstone => (Kind::Tombstone, &[]),
+        };
+        self.push_version(&row.key, row.seq, kind, row.create_ts, value)
+    }
+
+    /// Appends one row from its parts, which need not be in a [`RowEntry`]. See
+    /// [`RangeFileWriter::push`].
+    pub(crate) fn push_version(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        kind: Kind,
+        create_ts: Option<i64>,
+        value: &[u8],
+    ) -> io::Result<()> {
+        let run = self.run_keys.is_some();
+        if kind == Kind::Tombstone && !run {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "range cache bases do not hold tombstones",
+            ));
         }
+        let same_key = match &self.prev_key {
+            Some(prev) => match key.cmp(prev.as_slice()) {
+                std::cmp::Ordering::Greater => false,
+                std::cmp::Ordering::Equal if run && seq < self.prev_seq => true,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        if run {
+                            "range cache run rows must be in ascending key order, newest first"
+                        } else {
+                            "range cache file rows must be in strictly ascending key order"
+                        },
+                    ))
+                }
+            },
+            None => false,
+        };
+        let merge = kind == Kind::Merge;
         if key.len() > u32::MAX as usize || value.len() > u32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -480,14 +563,17 @@ impl RangeFileWriter {
         if merge {
             flags |= FLAG_MERGE;
         }
-        if row.create_ts.is_some() {
+        if kind == Kind::Tombstone {
+            flags |= FLAG_TOMBSTONE;
+        }
+        if create_ts.is_some() {
             flags |= FLAG_CREATE_TS;
         }
         self.body.push(flags);
-        self.body.extend_from_slice(&row.seq.to_le_bytes());
+        self.body.extend_from_slice(&seq.to_le_bytes());
         self.body
-            .extend_from_slice(&row.create_ts.unwrap_or(0).to_le_bytes());
-        for (bytes, off) in [(key, key_off), (value.as_ref(), value_off)] {
+            .extend_from_slice(&create_ts.unwrap_or(0).to_le_bytes());
+        for (bytes, off) in [(key, key_off), (value, value_off)] {
             match off {
                 Some(off) => {
                     self.body.extend_from_slice(&off.to_le_bytes());
@@ -503,13 +589,19 @@ impl RangeFileWriter {
         }
         self.rows += 1;
         self.data_bytes += (key.len() + value.len()) as u64;
-        self.max_seq = self.max_seq.max(row.seq);
-        match &mut self.prev_key {
-            Some(prev) => {
-                prev.clear();
-                prev.extend_from_slice(key);
+        self.max_seq = self.max_seq.max(seq);
+        self.prev_seq = seq;
+        if !same_key {
+            if let Some(keys) = &mut self.run_keys {
+                keys.push(hash_key(key));
             }
-            None => self.prev_key = Some(key.to_vec()),
+            match &mut self.prev_key {
+                Some(prev) => {
+                    prev.clear();
+                    prev.extend_from_slice(key);
+                }
+                None => self.prev_key = Some(key.to_vec()),
+            }
         }
         Ok(())
     }
@@ -554,8 +646,8 @@ impl RangeFileWriter {
         Ok(())
     }
 
-    /// Writes the last page, the fence region and the trailer, and renames the file into
-    /// place. Returns the final path.
+    /// Writes the last page, the fence region, a run's filter and the trailer, and renames the
+    /// file into place. Returns the final path.
     pub(crate) fn finish(mut self) -> io::Result<PathBuf> {
         if !self.offsets.is_empty() {
             self.flush_page()?;
@@ -563,6 +655,13 @@ impl RangeFileWriter {
         let fence_off = self.pos;
         let fences = std::mem::take(&mut self.fences);
         self.write_raw(&fences)?;
+        let mut filter = Vec::new();
+        let mut flags = 0;
+        if let Some(keys) = self.run_keys.take() {
+            Filter::build(&keys).encode(&mut filter);
+            self.write_raw(&filter)?;
+            flags |= FILE_FLAG_RUN;
+        }
         let mut trailer = Vec::with_capacity(TRAILER_LEN);
         trailer.extend_from_slice(&MAGIC.to_le_bytes());
         trailer.extend_from_slice(&VERSION.to_le_bytes());
@@ -574,6 +673,8 @@ impl RangeFileWriter {
             fences.len() as u64,
             self.data_bytes,
             self.max_seq,
+            filter.len() as u64,
+            flags,
         ] {
             trailer.extend_from_slice(&x.to_le_bytes());
         }
@@ -595,6 +696,14 @@ impl Drop for RangeFileWriter {
             let _ = fs::remove_file(&self.tmp_path);
         }
     }
+}
+
+/// What [`RangeFile::read_version`] found.
+pub(crate) enum FileRead {
+    /// A value, copied out with its key.
+    Value(RowEntry),
+    Tombstone,
+    Merge,
 }
 
 /// An open, immutable range cache file. Dropping the last reference deletes the file.
@@ -619,6 +728,10 @@ pub(crate) struct RangeFile {
     file_len: u64,
     /// The end of the data pages and blob runs, which is the start of the fence region.
     data_end: u64,
+    /// True for a run, which can hold several versions of a key.
+    run: bool,
+    /// A run's filter, copied from the file, until [`RangeFile::take_filter`].
+    filter: Option<Filter>,
     /// The bytes of all open range cache files of one cache.
     disk_bytes: Arc<AtomicU64>,
 }
@@ -676,9 +789,26 @@ impl RangeFile {
         let fence_len = u64_at(t, 40);
         let data_bytes = u64_at(t, 48);
         let max_seq = u64_at(t, 56);
-        if !valid_page_size(page_size) || fence_off + fence_len + TRAILER_LEN as u64 != file_len {
+        let filter_len = u64_at(t, 64);
+        let flags = u64_at(t, 72);
+        let run = flags & FILE_FLAG_RUN != 0;
+        if !valid_page_size(page_size)
+            || flags & !FILE_FLAG_RUN != 0
+            || run != (filter_len > 0)
+            || fence_off
+                .checked_add(fence_len)
+                .and_then(|n| n.checked_add(filter_len))
+                .and_then(|n| n.checked_add(TRAILER_LEN as u64))
+                != Some(file_len)
+        {
             return Err(corrupt("inconsistent trailer"));
         }
+        let filter = if run {
+            let region = read_bytes(source.as_ref(), fence_off + fence_len, filter_len as usize)?;
+            Some(Filter::decode(&region).ok_or_else(|| corrupt("bad filter region"))?)
+        } else {
+            None
+        };
         let fence_region = read_bytes(source.as_ref(), fence_off, fence_len as usize)?;
         let raw = fence_region.as_ref();
         let mut page_offsets = Vec::with_capacity(pages);
@@ -732,12 +862,43 @@ impl RangeFile {
             max_seq,
             file_len,
             data_end: fence_off,
+            run,
+            filter,
             disk_bytes,
         })
     }
 
     pub(crate) fn rows(&self) -> u64 {
         self.rows
+    }
+
+    /// True for a run.
+    pub(crate) fn is_run(&self) -> bool {
+        self.run
+    }
+
+    /// Moves a run's filter out of the file, to the run that holds the file.
+    pub(crate) fn take_filter(&mut self) -> Option<Filter> {
+        self.filter.take()
+    }
+
+    /// The first key of the file, or `None` if it holds no row.
+    pub(crate) fn first_key(&self) -> Option<&[u8]> {
+        (self.page_count() > 0).then(|| self.fence(0))
+    }
+
+    /// The last key of the file, or `None` if it holds no row.
+    pub(crate) fn last_key(&self) -> io::Result<Option<Bytes>> {
+        let Some(last) = self.page_count().checked_sub(1) else {
+            return Ok(None);
+        };
+        let page = self.page(last)?;
+        let rows = Self::row_count(&page);
+        if rows == 0 {
+            return Err(corrupt("empty page"));
+        }
+        let key = self.key_at(&page, rows - 1)?;
+        Ok(Some(Bytes::copy_from_slice(&key)))
     }
 
     /// The size of the file on disk.
@@ -767,6 +928,16 @@ impl RangeFile {
 
     /// The number of pages whose first key is `<= key`.
     fn pages_le(&self, key: &[u8]) -> usize {
+        self.pages_before(key, false)
+    }
+
+    /// The number of pages whose first key is `< key`.
+    fn pages_lt(&self, key: &[u8]) -> usize {
+        self.pages_before(key, true)
+    }
+
+    /// The number of pages whose first key is `<= key` (`< key` when `strict`).
+    fn pages_before(&self, key: &[u8], strict: bool) -> usize {
         let pages = self.page_count();
         if pages == 0 {
             return 0;
@@ -787,8 +958,14 @@ impl RangeFile {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let prefix = self.fence_prefixes[mid];
-            let le = prefix < target || (prefix == target && self.fence(mid) <= key);
-            if le {
+            let before = prefix < target
+                || (prefix == target
+                    && match self.fence(mid).cmp(key) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => !strict,
+                        std::cmp::Ordering::Greater => false,
+                    });
+            if before {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -829,11 +1006,7 @@ impl RangeFile {
         let (key, value) = copy_key_value(&key, &value);
         Ok(RowEntry {
             key,
-            value: if raw.flags & FLAG_MERGE != 0 {
-                ValueDeletable::Merge(value)
-            } else {
-                ValueDeletable::Value(value)
-            },
+            value: value_of(kind_of(raw.flags), value),
             seq: raw.seq,
             create_ts: (raw.flags & FLAG_CREATE_TS != 0).then_some(raw.create_ts),
             expire_ts: None,
@@ -843,6 +1016,20 @@ impl RangeFile {
     /// The index of the first row in `page` whose key is `>= key` (`> key` when `strict`).
     /// `first` is the first key of the page, its fence.
     fn search(&self, page: &[u8], key: &[u8], strict: bool, first: &[u8]) -> io::Result<usize> {
+        self.search_by(page, key, first, |_| strict)
+    }
+
+    /// The index of the first row in `page` that does not come before a position: a row comes
+    /// before it if its key is smaller than `key`, or equal to `key` and `equal_before` is true
+    /// for its sequence number. `equal_before` must be true for a prefix of the versions of
+    /// `key` in order, newest first. `first` is the first key of the page, its fence.
+    fn search_by(
+        &self,
+        page: &[u8],
+        key: &[u8],
+        first: &[u8],
+        equal_before: impl Fn(u64) -> bool,
+    ) -> io::Result<usize> {
         let rows = Self::row_count(page);
         let skip = u16_at(page, 2);
         let hints = PAGE_HEADER_LEN + ROW_OFFSET_LEN * rows;
@@ -865,8 +1052,13 @@ impl RangeFile {
                 Some(t) if hint < t => true,
                 Some(t) if hint > t => false,
                 _ => {
-                    let k = self.key_at(page, mid)?;
-                    k.as_ref() < key || (strict && k.as_ref() == key)
+                    let raw = parse_row(page, mid)?;
+                    let k = self.resolve(page, &raw.key)?;
+                    match k.as_ref().cmp(key) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => equal_before(raw.seq),
+                        std::cmp::Ordering::Greater => false,
+                    }
                 }
             };
             if less {
@@ -876,6 +1068,86 @@ impl RangeFile {
             }
         }
         Ok(lo)
+    }
+
+    /// The sequence number of the first row of `page`.
+    fn first_seq(&self, page: usize) -> io::Result<u64> {
+        let bytes = self.page(page)?;
+        if Self::row_count(&bytes) == 0 {
+            return Err(corrupt("empty page"));
+        }
+        Ok(parse_row(&bytes, 0)?.seq)
+    }
+
+    /// Finds the newest version of `key` at or below `seq` and passes it to `read`.
+    ///
+    /// The versions of a key can span pages. Pages `lt..le` start with a version of `key`,
+    /// newest first, so the first of them whose first version is at or below `seq` is found by
+    /// a binary search on those first versions. The version is then in the page before it, or
+    /// it is its first row.
+    fn find_version<T>(
+        &self,
+        key: &[u8],
+        seq: u64,
+        read: impl FnOnce(&Self, &[u8], &RawRow) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        // Pages whose fence is `key` are the last ones of `..le`: step back over them, usually
+        // none or one, instead of a second search.
+        let le = self.pages_le(key);
+        let mut lt = le;
+        while lt > 0 && self.fence(lt - 1) == key {
+            lt -= 1;
+        }
+        let (mut lo, mut hi) = (lt, le);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.first_seq(mid)? > seq {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if let Some(prev) = lo.checked_sub(1) {
+            let page = self.page(prev)?;
+            let index = self.search_by(&page, key, self.fence(prev), |s| s > seq)?;
+            if index < Self::row_count(&page) {
+                let raw = parse_row(&page, index)?;
+                if self.resolve(&page, &raw.key)?.as_ref() != key {
+                    return Ok(None);
+                }
+                return read(self, &page, &raw).map(Some);
+            }
+        }
+        if lo < self.page_count() {
+            let page = self.page(lo)?;
+            if Self::row_count(&page) == 0 {
+                return Err(corrupt("empty page"));
+            }
+            let raw = parse_row(&page, 0)?;
+            if raw.seq <= seq && self.resolve(&page, &raw.key)?.as_ref() == key {
+                return read(self, &page, &raw).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Returns the newest version of `key` at or below `seq`, if the file holds one. In a base,
+    /// [`RangeFile::get`] is faster.
+    #[cfg(test)]
+    pub(crate) fn get_version(&self, key: &[u8], seq: u64) -> io::Result<Option<RowEntry>> {
+        self.find_version(key, seq, |file, page, raw| file.decode(page, raw))
+    }
+
+    /// Returns what the newest version of `key` at or below `seq` is, and copies it out if it is a
+    /// value.
+    pub(crate) fn read_version(&self, key: &[u8], seq: u64) -> io::Result<Option<FileRead>> {
+        self.find_version(key, seq, |file, page, raw| {
+            Ok(match kind_of(raw.flags) {
+                Kind::Value => FileRead::Value(file.decode(page, raw)?),
+                Kind::Tombstone => FileRead::Tombstone,
+                Kind::Merge => FileRead::Merge,
+            })
+        })
     }
 
     /// Returns the row for `key`, if the file holds one.
@@ -903,7 +1175,16 @@ impl RangeFile {
             Bound::Included(k) => (k, false),
             Bound::Excluded(k) => (k, true),
         };
-        let pages = self.pages_le(key);
+        // Search the page before the first one whose fence is at or after the start. In a run,
+        // the first version of `key` can be in a page before the last one whose fence is `key`:
+        // so for an included start, that is the last page whose fence is smaller. Rows after
+        // `key` are never in a page before the last one whose fence is at most `key`, so an
+        // excluded start, and any start in a base (one row per key), use that page.
+        let pages = if self.run && !strict {
+            self.pages_lt(key)
+        } else {
+            self.pages_le(key)
+        };
         if pages == 0 {
             return Ok((0, 0));
         }
@@ -1116,6 +1397,19 @@ impl RangeFileCursor {
         }
     }
 
+    /// The sequence number of the current row, or `None` past the end of the range.
+    pub(crate) fn seq(&self) -> Option<u64> {
+        self.current.as_ref().map(|raw| raw.seq)
+    }
+
+    /// The key of the current row as a slice of the cursor's page copy, without a copy.
+    pub(crate) fn key_bytes(&self) -> Option<Bytes> {
+        match self.current.as_ref()?.key {
+            Ref::Inline(ref range) => Some(self.page_bytes.slice(range.clone())),
+            Ref::OutOfLine { .. } => self.out_of_line_key.clone(),
+        }
+    }
+
     /// Returns the current row as slices of the page buffer, and moves to the next row. The
     /// caller must have seen a key.
     pub(crate) fn take(&mut self, file: &RangeFile) -> io::Result<RowEntry> {
@@ -1129,17 +1423,15 @@ impl RangeFileCursor {
                 .take()
                 .ok_or_else(|| corrupt("missing out-of-line key"))?,
         };
+        let kind = kind_of(raw.flags);
         let value = match &raw.value {
+            _ if kind == Kind::Tombstone => Bytes::new(),
             Ref::Inline(range) => self.page_bytes.slice(range.clone()),
             Ref::OutOfLine { offset, len } => Bytes::copy_from_slice(&file.read(*offset, *len)?),
         };
         let row = RowEntry {
             key,
-            value: if raw.flags & FLAG_MERGE != 0 {
-                ValueDeletable::Merge(value)
-            } else {
-                ValueDeletable::Value(value)
-            },
+            value: value_of(kind, value),
             seq: raw.seq,
             create_ts: (raw.flags & FLAG_CREATE_TS != 0).then_some(raw.create_ts),
             expire_ts: None,
@@ -1225,6 +1517,7 @@ impl RowEntryIterator for RangeFileIterator {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use std::collections::BTreeMap;
 
     fn row(key: &[u8], value: &[u8], seq: u64) -> RowEntry {
         RowEntry::new_value(key, value, seq)
@@ -1568,6 +1861,182 @@ mod tests {
         assert!(RangeFileWriter::create(dir.path(), "p", 1000).is_err());
         assert!(RangeFileWriter::create(dir.path(), "p", 256).is_err());
         assert!(RangeFileWriter::create(dir.path(), "p", 131072).is_err());
+    }
+
+    /// The versions of a run: keys with up to 40 versions each, newest first, values, tombstones
+    /// and merge operands, some values large enough to go out of line. With 512-byte pages, the
+    /// versions of a key span pages.
+    fn run_versions(seed: u64) -> Vec<RowEntry> {
+        let mut state = seed | 1;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let mut rows = Vec::new();
+        for i in 0..120usize {
+            let versions = match i % 7 {
+                0 => 40,
+                1 => 0,
+                _ => 1 + next(6),
+            };
+            let mut seq = 10_000;
+            for v in 0..versions {
+                seq -= 1 + next(50);
+                let k = key(i);
+                let row = match next(5) {
+                    0 => RowEntry::new_tombstone(&k, seq),
+                    1 => RowEntry::new_merge(&k, format!("+{i}.{v}").as_bytes(), seq),
+                    2 => row(&k, &vec![v as u8; 300], seq).with_create_ts(seq as i64),
+                    _ => row(&k, format!("{i}.{v}").as_bytes(), seq),
+                };
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    fn build_run(
+        dir: &Path,
+        name: &str,
+        source: RangeCachePageSource,
+        rows: &[RowEntry],
+    ) -> RangeFile {
+        let mut writer = RangeFileWriter::create_run(dir, name, 512).unwrap();
+        for r in rows {
+            writer.push(r).unwrap();
+        }
+        let path = writer.finish().unwrap();
+        RangeFile::open(path, source, Arc::new(AtomicU64::new(0))).unwrap()
+    }
+
+    /// A run holds every version: a scan returns them in order, and a read at any sequence
+    /// number finds the newest version at or below it, also when the versions of the key span
+    /// pages. Its filter passes every key it holds.
+    #[rstest]
+    #[case::mmap(RangeCachePageSource::Mmap)]
+    #[case::positional_read(RangeCachePageSource::PositionalRead)]
+    #[tokio::test]
+    async fn should_read_every_version_of_a_run(#[case] source: RangeCachePageSource) {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = run_versions(7);
+        let mut file = build_run(dir.path(), "run", source, &rows);
+        assert!(file.is_run());
+        assert!(file.page_count() > 50);
+        assert_eq!(file.rows(), rows.len() as u64);
+        let filter = file.take_filter().unwrap();
+        assert!(file.take_filter().is_none());
+        let file = Arc::new(file);
+        assert_eq!(scan(&file, BytesRange::unbounded()).await, rows);
+        assert_eq!(file.first_key(), Some(rows[0].key.as_ref()));
+        assert_eq!(
+            file.last_key().unwrap(),
+            Some(rows.last().unwrap().key.clone())
+        );
+        // Keys whose versions span more than one page.
+        let spanning = (0..file.page_count() - 1)
+            .filter(|&p| file.fence(p) == file.fence(p + 1))
+            .count();
+        assert!(
+            spanning > 3,
+            "{spanning} pages start with the key of the page before"
+        );
+
+        let mut by_key: BTreeMap<Bytes, Vec<&RowEntry>> = BTreeMap::new();
+        for r in &rows {
+            by_key.entry(r.key.clone()).or_default().push(r);
+        }
+        for i in 0..120usize {
+            let k = Bytes::from(key(i));
+            let versions = by_key.get(&k).cloned().unwrap_or_default();
+            if !versions.is_empty() {
+                assert!(filter.may_contain(hash_key(&k)), "key {i}");
+            }
+            // Every sequence number where the answer changes, and around it.
+            let mut seqs = vec![0, 1, 9_999, 10_000, u64::MAX];
+            for v in &versions {
+                seqs.extend([v.seq - 1, v.seq, v.seq + 1]);
+            }
+            for seq in seqs {
+                let want = versions.iter().find(|v| v.seq <= seq).map(|v| (*v).clone());
+                assert_eq!(file.get_version(&k, seq).unwrap(), want, "key {i} at {seq}");
+                let kind = file
+                    .read_version(&k, seq)
+                    .unwrap()
+                    .map(|found| match found {
+                        FileRead::Value(row) => {
+                            assert_eq!(Some(&row), want.as_ref());
+                            Kind::Value
+                        }
+                        FileRead::Tombstone => Kind::Tombstone,
+                        FileRead::Merge => Kind::Merge,
+                    });
+                let want_kind = want.as_ref().map(|r| match r.value {
+                    ValueDeletable::Value(_) => Kind::Value,
+                    ValueDeletable::Tombstone => Kind::Tombstone,
+                    ValueDeletable::Merge(_) => Kind::Merge,
+                });
+                assert_eq!(kind, want_kind, "key {i} at {seq}");
+            }
+            // Absent keys around this one.
+            let mut after = key(i);
+            after.push(0);
+            assert_eq!(file.get_version(&after, u64::MAX).unwrap(), None);
+            // A scan from the key starts at its newest version, and one after it at the next key.
+            let from = scan(
+                &file,
+                BytesRange::new(Bound::Included(k.clone()), Bound::Unbounded),
+            )
+            .await;
+            let first = rows.iter().position(|r| r.key >= k).unwrap_or(rows.len());
+            assert_eq!(from, rows[first..], "scan from key {i}");
+            let past = scan(
+                &file,
+                BytesRange::new(Bound::Excluded(k.clone()), Bound::Unbounded),
+            )
+            .await;
+            let next = rows.iter().position(|r| r.key > k).unwrap_or(rows.len());
+            assert_eq!(past, rows[next..], "scan after key {i}");
+            // A cursor that seeks to the key lands on its newest version.
+            let mut iter = RangeFileIterator::new(file.clone(), BytesRange::unbounded());
+            iter.init().await.unwrap();
+            iter.seek(&k).await.unwrap();
+            assert_eq!(iter.next().await.unwrap().as_ref(), rows.get(first));
+        }
+    }
+
+    #[test]
+    fn should_keep_bases_and_runs_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        // A run takes tombstones and older versions of a key, newest first, only.
+        let mut writer = RangeFileWriter::create_run(dir.path(), "run", 4096).unwrap();
+        writer.push(&row(b"a", b"2", 5)).unwrap();
+        writer.push(&RowEntry::new_tombstone(b"a", 4)).unwrap();
+        assert!(writer.push(&row(b"a", b"1", 4)).is_err());
+        assert!(writer.push(&row(b"a", b"1", 9)).is_err());
+        writer.push(&row(b"b", b"1", 9)).unwrap();
+        assert!(writer.push(&row(b"a", b"1", 1)).is_err());
+        assert!(writer.push(&row(b"c", b"", 2).with_expire_ts(10)).is_err());
+        let path = writer.finish().unwrap();
+        let mut run = RangeFile::open(
+            path,
+            RangeCachePageSource::Mmap,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        assert!(run.is_run());
+        assert!(run.take_filter().is_some());
+        // A base has no filter, and holds one row per key.
+        let base = build(
+            dir.path(),
+            "base",
+            4096,
+            RangeCachePageSource::Mmap,
+            &[row(b"a", b"1", 1)],
+        );
+        assert!(!base.is_run());
+        assert_eq!(base.file_len(), 4096 + 4 + 8 + 1 + TRAILER_LEN as u64);
     }
 
     #[test]

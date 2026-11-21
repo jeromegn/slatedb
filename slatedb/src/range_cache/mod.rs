@@ -5,18 +5,25 @@
 //! - A *cached range* is a half-open key range `[start, end)`. The cache knows every live key
 //!   in a cached range, so a point read in it is a definite hit or a definite miss, and a scan
 //!   in it needs no other source.
-//! - A cached range has three layers, newest first: the *active delta*, at most one *frozen
-//!   delta*, and one *range cache file*. A delta holds every version that the writer applied to
-//!   the range since the file was written, in a sorted buffer that only the writer appends to
-//!   and that reads search without a shared write (see the `buffer` and `delta` modules). The
-//!   file holds the rows of the range at one sequence number.
-//! - The batch writer applies each write to the deltas after it puts the write in the memtable
-//!   and before it advances the last committed sequence number. Reads at the latest committed
-//!   state read the deltas with that sequence number as the bound, so a write becomes visible
-//!   in the cache and in the memtable at the same time. Reads in a snapshot or a transaction
-//!   use the snapshot's sequence number as the bound instead: deltas keep every version.
-//! - Only the batch writer changes the set of ranges and the layers of a range. Loads,
-//!   rebuilds and removals send it requests, which it applies between batches (see the `writer`
+//! - A cached range has one *layer set* (design 01 section 4.3), newest first: the *active
+//!   buffer*, which the writer appends to; *sealed buffers*, which wait for their flush; up to
+//!   [`MAX_RUNS`] *runs*, each a file of every version of the range in an interval of sequence
+//!   numbers `(lo, hi]`; and a *base*, a file of the state of the range at `base_seq`. The runs
+//!   cover `(base_seq, covered_to]` without a gap, and the buffers hold every version above
+//!   `covered_to`. A buffer is a sorted map that only the writer appends to and that reads search
+//!   without a shared write (see the `buffer` and `delta` modules).
+//! - The batch writer applies each write to the active buffer after it puts the write in the
+//!   memtable and before it advances the last committed sequence number. Reads at the latest
+//!   committed state read the layers with that sequence number as the bound, so a write becomes
+//!   visible in the cache and in the memtable at the same time. Reads in a snapshot or a
+//!   transaction use the snapshot's sequence number as the bound instead: buffers and runs keep
+//!   every version.
+//! - The writer seals the active buffer when it reaches `range_seal_bytes`. The maintenance task
+//!   (the `maintain` module) flushes the oldest sealed buffer of a range to a run, and merges
+//!   the base with the runs into a new base when the runs grow (a *major merge*). The memory of
+//!   all buffers has a hard cap: a write that does not fit removes its range instead of waiting.
+//! - Only the batch writer changes the set of ranges and the layers of a range. Loads, flushes,
+//!   merges and removals send it requests, which it applies between batches (see the `writer`
 //!   module). Neither reads nor writes take a lock.
 //!
 //! # Sequence number rules
@@ -25,16 +32,16 @@
 //! number `seq` is that number, or for a read in a snapshot or a transaction, the smaller of
 //! that number and the snapshot's. It uses the layers only if both rules hold:
 //!
-//! - `seq >= layers.file_seq`. The file holds the state at `file_seq`, without older versions.
-//! - `seq <= layers.active.sealed_at`. When the cache stops applying writes to a delta (a
-//!   freeze or a removal), it seals the delta at the last sequence number that it applied.
-//!   The delta then holds every version up to that number and none after it. The word is on
-//!   the delta, not on the layers, so a read that holds an earlier set of layers with the same
-//!   active delta sees the seal too.
+//! - `seq >= layers.base_seq`. The base holds the state at `base_seq`, without older versions.
+//! - `seq <= layers.active.sealed_at`. When the cache stops applying writes to the active buffer
+//!   (a seal or a removal), it seals the buffer at the last sequence number that it applied.
+//!   The buffer then holds every version above its `lo` up to that number and none after it.
+//!   The word is on the buffer, not on the layers, so a read that holds an earlier set of layers
+//!   with the same active buffer sees the seal too.
 //!
-//! If the first rule fails, the read is in a snapshot older than the file and uses the normal
+//! If the first rule fails, the read is in a snapshot older than the base and uses the normal
 //! read path. If the second fails, the read tries again, a few times, then uses the normal read
-//! path. The first rule keeps versions that the file folded out of reach. The second rule makes
+//! path. The first rule keeps versions that the base folded out of reach. The second rule makes
 //! the answer exactly the state at `seq`, which is the answer of the normal read path at `seq`.
 //!
 //! # Automatic promotion
@@ -55,7 +62,9 @@ mod auto;
 mod buffer;
 mod delta;
 mod file;
+mod filter;
 mod hits;
+mod maintain;
 mod mixed;
 mod scan;
 pub mod stats;
@@ -97,10 +106,14 @@ pub use auto::AutoPromoteOptions;
 use auto::AutoSettings;
 pub(crate) use auto::{Promoter, PromoterMessage, RANGE_CACHE_PROMOTER_TASK_NAME};
 use buffer::Kind;
-use delta::{Delta, DeltaIterator, DeltaMemory};
+use delta::{Delta, DeltaIterator, DeltaMemory, DeltaShape};
 pub use file::RangeCachePageSource;
-use file::{RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION, TEMP_FILE_EXTENSION};
+use file::{
+    FileRead, RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION, TEMP_FILE_EXTENSION,
+};
+use filter::{hash_key, Filter};
 use hits::{HitStats, RangeHits};
+pub(crate) use maintain::{Maintainer, RANGE_CACHE_MAINTENANCE_TASK_NAME};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
 use stats::{AutoStats, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
@@ -108,6 +121,10 @@ use writer::{Padded, Target, WriterQueue};
 
 /// The number of times a read tries to pin a range before it uses the normal read path.
 const PIN_ATTEMPTS: usize = 3;
+
+/// The most runs that a range holds (design 01's `D_hard`). While a range holds this many, its
+/// flushes wait for a major merge.
+pub(crate) const MAX_RUNS: usize = 4;
 
 /// Options for the range cache. See [`crate::DbBuilder::with_range_cache`].
 ///
@@ -157,10 +174,31 @@ impl RangeCacheOptions {
 pub struct RangeCacheTuning {
     /// The page size of range cache files. It must be a power of two from 512 to 65536.
     pub page_size: usize,
-    /// The smallest active delta that causes a rebuild. A rebuild starts when the active delta
-    /// of a range is larger than this value and larger than a quarter of the range file. The
-    /// local write amplification of rebuilds is thus at most about 4.
+    /// The smallest run bytes that cause a major merge (a rebuild of the base). A major merge
+    /// starts when the run files of a range are larger than this value and larger than a quarter
+    /// of its base, or when the range holds `major_merge_runs` runs.
     pub min_rebuild_delta_bytes: usize,
+    /// The chunk bytes at which the writer seals a range's active write buffer, so that the
+    /// maintenance task can flush it to a run.
+    pub range_seal_bytes: usize,
+    /// The hard cap on the memory of all write buffers: their chunks and filters, from their
+    /// allocation until their last holder drops them. A write that would pass it removes its
+    /// range from the cache; the write itself never waits. Above seven eighths of the cap the
+    /// cache rejects loads, and when it removes a range at the cap, it also removes the ranges
+    /// with the largest buffers until the memory would fall below three quarters of it. Above
+    /// half of it, the maintenance task seals the largest active buffers early.
+    pub max_recent_bytes: u64,
+    /// The smallest active buffer that the maintenance task seals early when the memory of the
+    /// buffers passes half of `max_recent_bytes`.
+    pub min_seal_bytes: usize,
+    /// The chunk bytes from which a write buffer has a filter of its keys, so that a read of a
+    /// key that the buffer does not hold skips it after one probe. `usize::MAX` turns buffer
+    /// filters off.
+    pub buffer_filter_bytes: usize,
+    /// A range that holds this many runs starts a major merge. At most [`MAX_RUNS`] (4), the
+    /// most runs that a range ever holds: while it holds 4, its flushes wait. A larger value
+    /// turns the count off, which only benchmarks use, to hold a range at 4 runs.
+    pub major_merge_runs: usize,
     /// How often the promoter looks for candidates.
     pub evaluate_interval: Duration,
     /// The most candidates that one evaluation forms or re-evaluates. Each new candidate costs
@@ -223,6 +261,11 @@ impl Default for RangeCacheTuning {
         Self {
             page_size: 4096,
             min_rebuild_delta_bytes: 1024 * 1024,
+            range_seal_bytes: 4 * 1024 * 1024,
+            max_recent_bytes: 256 * 1024 * 1024,
+            min_seal_bytes: 64 * 1024,
+            buffer_filter_bytes: 128 * 1024,
+            major_merge_runs: MAX_RUNS,
             evaluate_interval: Duration::from_millis(250),
             max_candidates_per_evaluation: 2,
             min_evidence: 8,
@@ -248,6 +291,30 @@ impl Default for RangeCacheTuning {
 }
 
 impl RangeCacheTuning {
+    /// How the cache's write buffers size themselves.
+    fn delta_shape(&self) -> DeltaShape {
+        DeltaShape {
+            seal_bytes: self.range_seal_bytes as u64,
+            filter_from: u64::try_from(self.buffer_filter_bytes).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The memory of the write buffers above which the cache rejects loads.
+    fn high_water(&self) -> u64 {
+        self.max_recent_bytes / 8 * 7
+    }
+
+    /// The memory of the write buffers to which removals at the cap bring it back.
+    fn low_water(&self) -> u64 {
+        self.max_recent_bytes / 4 * 3
+    }
+
+    /// The memory of the write buffers above which the maintenance task seals the largest active
+    /// buffers early.
+    fn pressure(&self) -> u64 {
+        self.max_recent_bytes / 2
+    }
+
     /// The scan options of the bulk reads of the cache: loads and candidate scans. They do not
     /// put blocks in the block cache.
     fn bulk_scan_options(&self) -> ScanOptions {
@@ -270,37 +337,131 @@ pub struct CachedRangeInfo {
     pub end: Option<Bytes>,
     /// True while the cache loads the range. A loading range serves no reads.
     pub loading: bool,
-    /// True while the cache rewrites the range's file on disk to include recent writes.
+    /// True while the cache writes the range's recent writes to disk: a sealed write buffer waits
+    /// for its flush, or a major merge is due or runs.
     pub rebuilding: bool,
-    /// The size of the range's file on disk.
+    /// The size of the range's base file on disk.
     pub file_bytes: u64,
-    /// The number of rows in the range's file on disk.
+    /// The number of rows in the range's base file on disk.
     pub file_rows: u64,
     /// The estimated size of the recent writes to the range that the cache holds in memory and
-    /// has not yet written to the range's file.
+    /// has not yet written to a run.
     pub delta_bytes: u64,
     /// True if automatic promotion cached the range.
     pub automatic: bool,
+    /// The number of runs of the range: files of its versions above the base.
+    pub runs: usize,
+    /// The size of the range's runs on disk.
+    pub run_bytes: u64,
+    /// The number of sealed write buffers that wait for their flush to a run.
+    pub sealed_buffers: usize,
+    /// The memory of the range's write buffers, active and sealed: their chunks and filters.
+    pub buffer_bytes: u64,
 }
 
-/// The layers of a cached range. The cache replaces this value as a whole.
+/// One run of a range: a file of every version of the range with a sequence number in
+/// `(lo, hi]`, its key bounds, and its filter on the heap.
+pub(crate) struct Run {
+    lo: u64,
+    hi: u64,
+    min_key: Bytes,
+    max_key: Bytes,
+    filter: Filter,
+    file: Arc<RangeFile>,
+}
+
+impl Run {
+    /// A run of the versions in `(lo, hi]` from a finished run file.
+    fn new(mut file: RangeFile, lo: u64, hi: u64) -> io::Result<Self> {
+        if !file.is_run() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "range cache run: not a run file",
+            ));
+        }
+        let filter = file
+            .take_filter()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "range cache run: filter"))?;
+        let min_key = file.first_key().map(Bytes::copy_from_slice);
+        let max_key = file.last_key()?;
+        Ok(Self {
+            lo,
+            hi,
+            min_key: min_key.unwrap_or_default(),
+            max_key: max_key.unwrap_or_default(),
+            filter,
+            file: Arc::new(file),
+        })
+    }
+
+    fn file_bytes(&self) -> u64 {
+        self.file.file_len()
+    }
+}
+
+/// The layer set of a cached range (design 01 section 4.3). The cache replaces this value as a
+/// whole, and only the writer stores it.
 ///
 /// Every scan increments and decrements the reference count of the `Arc` that holds the layers
 /// (see [`RangeCache::pin_scan`]). The alignment keeps that count off the cache line of the fields
 /// that every read loads, so concurrent reads of the range do not miss on it. Apple silicon has
 /// 128-byte lines.
 #[repr(align(128))]
-struct Layers {
+pub(crate) struct Layers {
+    /// The buffer that the writer appends to. Its `sealed_at` is the readers' validity word.
     active: Arc<Delta>,
-    /// A delta that a rebuild merges into a new file.
-    frozen: Option<Arc<Delta>>,
+    /// Sealed buffers that wait for their flush, newest first. Each one's `lo` is the seal of the
+    /// next one, and the oldest one's `lo` is `covered_to`.
+    sealed: Vec<Arc<Delta>>,
+    /// Runs, newest first, at most [`MAX_RUNS`]: run `i` covers `(lo_i, hi_i]` with
+    /// `hi_{i+1} = lo_i`, and the oldest one's `lo` is `base_seq`.
+    runs: Vec<Arc<Run>>,
     /// `None` while the range loads.
-    file: Option<Arc<RangeFile>>,
-    /// The file holds the state of the range at this sequence number.
-    file_seq: u64,
+    base: Option<Arc<RangeFile>>,
+    /// The base holds the state of the range at this sequence number.
+    base_seq: u64,
+    /// The base and the runs hold every version of the range at or below this sequence number:
+    /// the newest run's `hi`, or `base_seq`. The buffers hold every version above it.
+    covered_to: u64,
     /// The end of the range, so that a scan can walk adjacent ranges with one reference to
     /// each.
     end: Option<Bytes>,
+}
+
+impl Layers {
+    /// The buffers, newest first: the active one, then the sealed ones.
+    fn buffers(&self) -> impl Iterator<Item = &Arc<Delta>> {
+        std::iter::once(&self.active).chain(self.sealed.iter())
+    }
+
+    /// Checks the layer set's invariants (design 01 section 10.1, I4, I5 and I7) in debug builds.
+    fn check(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        assert!(
+            self.runs.len() <= MAX_RUNS,
+            "a range holds {} runs",
+            self.runs.len()
+        );
+        let mut to = self.covered_to;
+        for run in &self.runs {
+            assert_eq!(run.hi, to, "runs are not contiguous");
+            assert!(run.lo < run.hi || run.lo == run.hi && run.file.rows() == 0);
+            to = run.lo;
+        }
+        assert_eq!(to, self.base_seq, "the runs do not reach the base");
+        let mut lo = self.covered_to;
+        for buffer in self.sealed.iter().rev() {
+            assert_eq!(buffer.lo(), lo, "sealed buffers are not contiguous");
+            lo = buffer.sealed_at().load(Ordering::Acquire);
+        }
+        assert_eq!(
+            self.active.lo(),
+            lo,
+            "the active buffer does not follow the sealed ones"
+        );
+    }
 }
 
 /// Who asked for a range.
@@ -380,11 +541,14 @@ struct CachedRange {
     /// The estimated normal-path cost of one read of the range, in nanoseconds. Zero for an
     /// explicit range, which uses the average cost of sampled reads.
     read_cost_ns: u64,
-    /// `heat.reads` when the current file was written, for the payback check of rebuilds.
+    /// `heat.reads` when the current base was written, for the payback check of major merges.
     reads_at_build: AtomicU64,
     /// The sequence number of the last batch that wrote to the range. Only the writer stores
     /// it. Nothing reads it yet: persistence will (design 01 section 15, R3).
     last_write_seq: Padded<AtomicU64>,
+    /// The maintenance task's jobs on the range: a flush and a major merge, at most one of each
+    /// at a time. Only the maintenance task and its jobs store them; no read loads them.
+    jobs: maintain::RangeJobs,
 }
 
 impl CachedRange {
@@ -413,6 +577,7 @@ impl CachedRange {
             read_cost_ns,
             reads_at_build: AtomicU64::new(0),
             last_write_seq: Padded(AtomicU64::new(0)),
+            jobs: maintain::RangeJobs::default(),
         }
     }
 
@@ -437,26 +602,41 @@ impl CachedRange {
         BytesRange::new(Included(self.start.clone()), end)
     }
 
-    fn info(&self) -> CachedRangeInfo {
+    fn info(&self, tuning: &RangeCacheTuning) -> CachedRangeInfo {
         let layers = self.layers.load();
         CachedRangeInfo {
             start: self.start.clone(),
             end: self.end.clone(),
-            loading: layers.file.is_none(),
-            rebuilding: layers.frozen.is_some(),
-            file_bytes: layers.file.as_ref().map_or(0, |f| f.file_len()),
-            file_rows: layers.file.as_ref().map_or(0, |f| f.rows()),
+            loading: layers.base.is_none(),
+            rebuilding: !layers.sealed.is_empty()
+                || self.jobs.merging()
+                || maintain::merge_due(&layers, tuning),
+            file_bytes: layers.base.as_ref().map_or(0, |f| f.file_len()),
+            file_rows: layers.base.as_ref().map_or(0, |f| f.rows()),
             delta_bytes: self.delta_bytes(&layers),
             automatic: self.auto,
+            runs: layers.runs.len(),
+            run_bytes: layers.runs.iter().map(|r| r.file_bytes()).sum(),
+            sealed_buffers: layers.sealed.len(),
+            buffer_bytes: layers.buffers().map(|b| b.memory_bytes()).sum(),
         }
     }
 
+    /// The estimated bytes of the range's buffers.
     fn delta_bytes(&self, layers: &Layers) -> u64 {
-        (layers.active.size() + layers.frozen.as_ref().map_or(0, |f| f.size())) as u64
+        layers.buffers().map(|b| b.size() as u64).sum()
     }
 
+    /// The memory of the range's buffers that no run holds yet.
+    fn unflushed_bytes(&self) -> u64 {
+        self.layers.load().buffers().map(|b| b.memory_bytes()).sum()
+    }
+
+    /// The bytes of the range's base and runs, which count against the disk budget.
     fn file_bytes(&self) -> u64 {
-        self.layers.load().file.as_ref().map_or(0, |f| f.file_len())
+        let layers = self.layers.load();
+        layers.base.as_ref().map_or(0, |f| f.file_len())
+            + layers.runs.iter().map(|r| r.file_bytes()).sum::<u64>()
     }
 }
 
@@ -564,11 +744,13 @@ pub(crate) struct RangeCache {
     /// The queue of requests to the writer, and the writer's own state.
     writer: WriterQueue,
     /// The bytes of all open range cache files, including files that only a reader or a
-    /// rebuild keeps open.
+    /// maintenance job keeps open.
     disk_bytes: Arc<AtomicU64>,
-    /// The memory of all deltas, including deltas that only a reader or a rebuild holds.
+    /// The memory of all write buffers, including buffers that only a reader or a flush holds.
     delta_memory: Arc<DeltaMemory>,
-    /// The number of the next range cache file. Loads and rebuilds take one each.
+    /// The queue to the maintenance task.
+    maintenance: maintain::MaintenanceQueue,
+    /// The number of the next range cache file. Loads, flushes and merges take one each.
     next_file_id: AtomicU64,
     /// The bookkeeping of the reads that the cache serves. Its access clock advances by two on
     /// each load and rebuild. Folds copy it to the ranges that reads used. A new range gets the
@@ -609,6 +791,11 @@ impl RangeCache {
         if options.tuning.load_fetch_bytes == 0 || options.tuning.load_fetch_tasks == 0 {
             return Err(SlateDBError::InvalidConfiguration(
                 "range cache load_fetch_bytes and load_fetch_tasks must be positive".to_string(),
+            ));
+        }
+        if options.tuning.major_merge_runs == 0 {
+            return Err(SlateDBError::InvalidConfiguration(
+                "range cache major_merge_runs must be positive".to_string(),
             ));
         }
         std::fs::create_dir_all(&options.root_folder)?;
@@ -656,6 +843,7 @@ impl RangeCache {
             writer: WriterQueue::new(),
             disk_bytes: Arc::new(AtomicU64::new(0)),
             delta_memory: DeltaMemory::new(recorder.gauge(stats::DELTA_ALLOCATED_BYTES).register()),
+            maintenance: maintain::MaintenanceQueue::new(),
             next_file_id: AtomicU64::new(0),
             hits,
             stats: RangeCacheStats::new(recorder),
@@ -673,11 +861,11 @@ impl RangeCache {
         self.clock.now().timestamp_millis()
     }
 
-    /// Returns true if a rebuild of `range`, whose file has `file_bytes`, pays for itself: the
-    /// reads that the range served since its file was written, at the normal-path cost of a
-    /// read, must save at least the estimated cost of rewriting the file. Only automatic ranges
-    /// pay this test. A small file always rebuilds, since its rebuild is cheap. Writes alone
-    /// are never a reason to remove a range that is read.
+    /// Returns true if a major merge of `range`, whose base has `file_bytes`, pays for itself: the
+    /// reads that the range served since its base was written, at the normal-path cost of a
+    /// read, must save at least the estimated cost of rewriting the base. Only automatic ranges
+    /// pay this test. A small base always merges, since its merge is cheap. Writes alone are
+    /// never a reason to remove a range that is read.
     fn rebuild_pays(&self, range: &CachedRange, file_bytes: u64) -> bool {
         let Some(auto) = &self.auto else {
             return true;
@@ -694,50 +882,19 @@ impl RangeCache {
         saved_ns >= cost_ns
     }
 
-    /// Merges a frozen delta into the range file and installs the new file.
-    async fn rebuild(
-        self: Arc<Self>,
-        range: Arc<CachedRange>,
-        frozen: Arc<Delta>,
-        file: Arc<RangeFile>,
-        frozen_seq: u64,
-        file_id: u64,
-    ) -> Result<(), SlateDBError> {
-        fail_point!(Arc::clone(&self.fp_registry), "range-cache-rebuild");
-        let all = BytesRange::unbounded();
-        let sources: Vec<Box<dyn RowEntryIterator + 'static>> = vec![
-            Box::new(DeltaIterator::new(frozen.clone(), &all)),
-            Box::new(RangeFileIterator::new(file, all.clone())),
-        ];
-        let mut iter = DbIterator::new(
-            all,
-            None,
-            sources,
-            Box::new(EmptyIterator::new()),
-            None,
-            self.merge_operator.clone(),
-            IterationOrder::Ascending,
-            ReadTrace::none(),
-        )
-        .await?;
-        let mut writer = RangeFileWriter::create(
-            &self.options.root_folder,
-            &format!("{file_id:020}"),
-            self.options.tuning.page_size,
-        )?;
-        while let Some(entry) = iter.next_entry().await? {
-            writer.push(&entry)?;
-        }
-        let path = writer.finish()?;
-        let new_file = Arc::new(RangeFile::open(
-            path,
-            self.options.page_source,
-            self.disk_bytes.clone(),
-        )?);
-        if self.install(&range, &frozen, new_file, frozen_seq).await {
-            self.evict(None).await;
-        }
-        Ok(())
+    /// A new empty write buffer for versions above `lo`.
+    fn new_buffer(&self, lo: u64) -> Arc<Delta> {
+        Arc::new(Delta::new(
+            &self.delta_memory,
+            lo,
+            self.options.tuning.delta_shape(),
+        ))
+    }
+
+    /// The name of a new range cache file.
+    fn new_file_name(&self) -> String {
+        let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
+        format!("{file_id:020}")
     }
 
     fn is_indexed(&self, range: &Arc<CachedRange>) -> bool {
@@ -763,7 +920,7 @@ impl RangeCache {
             .index
             .load()
             .values()
-            .filter(|r| r.layers.load().file.is_some())
+            .filter(|r| r.layers.load().base.is_some())
             .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)))
             .cloned()
             .collect::<Vec<_>>();
@@ -830,9 +987,9 @@ impl RangeCache {
     }
 
     /// Checks whether a read at `seq` can use `layers`. See the sequence number rules. Callers
-    /// treat a loading range, which has no file, as uncovered before they call this.
+    /// treat a loading range, which has no base, as uncovered before they call this.
     fn usable(layers: &Layers, seq: u64) -> Result<(), Unfit> {
-        if layers.file.is_none() || seq < layers.file_seq {
+        if layers.base.is_none() || seq < layers.base_seq {
             return Err(Unfit::TooOld);
         }
         if layers.active.sealed_at().load(Ordering::SeqCst) < seq {
@@ -874,9 +1031,12 @@ impl RangeCache {
                 return CacheRead::Uncovered;
             };
             let layers = cached.layers.load();
-            if layers.file.is_none() {
+            if layers.base.is_none() {
                 return CacheRead::Uncovered;
             }
+            // Checkers stretch the window between the pin and the load of the sequence number,
+            // in which seals and installs happen (design 01, X23).
+            fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
             let seq = read_seq(oracle, at);
             if let Err(reason) = Self::usable(&layers, seq) {
                 if self.count_unfit(PinOp::Get, reason, attempt) {
@@ -958,9 +1118,10 @@ impl RangeCache {
                 last = index.get(last.end.as_ref()?)?;
                 parts.push(last.layers.load_full());
             }
-            if parts.iter().any(|l| l.file.is_none()) {
+            if parts.iter().any(|l| l.base.is_none()) {
                 return None;
             }
+            fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
             let seq = read_seq(oracle, at);
             if let Some(first) = parts.iter().find_map(|l| Self::usable(l, seq).err()) {
                 // One part that is too old makes every attempt fail.
@@ -1008,6 +1169,7 @@ impl RangeCache {
             return None;
         }
         let pinned: Vec<Arc<Layers>> = intersecting.iter().map(|r| r.layers.load_full()).collect();
+        fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
         let seq = read_seq(oracle, at);
 
         let scan_end = RangeBounds::end_bound(range).cloned();
@@ -1039,7 +1201,7 @@ impl RangeCache {
                 from
             };
             let to = scan::min_end(&scan_end, &cached.end);
-            let kind = if layers.file.is_none() {
+            let kind = if layers.base.is_none() {
                 // A loading range holds no rows yet.
                 PartKind::Gap { sample: true }
             } else {
@@ -1066,7 +1228,13 @@ impl RangeCache {
     }
 
     pub(crate) fn ranges(&self) -> Vec<CachedRangeInfo> {
-        self.index.load().values().map(|r| r.info()).collect()
+        let tuning = &self.options.tuning;
+        self.index.load().values().map(|r| r.info(tuning)).collect()
+    }
+
+    /// The memory of all write buffers: their chunks and filters.
+    pub(crate) fn buffer_memory(&self) -> u64 {
+        self.delta_memory.bytes()
     }
 
     /// Starts a sample of a normal-path read that the cache could have served, if automatic
@@ -1166,10 +1334,9 @@ impl RangeCache {
         check_open: &(dyn Fn() -> Result<(), SlateDBError> + Send + Sync),
     ) -> Result<(), SlateDBError> {
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-load");
-        let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
         let mut writer = RangeFileWriter::create(
             &self.options.root_folder,
-            &format!("{file_id:020}"),
+            &self.new_file_name(),
             self.options.tuning.page_size,
         )?;
         while let Some(entry) = iter.next_entry().await? {
@@ -1197,7 +1364,7 @@ impl RangeCache {
         )?);
         debug_assert_eq!(rows, file.rows());
 
-        if self.attach(range, file, file_seq).await {
+        if self.attach_base(range, file, file_seq).await {
             // An automatic range won admission against the ranges it displaces, so the budget
             // never evicts it right after its load.
             self.evict(range.auto.then_some(range)).await;
@@ -1303,16 +1470,32 @@ enum Found {
     Merge,
 }
 
-/// Returns the newest version of `key` in `layers` at `seq`. A delta is searched in place, by
-/// the borrowed key: only a value is copied out, with its key, in one allocation.
+/// Returns the newest version of `key` in `layers` at `seq` (design 01 section 5.1). The
+/// sources are disjoint in sequence numbers and visited newest first: buffers, then runs, then
+/// the base. So the first version found is the newest at or below `seq`.
+///
+/// A buffer is searched in place, by the borrowed key: only a value is copied out, with its key,
+/// in one allocation. The key's hash is computed once, for the first filter that the read
+/// probes, and reused for the others. Nothing here writes shared memory.
 fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
-    let deltas = std::iter::once(&layers.active).chain(layers.frozen.as_ref());
-    for delta in deltas {
-        // Most reads of a range that takes few writes find empty deltas: one load each.
-        if delta.is_empty() {
+    let mut hash = None;
+    let mut hash_of = || *hash.get_or_insert_with(|| hash_key(key));
+    for delta in layers.buffers() {
+        // Most reads of a range that takes few writes find empty buffers: one load each. A buffer
+        // whose versions are all newer than `seq` holds nothing for the read.
+        if delta.is_empty() || delta.lo() >= seq {
             continue;
         }
+        if let Some(filter) = delta.filter() {
+            if !filter.may_contain(hash_of()) {
+                continue;
+            }
+        }
         if let Some(version) = delta.newest(key, seq) {
+            debug_assert!(
+                version.seq > layers.covered_to,
+                "a buffered version is covered"
+            );
             return Ok(match version.kind {
                 Kind::Value => Found::Value(KeyValue::from(delta::to_row(&version))),
                 Kind::Tombstone => Found::Absent,
@@ -1320,7 +1503,22 @@ fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
             });
         }
     }
-    let row = match &layers.file {
+    for run in &layers.runs {
+        if run.lo >= seq || key < run.min_key.as_ref() || key > run.max_key.as_ref() {
+            continue;
+        }
+        if !run.filter.may_contain(hash_of()) {
+            continue;
+        }
+        if let Some(found) = run.file.read_version(key, seq)? {
+            return Ok(match found {
+                FileRead::Value(row) => Found::Value(KeyValue::from(row)),
+                FileRead::Tombstone => Found::Absent,
+                FileRead::Merge => Found::Merge,
+            });
+        }
+    }
+    let row = match &layers.base {
         Some(file) => file.get(key)?,
         None => None,
     };
@@ -1342,14 +1540,20 @@ async fn stack_iterator(
     range: BytesRange,
     merge_operator: Option<MergeOperatorType>,
 ) -> Result<DbIterator, SlateDBError> {
-    let mut sources: Vec<Box<dyn RowEntryIterator + 'static>> = std::iter::once(&layers.active)
-        .chain(layers.frozen.as_ref())
+    let mut sources: Vec<Box<dyn RowEntryIterator + 'static>> = layers
+        .buffers()
         .map(|delta| {
             Box::new(DeltaIterator::new(delta.clone(), &range))
                 as Box<dyn RowEntryIterator + 'static>
         })
         .collect();
-    if let Some(file) = &layers.file {
+    for run in &layers.runs {
+        sources.push(Box::new(RangeFileIterator::new(
+            run.file.clone(),
+            range.clone(),
+        )));
+    }
+    if let Some(file) = &layers.base {
         sources.push(Box::new(RangeFileIterator::new(
             file.clone(),
             range.clone(),
@@ -1712,6 +1916,19 @@ impl Db {
             .map(|cache| cache.ranges())
             .unwrap_or_default()
     }
+
+    /// Returns the memory of the range cache's write buffers: the chunks and filters of every
+    /// buffer, including buffers that only a reader or a flush still holds. It never exceeds
+    /// [`RangeCacheTuning::max_recent_bytes`]. Returns 0 if the database has no range cache.
+    ///
+    /// For tests and tools.
+    #[doc(hidden)]
+    pub fn range_cache_buffer_memory(&self) -> u64 {
+        self.inner
+            .range_cache
+            .as_ref()
+            .map_or(0, |cache| cache.buffer_memory())
+    }
 }
 
 #[cfg(test)]
@@ -1734,10 +1951,12 @@ mod tests {
                         b(start),
                         end.map(b),
                         Layers {
-                            active: Arc::new(Delta::new(&DeltaMemory::detached())),
-                            frozen: None,
-                            file: None,
-                            file_seq: 0,
+                            active: Arc::new(Delta::for_test(&DeltaMemory::detached(), 0)),
+                            sealed: Vec::new(),
+                            runs: Vec::new(),
+                            base: None,
+                            base_seq: 0,
+                            covered_to: 0,
                             end: end.map(b),
                         },
                         Origin::Explicit,

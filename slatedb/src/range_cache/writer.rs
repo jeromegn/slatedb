@@ -1,42 +1,51 @@
 //! The batch writer is the only task that changes the published state of the cache.
 //!
 //! The published state is the index, the layers of each range, the `sealed_at` word of each
-//! delta, and the watermarks `applied` and `CachedRange::last_write_seq`. Other tasks prepare a
-//! change (a loaded file, a rebuilt file, a removal) and send it as a [`Request`] through a
-//! lock-free queue. The writer applies requests between batches, at a *writer boundary* `W`:
-//! a moment when no batch is between its memtable insert and its commit. At a boundary, `W` is
-//! the last committed sequence number, every batch at or below `W` is committed, and every
-//! later batch starts after it.
+//! buffer, and the watermarks `applied` and `CachedRange::last_write_seq`. Other tasks prepare a
+//! change (a loaded base, a flushed run, a merged base, a removal) and send it as a [`Request`]
+//! through a lock-free queue. The writer applies requests between batches, at a *writer
+//! boundary* `W`: a moment when no batch is between its memtable insert and its commit. At a
+//! boundary, `W` is the last committed sequence number, every batch at or below `W` is
+//! committed, and every later batch starts after it.
 //!
 //! - Before the writer applies a batch, it drains the queue if the queue is not empty. That is
 //!   one check per batch.
 //! - A producer also sends [`BatchWriterMessage::RangeCache`], so that an idle writer drains.
 //!   A flag keeps one such message in flight at a time.
 //! - Each request checks the identity of what it changes (`Arc::ptr_eq` of the range and of
-//!   the expected delta), and changes nothing if the state moved on.
+//!   the expected buffer, runs or base), and changes nothing if the state moved on (design 01
+//!   section 6.2).
 //! - [`RangeCache::close`] refuses every queued request, and every later one.
 //!
 //! This replaces the cache mutex and the `inserted_seq` / `publish_epoch` pair. A range that
 //! registers at `W` loads the state at `W`, and every batch above `W` finds the range in the
-//! index. No batch is on both sides, so no version is both in the file and in a delta.
+//! index. No batch is on both sides, so no version is both in the base and in a buffer.
+//!
+//! The writer also seals a range's active buffer when it reaches `range_seal_bytes`, at the end
+//! of the batch that took it there, and it enforces the memory cap of the buffers (design 01
+//! section 9): a row whose append would take the memory of all buffers past the cap is not
+//! appended, and its range is removed at `s - 1`, before the batch `s` commits. The buffer
+//! reports the exact bytes that an append allocates before it allocates anything, and only the
+//! writer adds to the memory count, so the check is exact and the count never passes the cap.
 
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
-use log::warn;
 use tokio::sync::oneshot;
 
 use super::auto::Removal;
 use super::file::RangeFile;
 use super::stats::RemoveReason;
-use super::{covering, uncovered, CachedRange, Delta, Layers, Origin, RangeCache, RangeIndex};
+use super::{
+    covering, uncovered, CachedRange, Delta, Layers, Origin, RangeCache, RangeIndex, Run, MAX_RUNS,
+};
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::oracle::Oracle;
 use crate::types::RowEntry;
-use crate::utils::{spawn_bg_task, SafeSender};
+use crate::utils::SafeSender;
 
 /// A value on its own cache line, so that the writer's stores to it do not slow down readers of
 /// neighbouring fields. Apple silicon has 128-byte lines.
@@ -53,21 +62,34 @@ pub(super) enum Request {
         origin: Origin,
         reply: oneshot::Sender<Result<Registered, SlateDBError>>,
     },
-    /// Publish the file of a loading range. The file holds the state at `file_seq`.
-    Attach {
+    /// Publish the base of a loading range. The base holds the state at `base_seq`.
+    AttachBase {
         range: Arc<CachedRange>,
-        file: Arc<RangeFile>,
-        file_seq: u64,
+        base: Arc<RangeFile>,
+        base_seq: u64,
         reply: oneshot::Sender<bool>,
     },
-    /// Replace the frozen delta `frozen` of `range`, and the range's file, with `file`, which
-    /// holds the state at `file_seq`.
-    Install {
+    /// Install `run`, which a flush wrote from `buffer`, the oldest sealed buffer of `range`.
+    InstallRun {
         range: Arc<CachedRange>,
-        frozen: Arc<Delta>,
-        file: Arc<RangeFile>,
-        file_seq: u64,
+        run: Arc<Run>,
+        buffer: Arc<Delta>,
         reply: oneshot::Sender<bool>,
+    },
+    /// Replace the base `base_was` of `range` and its oldest runs `absorbed` (newest first) with
+    /// `base`, which a major merge wrote with the state at `base_seq`.
+    InstallMajor {
+        range: Arc<CachedRange>,
+        base_was: Arc<RangeFile>,
+        absorbed: Vec<Arc<Run>>,
+        base: Arc<RangeFile>,
+        base_seq: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Seal `buffer` if it is still the active buffer of `range` and holds a version.
+    Seal {
+        range: Arc<CachedRange>,
+        buffer: Arc<Delta>,
     },
     Remove {
         target: Target,
@@ -92,9 +114,12 @@ impl Request {
             Request::Register { reply, .. } => {
                 let _ = reply.send(Err(SlateDBError::Closed));
             }
-            Request::Attach { reply, .. } | Request::Install { reply, .. } => {
+            Request::AttachBase { reply, .. }
+            | Request::InstallRun { reply, .. }
+            | Request::InstallMajor { reply, .. } => {
                 let _ = reply.send(false);
             }
+            Request::Seal { .. } => {}
             Request::Remove { reply, .. } => {
                 if let Some(reply) = reply {
                     let _ = reply.send(());
@@ -268,42 +293,70 @@ impl RangeCache {
         answer.await.unwrap_or(Err(SlateDBError::Closed))
     }
 
-    /// Publishes the file of a loading range. Returns false if the range is no longer indexed
-    /// or no longer loading at `file_seq`: then the file is deleted when it drops.
-    pub(super) async fn attach(
+    /// Publishes the base of a loading range. Returns false if the range is no longer indexed
+    /// or no longer loading at `base_seq`: then the file is deleted when it drops.
+    pub(super) async fn attach_base(
         &self,
         range: &Arc<CachedRange>,
-        file: Arc<RangeFile>,
-        file_seq: u64,
+        base: Arc<RangeFile>,
+        base_seq: u64,
     ) -> bool {
         let (reply, answer) = oneshot::channel();
-        self.submit(Request::Attach {
+        self.submit(Request::AttachBase {
             range: range.clone(),
-            file,
-            file_seq,
+            base,
+            base_seq,
             reply,
         });
         answer.await.unwrap_or(false)
     }
 
-    /// Installs a rebuilt file. Returns false if the range is no longer indexed or `frozen` is
-    /// no longer its frozen delta.
-    pub(super) async fn install(
+    /// Installs a run that a flush wrote from `buffer`. Returns false if the state moved on (see
+    /// [`RangeCache::install_run_at`]): then the run's file is deleted when it drops.
+    pub(super) async fn install_run(
         &self,
         range: &Arc<CachedRange>,
-        frozen: &Arc<Delta>,
-        file: Arc<RangeFile>,
-        file_seq: u64,
+        run: Arc<Run>,
+        buffer: &Arc<Delta>,
     ) -> bool {
         let (reply, answer) = oneshot::channel();
-        self.submit(Request::Install {
+        self.submit(Request::InstallRun {
             range: range.clone(),
-            frozen: frozen.clone(),
-            file,
-            file_seq,
+            run,
+            buffer: buffer.clone(),
             reply,
         });
         answer.await.unwrap_or(false)
+    }
+
+    /// Installs a base that a major merge wrote from `base_was` and `absorbed`. Returns false if
+    /// the state moved on (see [`RangeCache::install_major_at`]).
+    pub(super) async fn install_major(
+        &self,
+        range: &Arc<CachedRange>,
+        base_was: &Arc<RangeFile>,
+        absorbed: Vec<Arc<Run>>,
+        base: Arc<RangeFile>,
+        base_seq: u64,
+    ) -> bool {
+        let (reply, answer) = oneshot::channel();
+        self.submit(Request::InstallMajor {
+            range: range.clone(),
+            base_was: base_was.clone(),
+            absorbed,
+            base,
+            base_seq,
+            reply,
+        });
+        answer.await.unwrap_or(false)
+    }
+
+    /// Asks the writer to seal `buffer`, the active buffer of `range`, at its next boundary.
+    pub(super) fn request_seal(&self, range: &Arc<CachedRange>, buffer: &Arc<Delta>) {
+        self.submit(Request::Seal {
+            range: range.clone(),
+            buffer: buffer.clone(),
+        });
     }
 
     /// Asks the writer to remove `target`. The removal takes effect at the writer's next
@@ -357,9 +410,11 @@ impl RangeCache {
     /// the same sequence number `s`.
     ///
     /// No lock: one check of the queue, one index load, and for a batch that touches cached
-    /// ranges, the copies into the deltas and one store per touched range and per batch. The only
-    /// read-modify-writes are the claim of a delta's writer role, once per run of entries on a
-    /// line that readers do not load, and the count of delta memory when a chunk is allocated.
+    /// ranges, the copies into the buffers and one store per touched range and per batch. The
+    /// only read-modify-writes are the claim of a buffer's writer role, once per run of entries
+    /// on a line that readers do not load, and the count of buffer memory when a chunk is
+    /// allocated. A commit never waits for the cache: a row that does not fit under the memory
+    /// cap removes its range instead.
     pub(crate) fn apply_write(self: &Arc<Self>, entries: &[RowEntry], oracle: &dyn Oracle) {
         let Some(seq) = entries.first().map(|e| e.seq) else {
             return;
@@ -379,10 +434,12 @@ impl RangeCache {
     }
 
     fn apply_covered(self: &Arc<Self>, index: &RangeIndex, entries: &[RowEntry], seq: u64) {
+        let cap = self.options.tuning.max_recent_bytes;
         // The ranges are references into the index that the caller holds, so the batch changes
         // no reference count that readers share.
         let mut touched: Vec<&Arc<CachedRange>> = Vec::new();
         let mut expiring: Vec<&Arc<CachedRange>> = Vec::new();
+        let mut overflowed: Vec<&Arc<CachedRange>> = Vec::new();
         let mut i = 0;
         while i < entries.len() {
             let Some(range) = covering(index, &entries[i].key) else {
@@ -390,10 +447,11 @@ impl RangeCache {
                 continue;
             };
             // A batch's entries come in key order, so the entries of a range are adjacent. The
-            // writer appends each run of them with one claim of the delta.
+            // writer appends each run of them with one claim of the buffer.
             let layers = range.layers.load();
-            let mut delta = layers.active.writer();
+            let mut buffer = layers.active.writer();
             let mut appended = false;
+            let mut full = false;
             while let Some(entry) = entries.get(i).filter(|e| range.contains(&e.key)) {
                 i += 1;
                 if entry.expire_ts.is_some() {
@@ -403,89 +461,128 @@ impl RangeCache {
                     }
                     continue;
                 }
-                // A range registered at `W`, or rebuilt at `W`, holds every batch at or below
-                // `W` in its file, and receives only later batches.
+                if full {
+                    continue;
+                }
+                // A range registered at `W`, or flushed or merged up to `W`, holds every batch
+                // at or below `W` in its files, and receives only later batches.
                 debug_assert!(
-                    entry.seq > layers.file_seq,
-                    "a batch at {} reached a range whose file holds {}",
+                    entry.seq > layers.covered_to,
+                    "a batch at {} reached a range whose files hold {}",
                     entry.seq,
-                    layers.file_seq
+                    layers.covered_to
                 );
-                delta.append(entry);
-                appended = true;
+                if buffer.append_within(entry, cap) {
+                    appended = true;
+                } else {
+                    // The row does not fit under the cap. The range leaves the cache at
+                    // `seq - 1`; its rows of this batch that the buffer already holds are above
+                    // that seal, so no read uses them.
+                    full = true;
+                    overflowed.push(range);
+                }
             }
-            drop(delta);
+            drop(buffer);
             if appended && !touched.iter().any(|r| Arc::ptr_eq(r, range)) {
                 range.last_write_seq.0.store(seq, Ordering::Release);
                 touched.push(range);
             }
         }
         for range in &expiring {
-            // The delta does not hold this write, so seal it before the write.
+            // The buffer does not hold this write, so seal it before the write.
             self.remove_at(range, seq - 1, RemoveReason::ExpiringWrite);
         }
+        if !overflowed.is_empty() {
+            self.remove_at_cap(&overflowed, seq - 1);
+        }
+        // A removed range must keep its last layers: a reader that loaded the index before the
+        // removal can still pin them, and a new active buffer would look complete to it.
+        let removals = !expiring.is_empty() || !overflowed.is_empty();
         for range in &touched {
-            if !expiring.iter().any(|r| Arc::ptr_eq(r, range)) {
-                self.maybe_freeze(range, seq);
+            if !removals || self.is_indexed(range) {
+                self.maybe_seal(range, seq);
             }
         }
     }
 
-    /// Starts a rebuild if the active delta of `range` is large enough.
-    fn maybe_freeze(self: &Arc<Self>, range: &Arc<CachedRange>, seq: u64) {
-        // A guard and borrows: the check changes no reference count unless the delta freezes.
+    /// Removes `ranges`, whose rows of the current batch did not fit under the memory cap, at
+    /// `sealed_at`, then removes the indexed ranges with the largest unflushed buffers until the
+    /// memory would be under the low-water mark once readers and flushes drop them (design 01
+    /// section 9).
+    fn remove_at_cap(&self, ranges: &[&Arc<CachedRange>], sealed_at: u64) {
+        let mut freed = 0u64;
+        for range in ranges {
+            let unflushed = range.unflushed_bytes();
+            if self.remove_at(range, sealed_at, RemoveReason::Overflow) {
+                freed += unflushed;
+            }
+        }
+        let low = self.options.tuning.low_water();
+        let projected = |freed: u64| self.delta_memory.bytes().saturating_sub(freed);
+        if projected(freed) <= low {
+            return;
+        }
+        let mut largest: Vec<(u64, Arc<CachedRange>)> = self
+            .index
+            .load()
+            .values()
+            .map(|r| (r.unflushed_bytes(), r.clone()))
+            .filter(|(bytes, _)| *bytes > 0)
+            .collect();
+        largest.sort_by(|a, b| b.0.cmp(&a.0));
+        for (unflushed, range) in largest {
+            if projected(freed) <= low {
+                break;
+            }
+            if self.remove_at(&range, sealed_at, RemoveReason::Overflow) {
+                freed += unflushed;
+            }
+        }
+    }
+
+    /// Seals the active buffer of `range` at `seq`, the batch just applied, if its chunks reached
+    /// `range_seal_bytes`.
+    fn maybe_seal(&self, range: &Arc<CachedRange>, seq: u64) {
+        // A guard and borrows: the check changes no reference count unless the buffer seals.
         let layers = range.layers.load();
-        let Some(file) = &layers.file else {
-            return;
-        };
-        if layers.frozen.is_some() {
+        if layers.active.allocated_bytes() < self.options.tuning.range_seal_bytes as u64 {
             return;
         }
-        let file_len = file.file_len();
-        let threshold = self
-            .options
-            .tuning
-            .min_rebuild_delta_bytes
-            .max((file_len / 4) as usize);
-        if layers.active.size() < threshold {
-            return;
-        }
-        let (frozen, file, file_seq) = (layers.active.clone(), file.clone(), layers.file_seq);
-        drop(layers);
-        if !self.rebuild_pays(range, file_len) {
-            // The delta holds this write, so it is complete up to `seq`.
-            self.remove_at(range, seq, RemoveReason::NotWorthIt);
-            return;
-        }
-        range
-            .reads_at_build
-            .store(range.heat.reads(), Ordering::Relaxed);
-        // The word is on the delta, so every set of layers that holds this delta as its active
-        // delta, older ones included, sees the seal.
-        frozen.sealed_at().store(seq, Ordering::SeqCst);
-        range.layers.store(Arc::new(Layers {
-            active: Arc::new(Delta::new(&self.delta_memory)),
-            frozen: Some(frozen.clone()),
-            file: Some(file.clone()),
-            file_seq,
-            end: range.end.clone(),
-        }));
-        let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
-        let cache = self.clone();
-        let failed_cache = self.clone();
-        let failed_range = range.clone();
-        let range = range.clone();
-        spawn_bg_task(
-            "range_cache_rebuild".to_string(),
-            &self.handle,
-            move |result: &Result<(), SlateDBError>| {
-                if let Err(e) = result {
-                    warn!("range cache rebuild failed [error={:?}]", e);
-                    failed_cache.request_removal(Target::Range(failed_range), RemoveReason::Error);
-                }
+        self.seal_at(range, &layers, seq);
+        self.stats.seals_full.increment(1);
+    }
+
+    /// Seals the active buffer of `layers`, the current layers of `range`, at `seq` (design 01
+    /// section 7.1): the buffer holds every version of the range above its `lo` up to `seq`, and
+    /// receives none after it. A new empty buffer for the versions above `seq` takes its place,
+    /// and the sealed one goes first in the sealed list, for the maintenance task to flush.
+    fn seal_at(&self, range: &Arc<CachedRange>, layers: &Layers, seq: u64) {
+        let sealed = layers.active.clone();
+        // The word is on the buffer, so every set of layers that holds this buffer as its active
+        // buffer, older ones included, sees the seal.
+        sealed.sealed_at().store(seq, Ordering::SeqCst);
+        let mut buffers = Vec::with_capacity(layers.sealed.len() + 1);
+        buffers.push(sealed);
+        buffers.extend(layers.sealed.iter().cloned());
+        self.store_layers(
+            range,
+            Layers {
+                active: self.new_buffer(seq),
+                sealed: buffers,
+                runs: layers.runs.clone(),
+                base: layers.base.clone(),
+                base_seq: layers.base_seq,
+                covered_to: layers.covered_to,
+                end: range.end.clone(),
             },
-            async move { cache.rebuild(range, frozen, file, seq, file_id).await },
         );
+        self.maintenance.wake();
+    }
+
+    /// Publishes a new layer set of `range`.
+    fn store_layers(&self, range: &CachedRange, layers: Layers) {
+        layers.check();
+        range.layers.store(Arc::new(layers));
     }
 
     /// Applies the queued requests at the writer boundary `oracle.last_committed_seq()`. The
@@ -514,24 +611,53 @@ impl RangeCache {
                 origin,
                 reply,
             } => {
-                let _ = reply.send(Ok(self.register_at(start, end, origin, w)));
+                // Above the high-water mark, a load would add rows to buffers that are nearly
+                // full (design 01 section 9).
+                let answer = if self.delta_memory.bytes() > self.options.tuning.high_water() {
+                    self.stats.loads_rejected_memory.increment(1);
+                    Err(SlateDBError::RangeCacheLoadRejected(
+                        "the range cache's write buffers are nearly full",
+                    ))
+                } else {
+                    Ok(self.register_at(start, end, origin, w))
+                };
+                let _ = reply.send(answer);
             }
-            Request::Attach {
+            Request::AttachBase {
                 range,
-                file,
-                file_seq,
+                base,
+                base_seq,
                 reply,
             } => {
-                let _ = reply.send(self.attach_at(&range, file, file_seq));
+                let _ = reply.send(self.attach_at(&range, base, base_seq));
             }
-            Request::Install {
+            Request::InstallRun {
                 range,
-                frozen,
-                file,
-                file_seq,
+                run,
+                buffer,
                 reply,
             } => {
-                let _ = reply.send(self.install_at(&range, &frozen, file, file_seq));
+                let _ = reply.send(self.install_run_at(&range, run, &buffer));
+            }
+            Request::InstallMajor {
+                range,
+                base_was,
+                absorbed,
+                base,
+                base_seq,
+                reply,
+            } => {
+                let installed = self.install_major_at(&range, &base_was, &absorbed, base, base_seq);
+                let _ = reply.send(installed);
+            }
+            Request::Seal { range, buffer } => {
+                if self.is_indexed(&range) {
+                    let layers = range.layers.load();
+                    if Arc::ptr_eq(&layers.active, &buffer) && !buffer.is_empty() {
+                        self.seal_at(&range, &layers, w);
+                        self.stats.seals_pressure.increment(1);
+                    }
+                }
             }
             Request::Remove {
                 target,
@@ -548,7 +674,7 @@ impl RangeCache {
                     if self.attached_bytes() <= self.options.max_disk_bytes {
                         break;
                     }
-                    if victim.layers.load().file.is_some() {
+                    if victim.layers.load().base.is_some() {
                         self.remove_at(&victim, w, RemoveReason::Evicted);
                     }
                 }
@@ -562,7 +688,7 @@ impl RangeCache {
 
     /// New loading ranges for the uncovered parts of `[start, end)`, which load the state at
     /// `w`: every batch at or below `w` is committed and in the load's view, and every later
-    /// batch finds the new ranges and goes to their deltas.
+    /// batch finds the new ranges and goes to their buffers.
     fn register_at(&self, start: Bytes, end: Option<Bytes>, origin: Origin, w: u64) -> Registered {
         let now = self.now_ms();
         let mut index = RangeIndex::clone(&self.index.load());
@@ -570,11 +696,13 @@ impl RangeCache {
         let mut ranges = Vec::with_capacity(parts.len());
         for (part_start, part_end) in parts {
             let layers = Layers {
-                active: Arc::new(Delta::new(&self.delta_memory)),
-                frozen: None,
+                active: self.new_buffer(w),
+                sealed: Vec::new(),
+                runs: Vec::new(),
                 // A loading range serves no read.
-                file: None,
-                file_seq: w,
+                base: None,
+                base_seq: w,
+                covered_to: w,
                 end: part_end.clone(),
             };
             let range = Arc::new(CachedRange::new(
@@ -595,61 +723,137 @@ impl RangeCache {
         Registered { seq: w, ranges }
     }
 
-    /// Publishes the file of a loading range. It keeps the active delta, which holds the
-    /// batches after `file_seq`, so no reader of an earlier set of layers loses a signal.
-    fn attach_at(&self, range: &Arc<CachedRange>, file: Arc<RangeFile>, file_seq: u64) -> bool {
+    /// Publishes the base of a loading range (`AttachBase`). It keeps the buffers, which hold the
+    /// batches after `base_seq`, and the runs that flushes installed meanwhile, so no reader of an
+    /// earlier set of layers loses a signal.
+    fn attach_at(&self, range: &Arc<CachedRange>, base: Arc<RangeFile>, base_seq: u64) -> bool {
         if !self.is_indexed(range) {
             // Removed, or removed and registered again: the file is deleted on drop.
             return false;
         }
         let layers = range.layers.load_full();
-        if layers.file.is_some() || layers.file_seq != file_seq {
+        if layers.base.is_some() || layers.base_seq != base_seq {
             return false;
         }
-        debug_assert!(layers.frozen.is_none(), "a loading range never freezes");
         self.stats.loads.increment(1);
-        self.stats.load_bytes.increment(file.file_len());
+        self.stats.load_bytes.increment(base.file_len());
         let now = self.hits.access_clock().fetch_add(2, Ordering::Relaxed) + 2;
         range.heat.hits.set_last_access(now - 1);
-        range.layers.store(Arc::new(Layers {
-            active: layers.active.clone(),
-            frozen: None,
-            file: Some(file),
-            file_seq,
-            end: range.end.clone(),
-        }));
+        self.store_layers(
+            range,
+            Layers {
+                active: layers.active.clone(),
+                sealed: layers.sealed.clone(),
+                runs: layers.runs.clone(),
+                base: Some(base),
+                base_seq,
+                covered_to: layers.covered_to,
+                end: range.end.clone(),
+            },
+        );
+        self.maintenance.wake();
         true
     }
 
-    /// Replaces the frozen delta and the file of `range` with a rebuilt file. It keeps the
-    /// active delta.
-    fn install_at(
+    /// Installs a flushed run (`InstallRun`, design 01 section 6.2): one store that puts the run
+    /// first, raises `covered_to` to its `hi` and removes its buffer from the sealed list.
+    ///
+    /// Preconditions: the range is indexed; `buffer` is still its oldest sealed buffer; the run
+    /// starts at `covered_to` and ends at the buffer's seal; the range holds fewer than
+    /// [`MAX_RUNS`] runs. Otherwise the run is rejected, and its file is deleted when it drops.
+    pub(super) fn install_run_at(
         &self,
         range: &Arc<CachedRange>,
-        frozen: &Arc<Delta>,
-        file: Arc<RangeFile>,
-        file_seq: u64,
+        run: Arc<Run>,
+        buffer: &Arc<Delta>,
     ) -> bool {
         if !self.is_indexed(range) {
+            self.stats.installs_rejected.increment(1);
             return false;
         }
         let layers = range.layers.load_full();
-        if !layers
-            .frozen
-            .as_ref()
-            .is_some_and(|f| Arc::ptr_eq(f, frozen))
+        let oldest = layers.sealed.last().is_some_and(|b| Arc::ptr_eq(b, buffer));
+        if !oldest
+            || run.lo != layers.covered_to
+            || run.hi != buffer.sealed_at().load(Ordering::Acquire)
+            || layers.runs.len() >= MAX_RUNS
         {
+            self.stats.installs_rejected.increment(1);
             return false;
         }
+        self.stats.flushes.increment(1);
+        self.stats.flush_bytes.increment(run.file_bytes());
+        let mut runs = Vec::with_capacity(layers.runs.len() + 1);
+        let covered_to = run.hi;
+        runs.push(run);
+        runs.extend(layers.runs.iter().cloned());
+        let sealed = layers.sealed[..layers.sealed.len() - 1].to_vec();
+        self.store_layers(
+            range,
+            Layers {
+                active: layers.active.clone(),
+                sealed,
+                runs,
+                base: layers.base.clone(),
+                base_seq: layers.base_seq,
+                covered_to,
+                end: range.end.clone(),
+            },
+        );
+        true
+    }
+
+    /// Installs a base from a major merge (`InstallMajor`, design 01 section 6.2): the new base
+    /// holds the state at `base_seq`, the `hi` of the newest absorbed run, and replaces the old
+    /// base and the absorbed runs. Runs that flushes installed during the merge stay, and so do
+    /// `covered_to` and the buffers. No history is kept (stage 3): a snapshot older than the new
+    /// base uses the normal read path.
+    ///
+    /// Preconditions: the range is indexed; its base is still `base_was`; `absorbed` are still
+    /// its oldest runs; `base_seq` is the newest absorbed run's `hi`.
+    pub(super) fn install_major_at(
+        &self,
+        range: &Arc<CachedRange>,
+        base_was: &Arc<RangeFile>,
+        absorbed: &[Arc<Run>],
+        base: Arc<RangeFile>,
+        base_seq: u64,
+    ) -> bool {
+        if !self.is_indexed(range) {
+            self.stats.installs_rejected.increment(1);
+            return false;
+        }
+        let layers = range.layers.load_full();
+        let same_base = layers
+            .base
+            .as_ref()
+            .is_some_and(|b| Arc::ptr_eq(b, base_was));
+        let kept = layers.runs.len().checked_sub(absorbed.len());
+        let oldest = kept.is_some_and(|kept| {
+            layers.runs[kept..]
+                .iter()
+                .zip(absorbed)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        });
+        if !same_base || !oldest || absorbed.first().is_none_or(|r| r.hi != base_seq) {
+            self.stats.installs_rejected.increment(1);
+            return false;
+        }
+        let kept = kept.unwrap_or(0);
         self.stats.rebuilds.increment(1);
-        self.stats.rebuild_bytes.increment(file.file_len());
-        range.layers.store(Arc::new(Layers {
-            active: layers.active.clone(),
-            frozen: None,
-            file: Some(file),
-            file_seq,
-            end: range.end.clone(),
-        }));
+        self.stats.rebuild_bytes.increment(base.file_len());
+        self.store_layers(
+            range,
+            Layers {
+                active: layers.active.clone(),
+                sealed: layers.sealed.clone(),
+                runs: layers.runs[..kept].to_vec(),
+                base: Some(base),
+                base_seq,
+                covered_to: layers.covered_to,
+                end: range.end.clone(),
+            },
+        );
         self.hits.access_clock().fetch_add(2, Ordering::Relaxed);
         true
     }
@@ -1000,14 +1204,14 @@ mod tests {
         t.db.cache_range(span(10, 90)).await.unwrap();
         let range = t.range(&key(10));
         // The file holds the state at the boundary, the last committed sequence number then.
-        assert_eq!(range.layers.load().file_seq, before);
+        assert_eq!(range.layers.load().base_seq, before);
         assert_eq!(t.cache().writer.applied(), before);
         // A later batch goes to the delta, above the file.
         t.db.put(key(20), "new").await.unwrap();
         let seq = t.committed();
         let layers = range.layers.load();
         assert_eq!(layers.active.len(), 1);
-        assert!(seq > layers.file_seq);
+        assert!(seq > layers.base_seq);
         assert_eq!(t.db.get(key(20)).await.unwrap(), Some(Bytes::from("new")));
         t.db.close().await.unwrap();
     }

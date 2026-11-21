@@ -758,6 +758,17 @@ impl Db {
                 e
             );
         }
+        #[cfg(feature = "range_cache")]
+        if let Err(e) = self
+            .task_executor
+            .shutdown_task(crate::range_cache::RANGE_CACHE_MAINTENANCE_TASK_NAME)
+            .await
+        {
+            warn!(
+                "failed to shutdown range cache maintenance task [error={:?}]",
+                e
+            );
+        }
 
         if let Err(e) = self.task_executor.shutdown_task(COMPACTOR_TASK_NAME).await {
             warn!("failed to shutdown compactor task [error={:?}]", e);

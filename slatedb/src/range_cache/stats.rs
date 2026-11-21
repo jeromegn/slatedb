@@ -44,26 +44,45 @@ pub const UNUSABLE_COUNT: &str = range_cache_stat_name!("unusable_count");
 pub const LOAD_COUNT: &str = range_cache_stat_name!("load_count");
 /// Bytes of range cache files that loads wrote.
 pub const LOAD_BYTES: &str = range_cache_stat_name!("load_bytes");
-/// Rebuilds of range cache files.
+/// Loads that the cache rejected because its write buffers were nearly full. The `reason` label
+/// is `memory`.
+pub const LOAD_REJECTED_COUNT: &str = range_cache_stat_name!("load_rejected_count");
+/// Major merges: rebuilds of a range's base from its base and runs.
 pub const REBUILD_COUNT: &str = range_cache_stat_name!("rebuild_count");
-/// Bytes of range cache files that rebuilds wrote. Divide by the bytes of the writes to cached
-/// ranges to get the local write amplification.
+/// Bytes of base files that major merges wrote. With `flush_bytes`, divide by the bytes of the
+/// writes to cached ranges to get the local write amplification.
 pub const REBUILD_BYTES: &str = range_cache_stat_name!("rebuild_bytes");
+/// Seals of active write buffers. The `reason` label is `full` (the buffer reached
+/// `range_seal_bytes`) or `pressure` (the maintenance task sealed it early because the memory of
+/// the buffers was high).
+pub const SEAL_COUNT: &str = range_cache_stat_name!("seal_count");
+/// Sealed buffers that the maintenance task flushed to runs.
+pub const FLUSH_COUNT: &str = range_cache_stat_name!("flush_count");
+/// Bytes of run files that flushes wrote.
+pub const FLUSH_BYTES: &str = range_cache_stat_name!("flush_bytes");
+/// Times that the maintenance task found a sealed buffer that it could not flush, because its
+/// range held the most runs (4) and waited for a major merge.
+pub const FLUSH_WAIT_COUNT: &str = range_cache_stat_name!("flush_wait_count");
+/// Flushed runs and merged bases that the writer rejected because the range changed meanwhile:
+/// it was removed, registered again, or its buffers or runs moved on.
+pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
 /// Ranges that the cache removed. The `reason` label is `evicted`, `explicit`,
-/// `expiring_write`, `error`, `closed` or `not_worth_it` (an automatic range whose reads did not
-/// pay for a rebuild).
+/// `expiring_write`, `error`, `closed`, `not_worth_it` (an automatic range whose reads did not
+/// pay for a rebuild) or `overflow` (a write did not fit under the memory cap of the write
+/// buffers, or the range had one of the largest buffers when another one did not).
 pub const REMOVE_COUNT: &str = range_cache_stat_name!("remove_count");
 /// The number of cached ranges, loading ranges included.
 pub const RANGE_COUNT: &str = range_cache_stat_name!("range_count");
 /// The bytes of open range cache files.
 pub const FILE_BYTES: &str = range_cache_stat_name!("file_bytes");
-/// The estimated bytes of the active and frozen deltas of cached ranges. The cache updates it
-/// when ranges change and, with automatic promotion, at each evaluation.
+/// The estimated bytes of the active and sealed write buffers of cached ranges. The cache
+/// updates it when ranges change.
 pub const DELTA_BYTES: &str = range_cache_stat_name!("delta_bytes");
-/// The memory that the deltas hold, exactly: every chunk of every delta from its allocation until
-/// the last holder of the delta (its range, a scan, a merge resolution or a rebuild) drops it. It
-/// changes when a delta allocates a chunk or drops. A delta's memory is larger than its share of
-/// `delta_bytes` by its index and its last chunk's free room.
+/// The memory that the write buffers hold, exactly: every chunk and filter of every buffer from
+/// its allocation until the last holder of the buffer (its range, a scan, a merge resolution or a
+/// flush) drops it. It changes when a buffer allocates a chunk or a filter, or drops. A buffer's
+/// memory is larger than its share of `delta_bytes` by its index, its filter and its last chunk's
+/// free room. It never exceeds `max_recent_bytes`.
 pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_bytes");
 
 // Automatic promotion. The cache registers these metrics only when automatic promotion is on.
@@ -101,14 +120,17 @@ pub(crate) enum RemoveReason {
     Error,
     /// The database closed or failed.
     Closed,
-    /// The delta of an automatic range outgrew its threshold, and the reads that the range
-    /// served since its file was written did not pay for a rebuild.
+    /// The runs of an automatic range called for a major merge, and the reads that the range
+    /// served since its base was written did not pay for it.
     NotWorthIt,
+    /// A write did not fit under the memory cap of the write buffers, or the range had one of
+    /// the largest buffers when another write did not.
+    Overflow,
 }
 
 impl RemoveReason {
-    /// Returns true if a later promotion of the range should wait. Space and explicit removals
-    /// do not count as failures.
+    /// Returns true if a later promotion of the range should wait. Space, memory and explicit
+    /// removals do not count as failures.
     pub(crate) fn is_failure(self) -> bool {
         matches!(
             self,
@@ -120,9 +142,9 @@ impl RemoveReason {
 /// Why a ready cached range failed the sequence number rules for a read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unfit {
-    /// The read's sequence number is below the sequence number of the range's file.
+    /// The read's sequence number is below the sequence number of the range's base.
     TooOld,
-    /// The read's sequence number is above the sequence number at which the active delta was
+    /// The read's sequence number is above the sequence number at which the active buffer was
     /// sealed.
     Sealed,
 }
@@ -349,14 +371,22 @@ impl AutoStats {
 pub(crate) struct RangeCacheStats {
     pub(crate) loads: Arc<dyn CounterFn>,
     pub(crate) load_bytes: Arc<dyn CounterFn>,
+    pub(crate) loads_rejected_memory: Arc<dyn CounterFn>,
     pub(crate) rebuilds: Arc<dyn CounterFn>,
     pub(crate) rebuild_bytes: Arc<dyn CounterFn>,
+    pub(crate) seals_full: Arc<dyn CounterFn>,
+    pub(crate) seals_pressure: Arc<dyn CounterFn>,
+    pub(crate) flushes: Arc<dyn CounterFn>,
+    pub(crate) flush_bytes: Arc<dyn CounterFn>,
+    pub(crate) flush_waits: Arc<dyn CounterFn>,
+    pub(crate) installs_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
     removed_expiring_write: Arc<dyn CounterFn>,
     removed_error: Arc<dyn CounterFn>,
     removed_closed: Arc<dyn CounterFn>,
     removed_not_worth_it: Arc<dyn CounterFn>,
+    removed_overflow: Arc<dyn CounterFn>,
     pub(crate) ranges: Arc<dyn GaugeFn>,
     pub(crate) file_bytes: Arc<dyn GaugeFn>,
     pub(crate) delta_bytes: Arc<dyn GaugeFn>,
@@ -364,23 +394,28 @@ pub(crate) struct RangeCacheStats {
 
 impl RangeCacheStats {
     pub(crate) fn new(recorder: &MetricsRecorderHelper) -> Self {
-        let removed = |reason| {
-            recorder
-                .counter(REMOVE_COUNT)
-                .labels(&[("reason", reason)])
-                .register()
-        };
+        let labeled =
+            |name, label, value| recorder.counter(name).labels(&[(label, value)]).register();
+        let removed = |reason| labeled(REMOVE_COUNT, "reason", reason);
         Self {
             loads: recorder.counter(LOAD_COUNT).register(),
             load_bytes: recorder.counter(LOAD_BYTES).register(),
+            loads_rejected_memory: labeled(LOAD_REJECTED_COUNT, "reason", "memory"),
             rebuilds: recorder.counter(REBUILD_COUNT).register(),
             rebuild_bytes: recorder.counter(REBUILD_BYTES).register(),
+            seals_full: labeled(SEAL_COUNT, "reason", "full"),
+            seals_pressure: labeled(SEAL_COUNT, "reason", "pressure"),
+            flushes: recorder.counter(FLUSH_COUNT).register(),
+            flush_bytes: recorder.counter(FLUSH_BYTES).register(),
+            flush_waits: recorder.counter(FLUSH_WAIT_COUNT).register(),
+            installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
             removed_expiring_write: removed("expiring_write"),
             removed_error: removed("error"),
             removed_closed: removed("closed"),
             removed_not_worth_it: removed("not_worth_it"),
+            removed_overflow: removed("overflow"),
             ranges: recorder.gauge(RANGE_COUNT).register(),
             file_bytes: recorder.gauge(FILE_BYTES).register(),
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
@@ -395,6 +430,7 @@ impl RangeCacheStats {
             RemoveReason::Error => &self.removed_error,
             RemoveReason::Closed => &self.removed_closed,
             RemoveReason::NotWorthIt => &self.removed_not_worth_it,
+            RemoveReason::Overflow => &self.removed_overflow,
         };
         counter.increment(1);
     }

@@ -42,8 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 /// rebuild.
 const MAX_HEIGHT: usize = 12;
 /// The first chunk of a buffer. Each later chunk doubles, up to [`MAX_CHUNK`], so a buffer that
-/// holds a few versions allocates little.
-const FIRST_CHUNK: usize = 4 * 1024;
+/// holds a few versions allocates little. [`Buffer::with_first_chunk`] can start smaller, down to
+/// [`MIN_FIRST_CHUNK`].
+pub(super) const FIRST_CHUNK: usize = 4 * 1024;
+pub(super) const MIN_FIRST_CHUNK: usize = 512;
 const MAX_CHUNK: usize = 64 * 1024;
 /// A node larger than this gets a chunk of its own, so that a large value does not waste the
 /// rest of a regular chunk.
@@ -294,6 +296,13 @@ impl Default for Buffer {
 impl Buffer {
     /// Returns an empty buffer. It allocates no chunk until the first append.
     pub(super) fn new() -> Self {
+        Self::with_first_chunk(FIRST_CHUNK)
+    }
+
+    /// Returns an empty buffer whose first chunk is `first_chunk` bytes, clamped to
+    /// `MIN_FIRST_CHUNK..=FIRST_CHUNK`. Later chunks double as usual.
+    pub(super) fn with_first_chunk(first_chunk: usize) -> Self {
+        let first_chunk = first_chunk.clamp(MIN_FIRST_CHUNK, FIRST_CHUNK);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             read: CacheLine(ReadSide {
@@ -311,7 +320,7 @@ impl Buffer {
                     chunks: ptr::null_mut(),
                     next: ptr::null_mut(),
                     room: 0,
-                    next_chunk: FIRST_CHUNK,
+                    next_chunk: first_chunk,
                     // Any odd seed works for the generator.
                     rng: id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
                 }),
@@ -504,6 +513,7 @@ impl Writer<'_> {
     /// A version with the key and sequence number of an earlier one replaces it, for the readers
     /// that find the new one; a version that readers can see already never changes. The batch
     /// writer never appends such a version.
+    #[cfg(test)]
     pub(super) fn append(
         &mut self,
         key: &[u8],
@@ -512,12 +522,35 @@ impl Writer<'_> {
         create_ts: Option<i64>,
         value: &[u8],
     ) -> u64 {
+        self.try_append(key, seq, kind, create_ts, value, |_| true)
+            .expect("an append that fits")
+    }
+
+    /// Appends a version as [`Writer::append`] does, if `fits` accepts the bytes of the chunk that
+    /// the append allocates (0 if the version fits in the current chunk). `fits` runs before the
+    /// buffer allocates or links anything; if it returns false, the buffer does not change and
+    /// this returns `None`. Otherwise it returns the bytes allocated, which are the bytes that
+    /// `fits` accepted.
+    pub(super) fn try_append(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        kind: Kind,
+        create_ts: Option<i64>,
+        value: &[u8],
+        fits: impl FnOnce(u64) -> bool,
+    ) -> Option<u64> {
         let buffer = self.buffer;
         let read = &buffer.read.0;
         let write = &buffer.write.0;
         // SAFETY: this writer holds the role, so nothing else touches the arena (R1).
         let arena = unsafe { &mut *write.arena.get() };
         let height = arena.height();
+        let size = node_size(height, key.len(), value.len());
+        let growth = arena.growth(size);
+        if !fits(growth) {
+            return None;
+        }
 
         // On each level, the link to store the node in and the node that it points to now.
         let mut at: [&AtomicPtr<Node>; MAX_HEIGHT] = std::array::from_fn(|l| &read.head[l]);
@@ -554,8 +587,8 @@ impl Writer<'_> {
             unsafe { same_version(succ[0], key, seq).then(|| version(succ[0]).estimated_size()) }
         };
 
-        let size = node_size(height, key.len(), value.len());
         let (memory, grown) = arena.alloc(size);
+        debug_assert_eq!(grown, growth, "an allocation other than the one checked");
         let node = memory.cast::<Node>();
         let mut flags = match kind {
             Kind::Value => KIND_VALUE,
@@ -614,7 +647,7 @@ impl Writer<'_> {
             let allocated = write.allocated.load(Ordering::Relaxed) + grown;
             write.allocated.store(allocated, Ordering::Relaxed);
         }
-        grown
+        Some(grown)
     }
 }
 
@@ -637,8 +670,20 @@ impl Arena {
         (1 + x.trailing_zeros() as usize / 2).min(MAX_HEIGHT)
     }
 
+    /// The bytes of the chunk that [`Arena::alloc`] allocates for a node of `size` bytes, or 0 if
+    /// the node fits in the current chunk.
+    fn growth(&self, size: usize) -> u64 {
+        if size <= self.room {
+            0
+        } else if size > LARGE_NODE {
+            (CHUNK_HEADER + size) as u64
+        } else {
+            self.next_chunk.max(CHUNK_HEADER + size) as u64
+        }
+    }
+
     /// Returns `size` bytes for a node, aligned for it, and the bytes of the chunk that it
-    /// allocated for them, or 0.
+    /// allocated for them, or 0. Those are [`Arena::growth`] of `size`.
     fn alloc(&mut self, size: usize) -> (*mut u8, u64) {
         debug_assert!(size.is_multiple_of(ALIGN));
         if size <= self.room {

@@ -976,6 +976,19 @@ impl<P: Into<Path>> DbBuilder<P> {
                 &tokio_handle,
             )?;
         }
+        // The range cache's maintenance task: flushes and merges (design 01 section 7).
+        #[cfg(feature = "range_cache")]
+        if let Some(cache) = &inner.range_cache {
+            task_executor.add_handler(
+                crate::range_cache::RANGE_CACHE_MAINTENANCE_TASK_NAME.to_string(),
+                Box::new(crate::range_cache::Maintainer::new(
+                    inner.clone(),
+                    cache.clone(),
+                )),
+                cache.maintenance_receiver(),
+                &tokio_handle,
+            )?;
+        }
 
         // Monitor background tasks
         task_executor.monitor_on(&tokio_handle)?;

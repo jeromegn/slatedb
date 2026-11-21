@@ -1,16 +1,22 @@
 //! The scan path of the range cache.
 //!
-//! [`CachedScan`] walks the pinned layers of cached ranges directly. It reads the file with a
-//! cursor and overlays the frozen and the active delta, at the pinned sequence number. For each
-//! key it returns the newest version at or below that number, and it skips tombstones.
+//! [`CachedScan`] walks the pinned layers of cached ranges directly (design 01 section 5.2): a
+//! cursor on the base, and one on each buffer and run that can hold a version visible at the
+//! pinned sequence number. Buffers and runs can hold several versions of a key; their cursors
+//! skip the versions above the sequence number. For each key the scan takes the newest visible
+//! version from the newest source that holds the key (buffers, then runs, then the base), and it
+//! skips tombstones.
 //!
 //! A scan can span adjacent cached ranges. It then walks the parts in key order, all pinned at
 //! the same sequence number. The parts hold disjoint keys, so the scan is their concatenation.
 //!
 //! A merge operand needs the merge operator and the older versions of its key. For such a key,
 //! the scan reads that key alone through the normal iterator stack, at the same sequence number.
-//! No other row needs the normal stack: cached ranges hold no expiring rows, and a file holds
+//! No other row needs the normal stack: cached ranges hold no expiring rows, and a base holds
 //! only values and base-less merge operands.
+//!
+//! The cursors hold positions, not references: they read their buffer or file through the layers
+//! that the scan holds. So a scan takes one reference count, on its layers, and none per source.
 
 use std::collections::VecDeque;
 use std::io;
@@ -23,28 +29,25 @@ use bytes::Bytes;
 
 use super::buffer::{Cursor, Kind, Version};
 use super::delta::{past_end, to_row, Delta};
-use super::Layers;
+use super::{Layers, Run};
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::iter::RowEntryIterator;
 use crate::merge_operator::MergeOperatorType;
-use crate::range_cache::file::RangeFileCursor;
+use crate::range_cache::file::{RangeFile, RangeFileCursor};
 use crate::types::{RowEntry, ValueDeletable};
 
-/// The deltas of a set of layers, newest first: the active delta, then the frozen delta.
-const DELTAS: usize = 2;
-
-/// The delta `i` of `layers`, in the order of [`DELTAS`].
-fn delta_of(layers: &Layers, i: usize) -> Option<&Delta> {
+/// Buffer `i` of `layers`, in the order of [`Layers::buffers`]: 0 is the active buffer.
+fn buffer_of(layers: &Layers, i: usize) -> &Delta {
     match i {
-        0 => Some(&layers.active),
-        _ => layers.frozen.as_deref(),
+        0 => &layers.active,
+        _ => &layers.sealed[i - 1],
     }
 }
 
-/// A cursor over the versions of a delta that are visible at one sequence number. It is a
-/// position in the delta's buffer: the scan reads it through the layers that it holds, so the
-/// cursor takes no reference of its own and reads the buffer in place.
+/// A cursor over the versions of a buffer that are visible at one sequence number. It is a
+/// position in the buffer: the scan reads it through the layers that it holds, so the cursor
+/// takes no reference of its own and reads the buffer in place.
 struct DeltaCursor {
     pos: Cursor,
     seq: u64,
@@ -64,7 +67,7 @@ impl DeltaCursor {
         }
     }
 
-    /// Moves to the newest visible version of the next key, unless the cursor is at one. A delta
+    /// Moves to the newest visible version of the next key, unless the cursor is at one. A buffer
     /// holds the versions of a key newest first, so the first version at or below `seq` is the
     /// newest visible one.
     fn fill(&mut self, delta: &Delta, end: &Bound<Bytes>) {
@@ -92,16 +95,20 @@ impl DeltaCursor {
         self.version(delta).map(|version| version.key)
     }
 
-    /// Leaves the key of the version that `fill` found: moves past its older versions.
-    fn next_key(&mut self, delta: &Delta) {
-        let buffer = delta.buffer();
-        if let Some(key) = self.key(delta) {
-            buffer.advance(&mut self.pos);
-            while buffer.version(&self.pos).is_some_and(|v| v.key == key) {
-                buffer.advance(&mut self.pos);
-            }
+    /// Leaves `key` if the cursor is at one of its versions, visible or not.
+    fn skip_key(&mut self, delta: &Delta, key: &[u8]) {
+        if self.done {
+            return;
         }
-        self.peeked = false;
+        let buffer = delta.buffer();
+        let mut moved = false;
+        while buffer.version(&self.pos).is_some_and(|v| v.key == key) {
+            buffer.advance(&mut self.pos);
+            moved = true;
+        }
+        if moved {
+            self.peeked = false;
+        }
     }
 
     /// Moves forward to the first key at or after `key`. It never moves backwards.
@@ -117,13 +124,145 @@ impl DeltaCursor {
     }
 }
 
-/// Where the next row of a scan comes from.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// A cursor over the versions of a run that are visible at one sequence number. Like
+/// [`DeltaCursor`], it reads the run's file through the layers that the scan holds.
+struct RunCursor {
+    cursor: RangeFileCursor,
+    seq: u64,
+    /// The cursor is at the newest visible version of its key, which the scan has not used yet.
+    peeked: bool,
+}
+
+impl RunCursor {
+    fn new(run: &Run, start: Bound<&[u8]>, end: Bound<Bytes>, seq: u64) -> io::Result<Self> {
+        Ok(Self {
+            cursor: RangeFileCursor::with_bounds(&run.file, start, end)?,
+            seq,
+            peeked: false,
+        })
+    }
+
+    /// Moves to the newest visible version of the next key, unless the cursor is at one.
+    fn fill(&mut self, file: &RangeFile) -> io::Result<()> {
+        while !self.peeked {
+            match self.cursor.seq() {
+                None => return Ok(()),
+                Some(seq) if seq <= self.seq => self.peeked = true,
+                Some(_) => self.cursor.skip(file)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn key(&self) -> Option<&[u8]> {
+        if self.peeked {
+            self.cursor.key()
+        } else {
+            None
+        }
+    }
+
+    /// The version that `fill` found, then leaves its key.
+    fn take(&mut self, file: &RangeFile) -> io::Result<RowEntry> {
+        let row = self.cursor.take(file)?;
+        self.peeked = false;
+        self.skip_key(file, &row.key)?;
+        Ok(row)
+    }
+
+    /// Leaves `key` if the cursor is at one of its versions, visible or not.
+    fn skip_key(&mut self, file: &RangeFile, key: &[u8]) -> io::Result<()> {
+        let mut moved = false;
+        while self.cursor.key() == Some(key) {
+            self.cursor.skip(file)?;
+            moved = true;
+        }
+        if moved {
+            self.peeked = false;
+        }
+        Ok(())
+    }
+
+    /// Moves forward to the first key at or after `key`. It never moves backwards.
+    fn seek(&mut self, file: &RangeFile, key: &[u8]) -> io::Result<()> {
+        if self.cursor.key().is_some_and(|current| current < key) {
+            self.cursor.seek(file, key)?;
+            self.peeked = false;
+        }
+        Ok(())
+    }
+}
+
+/// A cursor over one buffer or run of the current part, with its place in the layers. A run's
+/// cursor is large (it holds a page copy and the page's row offsets), so it is boxed.
 enum Source {
-    File,
-    Delta,
-    /// The file and a delta hold the same key. The delta is newer.
-    Both,
+    Buffer(usize, DeltaCursor),
+    Run(usize, Box<RunCursor>),
+}
+
+impl Source {
+    fn fill(&mut self, layers: &Layers, end: &Bound<Bytes>) -> io::Result<()> {
+        match self {
+            Source::Buffer(i, cursor) => {
+                cursor.fill(buffer_of(layers, *i), end);
+                Ok(())
+            }
+            Source::Run(i, cursor) => cursor.fill(&layers.runs[*i].file),
+        }
+    }
+
+    /// The key of the version that `fill` found.
+    fn key<'a>(&'a self, layers: &'a Layers) -> Option<&'a [u8]> {
+        match self {
+            Source::Buffer(i, cursor) => cursor.key(buffer_of(layers, *i)),
+            Source::Run(_, cursor) => cursor.key(),
+        }
+    }
+
+    fn skip_key(&mut self, layers: &Layers, key: &[u8]) -> io::Result<()> {
+        match self {
+            Source::Buffer(i, cursor) => {
+                cursor.skip_key(buffer_of(layers, *i), key);
+                Ok(())
+            }
+            Source::Run(i, cursor) => cursor.skip_key(&layers.runs[*i].file, key),
+        }
+    }
+
+    fn seek(&mut self, layers: &Layers, key: &[u8]) -> io::Result<()> {
+        match self {
+            Source::Buffer(i, cursor) => {
+                cursor.seek(buffer_of(layers, *i), key);
+                Ok(())
+            }
+            Source::Run(i, cursor) => cursor.seek(&layers.runs[*i].file, key),
+        }
+    }
+}
+
+/// The key of the version that a step takes, borrowed from a buffer or held by the run's row.
+enum StepKey<'a> {
+    Buffer(&'a [u8]),
+    Run(Bytes),
+}
+
+impl StepKey<'_> {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            StepKey::Buffer(key) => key,
+            StepKey::Run(key) => key,
+        }
+    }
+}
+
+/// Returns true if a run can hold a key of `[start, end)`.
+fn run_meets(run: &Run, start: Bound<&[u8]>, end: &Bound<Bytes>) -> bool {
+    let after_start = match start {
+        Unbounded => true,
+        Included(start) => run.max_key.as_ref() >= start,
+        Excluded(start) => run.max_key.as_ref() > start,
+    };
+    after_start && !past_end(end, &run.min_key)
 }
 
 /// The smaller of a scan's end bound and a range's exclusive end.
@@ -158,10 +297,11 @@ pub(crate) struct CachedScan {
     /// The end of the scan range.
     scan_end: Bound<Bytes>,
     seq: u64,
-    /// A cursor over the file of the current layers, which it reads through `layers`.
-    file: Option<RangeFileCursor>,
-    /// A cursor for each non-empty delta of the current layers, in the order of [`DELTAS`].
-    deltas: [Option<DeltaCursor>; DELTAS],
+    /// A cursor over the base of the current layers, which it reads through `layers`.
+    base: Option<RangeFileCursor>,
+    /// A cursor for each buffer and run of the current layers that can hold a visible version,
+    /// newest first.
+    sources: Vec<Source>,
     merge_operator: Option<MergeOperatorType>,
     /// A merge-operand key that `next_sync` found and left for `next` to resolve.
     unresolved: Option<Bytes>,
@@ -190,8 +330,8 @@ impl CachedScan {
             rest,
             scan_end,
             seq,
-            file: None,
-            deltas: [None, None],
+            base: None,
+            sources: Vec::new(),
             merge_operator,
             unresolved: None,
             point: range.as_point().is_some(),
@@ -210,20 +350,29 @@ impl CachedScan {
     /// Starts reading the current layers from `start` to `end`.
     fn open(&mut self, start: Bound<&[u8]>, end: Bound<Bytes>) -> io::Result<()> {
         let layers = &self.layers;
-        // The cursor reads the file of the pinned layers, so it takes no reference to it.
-        self.file = match &layers.file {
+        // The cursors read the files of the pinned layers, so they take no reference to them.
+        self.base = match &layers.base {
             Some(file) => Some(RangeFileCursor::with_bounds(file, start, end.clone())?),
             None => None,
         };
-        // A delta that is empty now holds no version at or below `seq`: the writer puts each
-        // version in its delta before it commits it, and `seq` was loaded before this call
-        // (see Appendix B of RFC 0040). So the scan skips it.
         let seq = self.seq;
-        self.deltas = std::array::from_fn(|i| {
-            delta_of(layers, i)
-                .filter(|delta| !delta.is_empty())
-                .map(|delta| DeltaCursor::new(delta, start, seq))
-        });
+        self.sources.clear();
+        // A buffer that is empty now holds no version at or below `seq`: the writer puts each
+        // version in its buffer before it commits it, and `seq` was loaded before this call (see
+        // Appendix B of RFC 0040). A buffer or run whose versions are all above `seq` holds
+        // nothing for the scan either. So the scan skips them.
+        for (i, delta) in layers.buffers().enumerate() {
+            if !delta.is_empty() && delta.lo() < seq {
+                self.sources
+                    .push(Source::Buffer(i, DeltaCursor::new(delta, start, seq)));
+            }
+        }
+        for (i, run) in layers.runs.iter().enumerate() {
+            if run.lo < seq && run.file.rows() > 0 && run_meets(run, start, &end) {
+                let cursor = RunCursor::new(run, start, end.clone(), seq)?;
+                self.sources.push(Source::Run(i, Box::new(cursor)));
+            }
+        }
         self.part_end = end;
         Ok(())
     }
@@ -255,44 +404,34 @@ impl CachedScan {
     fn step(&mut self) -> io::Result<Step> {
         loop {
             let layers = &*self.layers;
-            for (i, cursor) in self.deltas.iter_mut().enumerate() {
-                if let (Some(cursor), Some(delta)) = (cursor, delta_of(layers, i)) {
-                    cursor.fill(delta, &self.part_end);
-                }
+            for source in self.sources.iter_mut() {
+                source.fill(layers, &self.part_end)?;
             }
-            // The newest delta with the smallest key. On a tie, the newer delta wins.
+            // The newest source with the smallest key. On a tie, the newer source wins.
             let mut best: Option<(usize, &[u8])> = None;
-            for (i, cursor) in self.deltas.iter().enumerate() {
-                let key = match (cursor, delta_of(layers, i)) {
-                    (Some(cursor), Some(delta)) => cursor.key(delta),
-                    _ => None,
-                };
-                if let Some(key) = key {
+            for (i, source) in self.sources.iter().enumerate() {
+                if let Some(key) = source.key(layers) {
                     if best.is_none_or(|(_, best_key)| key < best_key) {
                         best = Some((i, key));
                     }
                 }
             }
-            let file_key = self.file.as_ref().and_then(|file| file.key());
-            let source = match (file_key, best) {
+            let base_key = self.base.as_ref().and_then(|base| base.key());
+            let order = match (base_key, best) {
                 (None, None) => None,
-                (Some(_), None) => Some(Source::File),
-                (None, Some(_)) => Some(Source::Delta),
-                (Some(file_key), Some((_, delta_key))) => Some(match file_key.cmp(delta_key) {
-                    std::cmp::Ordering::Less => Source::File,
-                    std::cmp::Ordering::Equal => Source::Both,
-                    std::cmp::Ordering::Greater => Source::Delta,
-                }),
+                (Some(_), None) => Some(std::cmp::Ordering::Less),
+                (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+                (Some(base_key), Some((_, key))) => Some(base_key.cmp(key)),
             };
             let best = best.map(|(i, _)| i);
-            let Some(source) = source else {
+            let Some(order) = order else {
                 if self.next_part()? {
                     continue;
                 }
                 return Ok(Step::End);
             };
-            if source == Source::File {
-                let row = match (self.file.as_mut(), &self.layers.file) {
+            if order == std::cmp::Ordering::Less {
+                let row = match (self.base.as_mut(), &self.layers.base) {
                     (Some(cursor), Some(file)) => cursor.take(file)?,
                     _ => return Ok(Step::End),
                 };
@@ -301,36 +440,50 @@ impl CachedScan {
                     _ => Step::Row(row),
                 });
             }
-            if source == Source::Both {
-                if let (Some(cursor), Some(file)) = (self.file.as_mut(), &self.layers.file) {
+            if order == std::cmp::Ordering::Equal {
+                if let (Some(cursor), Some(file)) = (self.base.as_mut(), &layers.base) {
                     cursor.skip(file)?;
                 }
             }
-            let layers = &*self.layers;
-            let found = best.and_then(|i| {
-                let delta = delta_of(layers, i)?;
-                Some((i, delta, self.deltas[i].as_ref()?.version(delta)?))
-            });
-            let Some((b, delta, version)) = found else {
+            let Some(b) = best else {
                 return Ok(Step::End);
             };
-            // Older deltas that hold the same key lose.
-            for (i, cursor) in self.deltas.iter_mut().enumerate().skip(b + 1) {
-                if let (Some(cursor), Some(older)) = (cursor, delta_of(layers, i)) {
-                    if cursor.key(older) == Some(version.key) {
-                        cursor.next_key(older);
-                    }
+            // The key of the version to take. Older sources that hold it lose.
+            let key = match &self.sources[b] {
+                Source::Buffer(i, cursor) => cursor.key(buffer_of(layers, *i)).map(StepKey::Buffer),
+                Source::Run(_, cursor) => cursor.cursor.key_bytes().map(StepKey::Run),
+            };
+            let Some(key) = key else {
+                return Ok(Step::End);
+            };
+            for (j, source) in self.sources.iter_mut().enumerate() {
+                if j != b {
+                    source.skip_key(layers, key.as_bytes())?;
                 }
             }
             // Copy out only what the scan returns.
-            let step = match version.kind {
-                Kind::Value => Some(Step::Row(to_row(&version))),
-                Kind::Tombstone => None,
-                Kind::Merge => Some(Step::Resolve(Bytes::copy_from_slice(version.key))),
+            let step = match &mut self.sources[b] {
+                Source::Buffer(i, cursor) => {
+                    let delta = buffer_of(layers, *i);
+                    let step = cursor
+                        .version(delta)
+                        .and_then(|version| match version.kind {
+                            Kind::Value => Some(Step::Row(to_row(&version))),
+                            Kind::Tombstone => None,
+                            Kind::Merge => Some(Step::Resolve(Bytes::copy_from_slice(version.key))),
+                        });
+                    cursor.skip_key(delta, key.as_bytes());
+                    step
+                }
+                Source::Run(i, cursor) => {
+                    let row = cursor.take(&layers.runs[*i].file)?;
+                    match row.value {
+                        ValueDeletable::Value(_) => Some(Step::Row(row)),
+                        ValueDeletable::Tombstone => None,
+                        ValueDeletable::Merge(_) => Some(Step::Resolve(row.key)),
+                    }
+                }
             };
-            if let Some(cursor) = self.deltas[b].as_mut() {
-                cursor.next_key(delta);
-            }
             if let Some(step) = step {
                 return Ok(step);
             }
@@ -403,14 +556,12 @@ impl RowEntryIterator for CachedScan {
                 break;
             }
         }
-        if let (Some(cursor), Some(file)) = (self.file.as_mut(), &self.layers.file) {
+        if let (Some(cursor), Some(file)) = (self.base.as_mut(), &self.layers.base) {
             cursor.seek(file, next_key)?;
         }
         let layers = &*self.layers;
-        for (i, cursor) in self.deltas.iter_mut().enumerate() {
-            if let (Some(cursor), Some(delta)) = (cursor, delta_of(layers, i)) {
-                cursor.seek(delta, next_key);
-            }
+        for source in self.sources.iter_mut() {
+            source.seek(layers, next_key)?;
         }
         Ok(())
     }
@@ -436,19 +587,18 @@ mod tests {
     use super::*;
     use crate::db_iter::DbIterator;
     use crate::range_cache::delta::DeltaMemory;
-    use crate::range_cache::file::{RangeCachePageSource, RangeFile, RangeFileWriter};
+    use crate::range_cache::file::{RangeCachePageSource, RangeFileWriter};
     use crate::read_trace::ReadTrace;
     use crate::test_utils::StringConcatMergeOperator;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::ops::Bound::{self, Unbounded};
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// The newest seq of a file row. Frozen deltas hold seqs above it, active deltas above
-    /// `FROZEN_MAX_SEQ`.
-    const FILE_SEQ: u64 = 100;
-    const FROZEN_MAX_SEQ: u64 = 200;
-    const ACTIVE_MAX_SEQ: u64 = 300;
+    /// The sequence number of the base of the test layers. Runs, sealed buffers and the active
+    /// buffer hold the versions above it, in that order, up to `MAX_SEQ`.
+    const BASE_SEQ: u64 = 100;
+    const MAX_SEQ: u64 = 300;
 
     #[derive(Clone, Copy, Debug)]
     enum Kind {
@@ -479,7 +629,7 @@ mod tests {
 
     /// A version as the writer makes it: every write has a create time, from a clock that
     /// does not go back. A merge result takes the newest create time of its versions, so with
-    /// such times a tombstone under a merge operand never changes the result. The file drops
+    /// such times a tombstone under a merge operand never changes the result. The base drops
     /// tombstones, as compaction does, so the history test depends on this.
     fn history_entry(k: u8, kind: Kind, seq: u64) -> RowEntry {
         let mut entry = entry(k, kind, seq);
@@ -499,60 +649,136 @@ mod tests {
         ]
     }
 
-    /// Builds layers from generated versions: file rows (no tombstones), then frozen and active
-    /// delta versions with seqs in their own bands. Only keys in `keys` go in.
-    fn layers_of(
+    /// Where the versions above the base go. The cuts split `(BASE_SEQ, MAX_SEQ]` into
+    /// intervals: the first `runs` are runs, the last one is the active buffer, and the ones in
+    /// between are sealed buffers.
+    #[derive(Clone, Debug)]
+    struct Shape {
+        cuts: Vec<u64>,
+        runs: usize,
+    }
+
+    fn shape() -> impl Strategy<Value = Shape> {
+        proptest::collection::btree_set(BASE_SEQ + 1..MAX_SEQ, 0..6).prop_flat_map(|cuts| {
+            let cuts: Vec<u64> = cuts.into_iter().collect();
+            let most = cuts.len().min(crate::range_cache::MAX_RUNS);
+            (Just(cuts), 0..=most).prop_map(|(cuts, runs)| Shape { cuts, runs })
+        })
+    }
+
+    /// One version per key and sequence number, as the writer applies them.
+    type History = BTreeMap<(u8, u64), Kind>;
+
+    /// Layers with only an active buffer that holds every version of `history`.
+    fn all_of(history: &History, make: fn(u8, Kind, u64) -> RowEntry) -> Arc<Layers> {
+        let all = Delta::for_test(&DeltaMemory::detached(), 0);
+        let mut writer = all.writer();
+        for ((k, seq), kind) in history {
+            writer.append(&make(*k, *kind, *seq));
+        }
+        drop(writer);
+        Arc::new(Layers {
+            active: Arc::new(all),
+            sealed: Vec::new(),
+            runs: Vec::new(),
+            base: None,
+            base_seq: 0,
+            covered_to: 0,
+            end: None,
+        })
+    }
+
+    /// Builds layers of `shape` from the versions of `history` whose keys pass `keys`: a base
+    /// with the state at `BASE_SEQ`, written the way a load or a major merge writes it, then
+    /// runs and buffers with every version of their intervals.
+    #[allow(clippy::too_many_arguments)]
+    async fn layers_of(
         dir: &std::path::Path,
         name: &str,
-        file_rows: &BTreeMap<u8, (bool, u64)>,
-        frozen: &[(u8, Kind, u64)],
-        active: &[(u8, Kind, u64)],
+        history: &History,
+        make: fn(u8, Kind, u64) -> RowEntry,
+        shape: &Shape,
         page_source: RangeCachePageSource,
         keys: impl Fn(u8) -> bool,
         end: Option<Bytes>,
     ) -> Arc<Layers> {
-        let mut writer = RangeFileWriter::create(dir, name, 512).unwrap();
-        for (k, (merge, seq)) in file_rows.iter().filter(|(k, _)| keys(**k)) {
-            let kind = if *merge { Kind::Merge } else { Kind::Value };
-            writer.push(&entry(*k, kind, *seq)).unwrap();
+        let history: History = history
+            .iter()
+            .filter(|((k, _), _)| keys(*k))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+        let disk = Arc::new(AtomicU64::new(0));
+        let mut writer = RangeFileWriter::create(dir, &format!("{name}-base"), 512).unwrap();
+        let mut rows = crate::range_cache::stack_iterator(
+            &all_of(&history, make),
+            BASE_SEQ,
+            BytesRange::unbounded(),
+            Some(merge),
+        )
+        .await
+        .unwrap();
+        while let Some(row) = rows.next_entry().await.unwrap() {
+            writer.push(&row).unwrap();
         }
         let path = writer.finish().unwrap();
-        let file = RangeFile::open(path, page_source, Arc::new(AtomicU64::new(0))).unwrap();
-        let delta = |versions: &[(u8, Kind, u64)]| {
-            let delta = Delta::new(&DeltaMemory::detached());
+        let base = RangeFile::open(path, page_source, disk.clone()).unwrap();
+
+        // The versions of `(lo, hi]`, key ascending and newest first.
+        let versions = |lo: u64, hi: u64| {
+            let mut out: Vec<RowEntry> = history
+                .iter()
+                .filter(|((_, seq), _)| *seq > lo && *seq <= hi)
+                .map(|((k, seq), kind)| make(*k, *kind, *seq))
+                .collect();
+            out.sort_by(|a, b| a.key.cmp(&b.key).then(b.seq.cmp(&a.seq)));
+            out
+        };
+        let bounds: Vec<u64> = std::iter::once(BASE_SEQ)
+            .chain(shape.cuts.iter().copied())
+            .chain(std::iter::once(MAX_SEQ))
+            .collect();
+        let intervals = bounds.len() - 1;
+        let mut runs = Vec::new();
+        for i in 0..shape.runs {
+            let (lo, hi) = (bounds[i], bounds[i + 1]);
+            let mut writer =
+                RangeFileWriter::create_run(dir, &format!("{name}-run{i}"), 512).unwrap();
+            for row in versions(lo, hi) {
+                writer.push(&row).unwrap();
+            }
+            let path = writer.finish().unwrap();
+            let file = RangeFile::open(path, page_source, disk.clone()).unwrap();
+            runs.push(Arc::new(Run::new(file, lo, hi).unwrap()));
+        }
+        runs.reverse();
+        let buffer = |lo: u64, hi: u64| {
+            let delta = Delta::for_test(&DeltaMemory::detached(), lo);
             let mut writer = delta.writer();
-            for (k, kind, seq) in versions.iter().filter(|(k, _, _)| keys(*k)) {
-                writer.append(&entry(*k, *kind, *seq));
+            for row in versions(lo, hi) {
+                writer.append(&row);
             }
             drop(writer);
             Arc::new(delta)
         };
-        Arc::new(Layers {
-            active: delta(active),
-            frozen: (!frozen.is_empty()).then(|| delta(frozen)),
-            file: Some(Arc::new(file)),
-            file_seq: FILE_SEQ,
+        let mut sealed = Vec::new();
+        for i in shape.runs..intervals - 1 {
+            let delta = buffer(bounds[i], bounds[i + 1]);
+            delta.sealed_at().store(bounds[i + 1], Ordering::Release);
+            sealed.push(delta);
+        }
+        sealed.reverse();
+        let layers = Layers {
+            active: buffer(bounds[intervals - 1], MAX_SEQ),
+            sealed,
+            runs,
+            base: Some(Arc::new(base)),
+            base_seq: BASE_SEQ,
+            covered_to: bounds[shape.runs],
             end,
-        })
-    }
-
-    fn layers(
-        dir: &std::path::Path,
-        file_rows: &BTreeMap<u8, (bool, u64)>,
-        frozen: &[(u8, Kind, u64)],
-        active: &[(u8, Kind, u64)],
-        page_source: RangeCachePageSource,
-    ) -> Arc<Layers> {
-        layers_of(
-            dir,
-            "f",
-            file_rows,
-            frozen,
-            active,
-            page_source,
-            |_| true,
-            None,
-        )
+        };
+        layers.check();
+        Arc::new(layers)
     }
 
     async fn drain(iter: &mut DbIterator, limit: usize) -> Vec<RowEntry> {
@@ -566,6 +792,14 @@ mod tests {
         out
     }
 
+    fn page_source(mmap: bool) -> RangeCachePageSource {
+        if mmap {
+            RangeCachePageSource::Mmap
+        } else {
+            RangeCachePageSource::PositionalRead
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 300,
@@ -575,14 +809,14 @@ mod tests {
         })]
 
         /// The direct scan returns exactly what the normal iterator stack returns over the same
-        /// layers at the same sequence number, also after a seek. With `split`, the scan walks
-        /// two adjacent ranges, split at that key, and the normal stack reads the unsplit layers.
+        /// layers at the same sequence number, also after a seek. The layers have a base, up to
+        /// four runs, sealed buffers and the active buffer. With `split`, the scan walks two
+        /// adjacent ranges, split at that key, and the normal stack reads the unsplit layers.
         #[test]
         fn should_match_the_normal_iterator_stack(
-            file_rows in proptest::collection::btree_map(0u8..40, (proptest::bool::weighted(0.2), 1..=FILE_SEQ), 0..60),
-            frozen in proptest::collection::vec((0u8..40, kind(), FILE_SEQ + 1..=FROZEN_MAX_SEQ), 0..30),
-            active in proptest::collection::vec((0u8..40, kind(), FROZEN_MAX_SEQ + 1..=ACTIVE_MAX_SEQ), 0..30),
-            seq in FILE_SEQ..=ACTIVE_MAX_SEQ,
+            history in proptest::collection::btree_map((0u8..40, 1..=MAX_SEQ), kind(), 0..150),
+            shape in shape(),
+            seq in BASE_SEQ..=MAX_SEQ,
             start in bound(),
             end in bound(),
             prefix_rows in 0usize..20,
@@ -596,12 +830,8 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
             runtime.block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let page_source = if mmap {
-                    RangeCachePageSource::Mmap
-                } else {
-                    RangeCachePageSource::PositionalRead
-                };
-                let layers = layers(dir.path(), &file_rows, &frozen, &active, page_source);
+                let source = page_source(mmap);
+                let layers = layers_of(dir.path(), "f", &history, entry, &shape, source, |_| true, None).await;
                 let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
                 let mut expected =
                     crate::range_cache::stack_iterator(&layers, seq, range.clone(), Some(merge.clone()))
@@ -611,16 +841,14 @@ mod tests {
                 let parts = match split {
                     None => vec![layers.clone()],
                     Some(at) => {
-                        let part = |name, low: bool, end| {
-                            layers_of(dir.path(), name, &file_rows, &frozen, &active, page_source, |k| (k < at) == low, end)
-                        };
-                        let high = part("high", false, None);
+                        let high = layers_of(dir.path(), "high", &history, entry, &shape, source, |k| k >= at, None).await;
                         let starts_low = match RangeBounds::start_bound(&range) {
                             Unbounded => true,
                             Included(k) | Excluded(k) => *k < key(at),
                         };
                         if starts_low {
-                            vec![part("low", true, Some(key(at))), high]
+                            let low = layers_of(dir.path(), "low", &history, entry, &shape, source, |k| k < at, Some(key(at))).await;
+                            vec![low, high]
                         } else {
                             vec![high]
                         }
@@ -647,19 +875,20 @@ mod tests {
             });
         }
 
-        /// Cached reads at any sequence number from the file's to the newest return the state
+        /// Cached reads at any sequence number from the base's to the newest return the state
         /// of the whole history at that number, as the normal path over all versions would.
         ///
-        /// The history is one table of all versions. The file holds its state at `FILE_SEQ`,
-        /// written the way a load or a rebuild writes it. The deltas hold the versions after
-        /// the file, split at `FROZEN_MAX_SEQ` when there is a frozen delta. Unlike the test
-        /// above, which reads the same layers both ways, the expected answer here does not
-        /// come from the layers.
+        /// The history is one table of all versions. The base holds its state at `BASE_SEQ`,
+        /// written the way a load or a major merge writes it; up to four runs, sealed buffers and
+        /// the active buffer hold the versions after the base. Unlike the test above, which reads
+        /// the same layers both ways, the expected answer here does not come from the layers.
+        /// Keys have many versions, so a run often holds several versions of a key, across its
+        /// pages, and a read at an older sequence number stops at a version below the newest.
         #[test]
         fn should_match_the_history_at_any_read_seq(
-            history in proptest::collection::vec((0u8..24, kind(), 1..=ACTIVE_MAX_SEQ), 0..120),
-            with_frozen in any::<bool>(),
-            seq in FILE_SEQ..=ACTIVE_MAX_SEQ,
+            history in proptest::collection::btree_map((0u8..24, 1..=MAX_SEQ), kind(), 0..200),
+            shape in shape(),
+            seq in BASE_SEQ..=MAX_SEQ,
             start in bound(),
             end in bound(),
             mmap in any::<bool>(),
@@ -670,72 +899,11 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
             runtime.block_on(async {
                 let dir = tempfile::tempdir().unwrap();
-                let page_source = if mmap {
-                    RangeCachePageSource::Mmap
-                } else {
-                    RangeCachePageSource::PositionalRead
-                };
                 let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
-                // One version per key and sequence number, as the writer applies them.
-                let history: BTreeMap<(u8, u64), Kind> =
-                    history.into_iter().map(|(k, kind, seq)| ((k, seq), kind)).collect();
-                let all = Delta::new(&DeltaMemory::detached());
-                let mut writer = all.writer();
-                for ((k, seq), kind) in &history {
-                    writer.append(&history_entry(*k, *kind, *seq));
-                }
-                drop(writer);
-                let all = Arc::new(Layers {
-                    active: Arc::new(all),
-                    frozen: None,
-                    file: None,
-                    file_seq: 0,
-                    end: None,
-                });
+                let all = all_of(&history, history_entry);
+                let layers = layers_of(dir.path(), "f", &history, history_entry, &shape, page_source(mmap), |_| true, None).await;
 
-                // The file: the state at `FILE_SEQ`, through the normal iterator stack.
-                let mut writer = RangeFileWriter::create(dir.path(), "f", 512).unwrap();
-                let mut rows = crate::range_cache::stack_iterator(
-                    &all,
-                    FILE_SEQ,
-                    BytesRange::unbounded(),
-                    Some(merge.clone()),
-                )
-                .await
-                .unwrap();
-                while let Some(row) = rows.next_entry().await.unwrap() {
-                    writer.push(&row).unwrap();
-                }
-                let path = writer.finish().unwrap();
-                let file = RangeFile::open(path, page_source, Arc::new(AtomicU64::new(0))).unwrap();
-                let delta = |low: u64, high: u64| {
-                    let delta = Delta::new(&DeltaMemory::detached());
-                    let mut writer = delta.writer();
-                    for ((k, seq), kind) in &history {
-                        if *seq > low && *seq <= high {
-                            writer.append(&history_entry(*k, *kind, *seq));
-                        }
-                    }
-                    drop(writer);
-                    Arc::new(delta)
-                };
-                let (active, frozen) = if with_frozen {
-                    (
-                        delta(FROZEN_MAX_SEQ, ACTIVE_MAX_SEQ),
-                        Some(delta(FILE_SEQ, FROZEN_MAX_SEQ)),
-                    )
-                } else {
-                    (delta(FILE_SEQ, ACTIVE_MAX_SEQ), None)
-                };
-                let layers = Arc::new(Layers {
-                    active,
-                    frozen,
-                    file: Some(Arc::new(file)),
-                    file_seq: FILE_SEQ,
-                    end: None,
-                });
-
-                // Scans. Compare what a caller sees. The entry kinds can differ: the file drops
+                // Scans. Compare what a caller sees. The entry kinds can differ: the base drops
                 // tombstones, so a merge over a tombstone in the history is a merge over nothing
                 // in the cache, which the stack returns as a merge operand with the same bytes.
                 let visible = |rows: Vec<RowEntry>| {
@@ -775,7 +943,7 @@ mod tests {
                         .await
                         .unwrap(),
                     };
-                    assert_eq!(got, want, "key {k} at {seq}");
+                    assert_eq!(got, want, "key {k} at {seq} in {shape:?}");
                 }
             });
         }

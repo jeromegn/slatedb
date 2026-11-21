@@ -1,33 +1,63 @@
-//! The deltas of cached ranges.
+//! The write buffers of cached ranges.
 //!
-//! A [`Delta`] holds every version that the writer applied to a range since the range's file was
-//! written, in a [`Buffer`] of the `buffer` module: a sorted map that the batch writer appends to
-//! and that readers search without a reference count or any other write to shared memory. Its
-//! `sealed_at` word is the readers' validity word (see the sequence number rules of the cache).
+//! A [`Delta`] holds versions that the writer applied to a range above a sequence number `lo`, in
+//! a [`Buffer`] of the `buffer` module: a sorted map that the batch writer appends to and that
+//! readers search without a reference count or any other write to shared memory. Its `sealed_at`
+//! word is the readers' validity word (see the sequence number rules of the cache). A range has
+//! one active delta, which the writer appends to, and sealed deltas, which wait for their flush to
+//! a run.
 //!
-//! The cache counts the memory of all deltas exactly, in [`DeltaMemory`]: each chunk from its
-//! allocation, by the writer, until the last holder of its delta (the layers, a scan, a merge
-//! resolution or a rebuild) drops it.
+//! A large delta also has a filter of its keys (see the `filter` module), which the writer creates
+//! when the delta's chunks reach a size and fills before it links each later version. A read of a
+//! key that the delta does not hold then costs one probe instead of a search.
+//!
+//! The cache counts the memory of all deltas exactly, in [`DeltaMemory`]: each chunk and each
+//! filter from its allocation, by the writer, until the last holder of its delta (the layers, a
+//! scan, a merge resolution or a flush) drops it. Only the writer adds to the count, after it has
+//! checked that the addition keeps the count at or below the cache's cap; drops only subtract. So
+//! the count never exceeds the cap.
 
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use slatedb_common::metrics::GaugeFn;
 
-use super::buffer::{Buffer, Cursor, Kind, Version, Writer};
+use super::buffer::{Buffer, Cursor, Kind, Version, Writer, FIRST_CHUNK};
 use super::file::copy_key_value;
+use super::filter::{blocks_for, hash_key, SharedFilter, BITS_PER_KEY, BLOCK_BYTES};
 use super::writer::Padded;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::iter::RowEntryIterator;
 use crate::types::{RowEntry, ValueDeletable};
 
-/// The memory that the deltas of one cache hold: the sum of their chunks (design 01 calls it
-/// `recent_bytes`). The writer adds a chunk when it allocates it; a delta subtracts its chunks
-/// when it drops. The gauge follows each change.
+/// How the deltas of one cache size themselves. See [`crate::RangeCacheTuning`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DeltaShape {
+    /// The chunk bytes at which the writer seals an active delta.
+    pub(super) seal_bytes: u64,
+    /// The chunk bytes from which a delta has a filter. `u64::MAX` turns filters off.
+    pub(super) filter_from: u64,
+}
+
+impl DeltaShape {
+    /// The first chunk of a delta: at most a quarter of the seal size, so that a delta with a
+    /// small seal size does not seal at its first version, and the buffer's own size otherwise.
+    fn first_chunk(&self) -> usize {
+        usize::try_from(self.seal_bytes / 4)
+            .unwrap_or(usize::MAX)
+            .checked_next_power_of_two()
+            .unwrap_or(FIRST_CHUNK)
+            .min(FIRST_CHUNK)
+    }
+}
+
+/// The memory that the deltas of one cache hold: the sum of their chunks and filters (design 01
+/// calls it `recent_bytes`). The writer adds a chunk or a filter when it allocates it; a delta
+/// subtracts its own when it drops. The gauge follows each change.
 pub(super) struct DeltaMemory {
     bytes: Padded<AtomicU64>,
     gauge: Arc<dyn GaugeFn>,
@@ -51,7 +81,7 @@ impl DeltaMemory {
         )
     }
 
-    /// The bytes of the chunks of all live deltas.
+    /// The bytes of the chunks and filters of all live deltas.
     pub(super) fn bytes(&self) -> u64 {
         self.bytes.0.load(Ordering::Relaxed)
     }
@@ -59,6 +89,14 @@ impl DeltaMemory {
     /// Sets the gauge to the current count.
     pub(super) fn publish(&self) {
         self.gauge.set(self.bytes() as i64);
+    }
+
+    /// Returns true if `bytes` more keep the count at or below `cap`. Only the writer adds to the
+    /// count, so the answer holds until it adds: other threads only subtract.
+    fn fits(&self, bytes: u64, cap: u64) -> bool {
+        self.bytes()
+            .checked_add(bytes)
+            .is_some_and(|total| total <= cap)
     }
 
     fn add(&self, bytes: u64) {
@@ -75,20 +113,47 @@ impl DeltaMemory {
     }
 }
 
-/// The versions that the writer applied to a range since its file was written.
+/// Versions that the writer applied to a range above a sequence number. See the module
+/// documentation.
 pub(super) struct Delta {
     buffer: Buffer,
+    /// Every version has a greater sequence number.
+    lo: u64,
+    shape: DeltaShape,
+    /// The filter of the delta's keys, once the delta is large. Only the writer sets it.
+    filter: OnceLock<SharedFilter>,
     memory: Arc<DeltaMemory>,
 }
 
 impl Delta {
-    /// An empty delta, whose chunks count in `memory`. It allocates nothing until the first
-    /// version arrives.
-    pub(super) fn new(memory: &Arc<DeltaMemory>) -> Self {
+    /// An empty delta for versions above `lo`, whose chunks and filter count in `memory`. It
+    /// allocates nothing until the first version arrives.
+    pub(super) fn new(memory: &Arc<DeltaMemory>, lo: u64, shape: DeltaShape) -> Self {
         Self {
-            buffer: Buffer::new(),
+            buffer: Buffer::with_first_chunk(shape.first_chunk()),
+            lo,
+            shape,
+            filter: OnceLock::new(),
             memory: memory.clone(),
         }
+    }
+
+    /// An empty delta with the default shape, for tests.
+    #[cfg(test)]
+    pub(super) fn for_test(memory: &Arc<DeltaMemory>, lo: u64) -> Self {
+        Self::new(
+            memory,
+            lo,
+            DeltaShape {
+                seal_bytes: 4 * 1024 * 1024,
+                filter_from: u64::MAX,
+            },
+        )
+    }
+
+    /// Every version of the delta has a sequence number above this one.
+    pub(super) fn lo(&self) -> u64 {
+        self.lo
     }
 
     /// The cache applies no write with a greater sequence number to this delta. It is
@@ -97,15 +162,31 @@ impl Delta {
         self.buffer.sealed_at()
     }
 
-    /// The estimated size of the versions, as the memtable counts its rows. The rebuild threshold
-    /// and the `delta_bytes` gauge use it.
+    /// The estimated size of the versions, as the memtable counts its rows. The `delta_bytes`
+    /// gauge uses it.
     pub(super) fn size(&self) -> usize {
         self.buffer.estimated_bytes() as usize
     }
 
-    /// The memory that the delta holds: its chunks.
+    /// The bytes of the delta's chunks. The seal threshold applies to them.
     pub(super) fn allocated_bytes(&self) -> u64 {
         self.buffer.allocated_bytes()
+    }
+
+    /// The memory that the delta holds: its chunks and its filter.
+    pub(super) fn memory_bytes(&self) -> u64 {
+        self.buffer.allocated_bytes() + self.filter_bytes()
+    }
+
+    /// The bytes of the delta's filter, or 0.
+    pub(super) fn filter_bytes(&self) -> u64 {
+        self.filter.get().map_or(0, |f| f.bytes() as u64)
+    }
+
+    /// The delta's filter, if it has one. A reader probes it after it loads its sequence number.
+    #[inline]
+    pub(super) fn filter(&self) -> Option<&SharedFilter> {
+        self.filter.get()
     }
 
     /// The number of versions.
@@ -134,37 +215,107 @@ impl Delta {
     pub(super) fn writer(&self) -> DeltaWriter<'_> {
         DeltaWriter {
             writer: self.buffer.writer(),
-            memory: &self.memory,
+            delta: self,
         }
+    }
+
+    /// The keys that a filter created now should hold: the versions at the delta's size when it
+    /// seals, projected from its versions so far, at most a sixteenth of the seal size in filter
+    /// bytes.
+    fn filter_keys(&self) -> usize {
+        let (len, allocated) = (self.buffer.len(), self.allocated_bytes().max(1));
+        let projected =
+            (len as u128 * self.shape.seal_bytes.max(allocated) as u128 / allocated as u128) as u64;
+        let most = self.shape.seal_bytes / 16 * 8 / BITS_PER_KEY as u64;
+        projected.min(most).max(len).max(1) as usize
     }
 }
 
 impl Drop for Delta {
     fn drop(&mut self) {
-        self.memory.release(self.allocated_bytes());
+        self.memory.release(self.memory_bytes());
     }
 }
 
 /// Appends the rows of a batch to a delta. See [`Delta::writer`].
 pub(super) struct DeltaWriter<'a> {
     writer: Writer<'a>,
-    memory: &'a DeltaMemory,
+    delta: &'a Delta,
 }
 
 impl DeltaWriter<'_> {
     /// Copies `entry` into the delta. The cache holds no row with an expire time.
+    #[cfg(test)]
     pub(super) fn append(&mut self, entry: &RowEntry) {
+        assert!(
+            self.append_within(entry, u64::MAX),
+            "an append without a cap"
+        );
+    }
+
+    /// Copies `entry` into the delta if the memory of all deltas stays at or below `cap`, and
+    /// returns false, changing nothing, if it would not. The cache holds no row with an expire
+    /// time.
+    ///
+    /// The buffer reports the exact bytes that the append allocates before it allocates or links
+    /// anything, so the check is exact: one load of the shared count when the append needs a
+    /// chunk, none otherwise. A filter's bits for the key are set at that point too, before the
+    /// node is linked.
+    pub(super) fn append_within(&mut self, entry: &RowEntry, cap: u64) -> bool {
         debug_assert!(entry.expire_ts.is_none(), "a delta row with an expire time");
         let (kind, value): (Kind, &[u8]) = match &entry.value {
             ValueDeletable::Value(v) => (Kind::Value, v),
             ValueDeletable::Merge(v) => (Kind::Merge, v),
             ValueDeletable::Tombstone => (Kind::Tombstone, &[]),
         };
-        let grown = self
-            .writer
-            .append(&entry.key, entry.seq, kind, entry.create_ts, value);
+        let delta = self.delta;
+        let memory = &*delta.memory;
+        let filter = delta.filter.get();
+        let fits = |grown: u64| {
+            if grown > 0 && !memory.fits(grown, cap) {
+                return false;
+            }
+            if let Some(filter) = filter {
+                filter.insert(hash_key(&entry.key));
+            }
+            true
+        };
+        let Some(grown) =
+            self.writer
+                .try_append(&entry.key, entry.seq, kind, entry.create_ts, value, fits)
+        else {
+            return false;
+        };
         if grown > 0 {
-            self.memory.add(grown);
+            memory.add(grown);
+            if filter.is_none() && delta.allocated_bytes() >= delta.shape.filter_from {
+                self.add_filter(cap);
+            }
+        }
+        true
+    }
+
+    /// Gives the delta a filter of its keys, if the filter fits under `cap`. It runs on the
+    /// writer, once per delta, when a new chunk takes the delta past the filter's size.
+    fn add_filter(&self, cap: u64) {
+        let delta = self.delta;
+        let keys = delta.filter_keys();
+        let bytes = (blocks_for(keys) * BLOCK_BYTES) as u64;
+        if !delta.memory.fits(bytes, cap) {
+            return;
+        }
+        let filter = SharedFilter::with_capacity(keys);
+        let buffer = &delta.buffer;
+        let mut cursor = buffer.seek(Bound::Unbounded);
+        while let Some(version) = buffer.version(&cursor) {
+            filter.insert(hash_key(version.key));
+            buffer.advance(&mut cursor);
+        }
+        debug_assert_eq!(filter.bytes() as u64, bytes);
+        delta.memory.add(bytes);
+        // Publishes the filter with its bits: a reader that finds it sees them.
+        if delta.filter.set(filter).is_err() {
+            unreachable!("only the writer sets a delta's filter");
         }
     }
 }
@@ -282,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn should_iterate_as_the_memtable_does() {
         let memory = DeltaMemory::detached();
-        let delta = Arc::new(Delta::new(&memory));
+        let delta = Arc::new(Delta::for_test(&memory, 0));
         let table = KVTable::new();
         let rows = [
             row("a", 3, Some("a3")),
@@ -339,12 +490,113 @@ mod tests {
         }
     }
 
+    fn shaped(memory: &Arc<DeltaMemory>, filter_from: u64) -> Delta {
+        Delta::new(
+            memory,
+            0,
+            DeltaShape {
+                seal_bytes: 1024 * 1024,
+                filter_from,
+            },
+        )
+    }
+
+    fn big_row(i: u64) -> RowEntry {
+        RowEntry::new(
+            Bytes::from(format!("k{i:08}")),
+            ValueDeletable::Value(Bytes::from(vec![b'v'; 200])),
+            i + 1,
+            None,
+            None,
+        )
+    }
+
+    /// An append that would take the memory past the cap is refused before it changes anything,
+    /// and every other append fits: the memory never passes the cap and stops close to it.
+    #[test]
+    fn should_refuse_an_append_that_does_not_fit_under_the_cap() {
+        let memory = DeltaMemory::detached();
+        let other = shaped(&memory, u64::MAX);
+        other.writer().append(&big_row(0));
+        let delta = shaped(&memory, u64::MAX);
+        let cap = 64 * 1024;
+        let mut writer = delta.writer();
+        let mut i = 0;
+        loop {
+            let (len, bytes) = (delta.len(), memory.bytes());
+            if !writer.append_within(&big_row(i), cap) {
+                assert_eq!((delta.len(), memory.bytes()), (len, bytes));
+                break;
+            }
+            assert!(memory.bytes() <= cap);
+            i += 1;
+        }
+        // Chunks double from 4 KiB: with the other delta's 4 KiB, chunks of 4, 8, 16 and 32 KiB
+        // reach the cap exactly, and the next one, 64 KiB, does not fit.
+        assert_eq!(memory.bytes(), cap);
+        // A version that fits in the current chunk's room needs no new chunk, so it is not
+        // refused at the cap.
+        let tiny = RowEntry::new_tombstone(b"k", 1_000_000);
+        let room = writer.append_within(&tiny, cap);
+        assert_eq!(memory.bytes(), cap, "appended into the room: {room}");
+        drop(writer);
+        drop(other);
+        drop(delta);
+        assert_eq!(memory.bytes(), 0);
+    }
+
+    /// A delta gets a filter when its chunks reach the filter size: the filter holds every key
+    /// that the delta held then and every key appended after, and its bytes count in the memory
+    /// until the delta drops. A filter that does not fit under the cap is not made.
+    #[test]
+    fn should_add_a_filter_when_the_delta_grows() {
+        let memory = DeltaMemory::detached();
+        let delta = shaped(&memory, 16 * 1024);
+        let mut writer = delta.writer();
+        let mut i = 0;
+        while delta.allocated_bytes() < 16 * 1024 {
+            assert!(delta.filter().is_none());
+            writer.append(&big_row(i));
+            i += 1;
+        }
+        let filter = delta.filter().expect("a filter at the filter size");
+        for j in i..i + 500 {
+            writer.append(&big_row(j));
+        }
+        drop(writer);
+        for j in 0..i + 500 {
+            assert!(
+                filter.may_contain(hash_key(big_row(j).key.as_ref())),
+                "key {j}"
+            );
+        }
+        assert!(delta.filter_bytes() > 0);
+        assert_eq!(
+            memory.bytes(),
+            delta.allocated_bytes() + delta.filter_bytes()
+        );
+        assert_eq!(delta.memory_bytes(), memory.bytes());
+        drop(delta);
+        assert_eq!(memory.bytes(), 0);
+
+        // The same delta under a cap that holds its chunks but not its filter.
+        let small = shaped(&memory, 16 * 1024);
+        let mut writer = small.writer();
+        let mut i = 0;
+        while small.allocated_bytes() < 16 * 1024 {
+            assert!(writer.append_within(&big_row(i), 28 * 1024));
+            i += 1;
+        }
+        assert!(small.filter().is_none());
+        assert_eq!(memory.bytes(), small.allocated_bytes());
+    }
+
     /// The cache's count of delta memory holds each delta's chunks until its last holder drops it.
     #[test]
     fn should_count_delta_memory_until_the_last_holder_drops_it() {
         let memory = DeltaMemory::detached();
-        let first = Arc::new(Delta::new(&memory));
-        let second = Arc::new(Delta::new(&memory));
+        let first = Arc::new(Delta::for_test(&memory, 0));
+        let second = Arc::new(Delta::for_test(&memory, 0));
         assert_eq!(memory.bytes(), 0);
         for (i, delta) in [&first, &second].into_iter().enumerate() {
             let mut writer = delta.writer();

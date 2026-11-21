@@ -487,7 +487,12 @@ async fn should_scan_across_adjacent_ranges() {
 
 #[tokio::test]
 async fn should_resolve_merge_operands() {
-    let t = open(|o| o.tuning.min_rebuild_delta_bytes = 512).await;
+    let t = open(|o| {
+        o.tuning.min_rebuild_delta_bytes = 512;
+        // Writes reach a rebuild through a seal of the write buffer and a flush to a run.
+        o.tuning.range_seal_bytes = 1024;
+    })
+    .await;
     let db = &t.db;
     db.put(b"m1", b"base").await.unwrap();
     db.merge(b"m2", b"op0").await.unwrap();
@@ -569,6 +574,7 @@ async fn should_not_cache_rows_that_expire() {
 async fn should_rebuild_grown_deltas() {
     let t = open(|o| {
         o.tuning.min_rebuild_delta_bytes = 2048;
+        o.tuning.range_seal_bytes = 4096;
         o.tuning.page_size = 512;
     })
     .await;
@@ -587,8 +593,8 @@ async fn should_rebuild_grown_deltas() {
     assert!(t.metric(REBUILD_COUNT, &[]) > 1);
     assert_eq!(db.cached_ranges().len(), 1);
     assert_matches_snapshot(db, (0..200).map(key), (Unbounded, Unbounded)).await;
-    // A rebuild deletes the old file.
-    assert_eq!(t.cache_files(), 1);
+    // A rebuild deletes the old base and the runs it merged. Runs flushed since stay.
+    assert_eq!(t.cache_files(), 1 + db.cached_ranges()[0].runs);
     db.close().await.unwrap();
 }
 
@@ -1304,6 +1310,7 @@ async fn should_scan_across_a_rebuild() {
         opts.page_source = page_source;
         opts.tuning.page_size = 512;
         opts.tuning.min_rebuild_delta_bytes = 2048;
+        opts.tuning.range_seal_bytes = 4096;
         let db = Db::builder("scan_rebuild", Arc::new(InMemory::new()))
             .with_range_cache(opts)
             .with_merge_operator(Arc::new(ConcatMergeOperator))
@@ -1547,6 +1554,7 @@ async fn should_fall_back_for_a_snapshot_older_than_the_load() {
 async fn should_fall_back_for_a_snapshot_older_than_a_rebuild() {
     let t = open(|o| {
         o.tuning.min_rebuild_delta_bytes = 2048;
+        o.tuning.range_seal_bytes = 4096;
         o.tuning.page_size = 512;
     })
     .await;
@@ -2329,6 +2337,7 @@ async fn should_keep_a_mixed_scan_at_one_state_while_the_cache_changes() {
         let t = open(|o| {
             o.page_source = page_source;
             o.tuning.min_rebuild_delta_bytes = 2048;
+            o.tuning.range_seal_bytes = 4096;
             // A file of 50 rows takes one page of 4096 bytes and a little more, so the budget
             // holds two ranges. See `should_evict_the_least_recently_read_range`.
             o.max_disk_bytes = 9000;
@@ -2876,7 +2885,11 @@ async fn should_follow_a_moving_hot_set() {
 
 #[tokio::test]
 async fn should_remove_ranges_that_writes_make_too_costly() {
-    let (t, clock) = open_auto(|o| o.tuning.min_rebuild_delta_bytes = 1024).await;
+    let (t, clock) = open_auto(|o| {
+        o.tuning.min_rebuild_delta_bytes = 1024;
+        o.tuning.range_seal_bytes = 4096;
+    })
+    .await;
     let db = &t.db;
     load_padded(db, 2000).await;
     for _ in 0..40 {
