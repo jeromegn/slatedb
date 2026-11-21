@@ -265,6 +265,9 @@ struct RawRow {
     create_ts: i64,
     key: Ref,
     value: Ref,
+    /// The offset just after the row's last byte in its page (its value, or its value's
+    /// reference when the value is out of line).
+    end: usize,
 }
 
 fn parse_ref(page: &[u8], at: usize, out_of_line: bool) -> io::Result<(Ref, usize)> {
@@ -303,13 +306,14 @@ fn parse_row_at(page: &[u8], off: usize) -> io::Result<RawRow> {
     let seq = u64_at(page, off + 1);
     let create_ts = u64_at(page, off + 9) as i64;
     let (key, next) = parse_ref(page, off + ROW_FIXED_LEN, flags & FLAG_KEY_OUT_OF_LINE != 0)?;
-    let (value, _) = parse_ref(page, next, flags & FLAG_VALUE_OUT_OF_LINE != 0)?;
+    let (value, end) = parse_ref(page, next, flags & FLAG_VALUE_OUT_OF_LINE != 0)?;
     Ok(RawRow {
         flags,
         seq,
         create_ts,
         key,
         value,
+        end,
     })
 }
 
@@ -366,6 +370,91 @@ pub(crate) struct RangeFileWriter {
     data_bytes: u64,
     max_seq: u64,
     prev_key: Option<Vec<u8>>,
+    /// The keys and row offsets of a run, collected as the writer writes them, if asked for (see
+    /// [`RangeFileWriter::with_locators`]).
+    locators: Option<RowLocators>,
+}
+
+/// The keys and row offsets of a run in file order, grouped by key: what a view build needs to
+/// add the run to a range's view (see the `view` module). A flush's writer collects them while it
+/// writes the run, so the build does not read the file again.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RowLocators {
+    /// The distinct keys, back to back.
+    keys: Vec<u8>,
+    /// The end of each key in `keys`.
+    key_end: Vec<usize>,
+    /// The file offset of every row.
+    offsets: Vec<u32>,
+    /// The end of each key's rows in `offsets`.
+    group_end: Vec<usize>,
+    /// Rows counted so far, whose offsets may not be known yet.
+    rows: usize,
+}
+
+impl RowLocators {
+    fn start_key(&mut self, key: &[u8]) {
+        if self.rows > 0 {
+            self.group_end.push(self.rows);
+        }
+        self.keys.extend_from_slice(key);
+        self.key_end.push(self.keys.len());
+    }
+
+    fn finish(&mut self) {
+        if self.rows > 0 && self.group_end.last() != Some(&self.rows) {
+            self.group_end.push(self.rows);
+        }
+    }
+
+    /// The number of rows.
+    pub(crate) fn rows(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// The number of distinct keys.
+    pub(crate) fn groups(&self) -> usize {
+        self.key_end.len()
+    }
+
+    /// Distinct key `g`.
+    pub(crate) fn key(&self, g: usize) -> &[u8] {
+        let start = if g == 0 { 0 } else { self.key_end[g - 1] };
+        &self.keys[start..self.key_end[g]]
+    }
+
+    /// The offsets of the rows of distinct key `g`, newest first.
+    pub(crate) fn offsets(&self, g: usize) -> &[u32] {
+        let start = if g == 0 { 0 } else { self.group_end[g - 1] };
+        &self.offsets[start..self.group_end[g]]
+    }
+
+    pub(crate) fn first(&self) -> Option<&[u8]> {
+        (self.groups() > 0).then(|| self.key(0))
+    }
+
+    pub(crate) fn last(&self) -> Option<&[u8]> {
+        self.groups().checked_sub(1).map(|g| self.key(g))
+    }
+
+    /// The locators of a finished run, read from its file: the same as its writer collected.
+    #[cfg(test)]
+    pub(crate) fn read(file: &RangeFile) -> io::Result<Self> {
+        let mut out = Self::default();
+        let mut prev: Option<Vec<u8>> = None;
+        file.for_each_row(|offset, key, _| {
+            if prev.as_deref() != Some(key) {
+                out.start_key(key);
+                prev = Some(key.to_vec());
+            }
+            out.rows += 1;
+            out.offsets
+                .push(u32::try_from(offset).map_err(|_| corrupt("a run file of 4 GiB or more"))?);
+            Ok(())
+        })?;
+        out.finish();
+        Ok(out)
+    }
 }
 
 impl RangeFileWriter {
@@ -409,7 +498,16 @@ impl RangeFileWriter {
             data_bytes: 0,
             max_seq: 0,
             prev_key: None,
+            locators: None,
         })
+    }
+
+    /// Makes the writer of a run collect the keys and offsets of its rows, which
+    /// [`RangeFileWriter::finish_with_locators`] returns. Call it before the first row.
+    pub(crate) fn with_locators(mut self) -> Self {
+        debug_assert!(self.run_keys.is_some() && self.rows == 0);
+        self.locators = Some(RowLocators::default());
+        self
     }
 
     /// Returns about the size of the file if it were finished now.
@@ -591,6 +689,13 @@ impl RangeFileWriter {
         self.data_bytes += (key.len() + value.len()) as u64;
         self.max_seq = self.max_seq.max(seq);
         self.prev_seq = seq;
+        if let Some(locators) = &mut self.locators {
+            // The row's offset is known when its page is written.
+            if !same_key {
+                locators.start_key(key);
+            }
+            locators.rows += 1;
+        }
         if !same_key {
             if let Some(keys) = &mut self.run_keys {
                 keys.push(hash_key(key));
@@ -614,16 +719,27 @@ impl RangeFileWriter {
             .extend_from_slice(&(self.first_key.len() as u32).to_le_bytes());
         self.fences.extend_from_slice(&self.first_key);
 
+        let n = self.offsets.len();
+        let hints = PAGE_HEADER_LEN + ROW_OFFSET_LEN * n;
+        let base = hints + ROW_HINT_LEN * n;
+        if let Some(locators) = &mut self.locators {
+            for off in &self.offsets {
+                let at = u32::try_from(page_off + (base + off) as u64).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a range cache run with row locators must be smaller than 4 GiB",
+                    )
+                })?;
+                locators.offsets.push(at);
+            }
+        }
         let mut page = std::mem::take(&mut self.page_buf);
         page.fill(0);
-        let n = self.offsets.len();
         // Keys of a page are sorted, so the first and the last share the prefix that all share.
         let last_key = self.prev_key.as_deref().unwrap_or_default();
         let skip = common_prefix_len(&self.first_key, last_key).min(MAX_HINT_SKIP);
         page[..2].copy_from_slice(&(n as u16).to_le_bytes());
         page[2..4].copy_from_slice(&(skip as u16).to_le_bytes());
-        let hints = PAGE_HEADER_LEN + ROW_OFFSET_LEN * n;
-        let base = hints + ROW_HINT_LEN * n;
         let mut key_start = 0;
         for (i, off) in self.offsets.iter().enumerate() {
             let at = PAGE_HEADER_LEN + ROW_OFFSET_LEN * i;
@@ -649,6 +765,19 @@ impl RangeFileWriter {
     /// Writes the last page, the fence region, a run's filter and the trailer, and renames the
     /// file into place. Returns the final path.
     pub(crate) fn finish(mut self) -> io::Result<PathBuf> {
+        self.finish_file()
+    }
+
+    /// [`RangeFileWriter::finish`] for a writer that collects row locators: returns them too.
+    pub(crate) fn finish_with_locators(mut self) -> io::Result<(PathBuf, RowLocators)> {
+        let path = self.finish_file()?;
+        let mut locators = self.locators.take().unwrap_or_default();
+        locators.finish();
+        debug_assert_eq!(locators.rows(), locators.rows);
+        Ok((path, locators))
+    }
+
+    fn finish_file(&mut self) -> io::Result<PathBuf> {
         if !self.offsets.is_empty() {
             self.flush_page()?;
         }
@@ -1248,53 +1377,48 @@ impl RangeFile {
         self.read(offset, len)
     }
 
-    /// Decodes the header of the row at `offset`, an offset that [`RangeFile::for_each_row`]
-    /// gave. Pages start at multiples of the page size, so the offset alone finds the page. The
-    /// key and the value come back as spans of the file. With positional reads this reads the
-    /// whole page.
-    pub(super) fn row_at(&self, offset: u64) -> io::Result<RowSpan> {
-        let page_size = self.page_size as u64;
-        let page_start = offset - offset % page_size;
-        if page_start + page_size > self.data_end {
-            return Err(corrupt("row offset past the pages"));
+    /// Copies `len` bytes at `offset` into one new buffer: from the map, or with one positional
+    /// read.
+    pub(super) fn copy_at(&self, offset: u64, len: usize) -> io::Result<Bytes> {
+        match self.source.mapped() {
+            Some(map) => Ok(Bytes::copy_from_slice(slice_at(map, offset, len)?)),
+            None => {
+                let mut buf = vec![0u8; len];
+                self.source.read_exact_at(&mut buf, offset)?;
+                Ok(Bytes::from(buf))
+            }
         }
-        let at = (offset - page_start) as usize;
-        let raw = match self.source.mapped() {
-            Some(map) => parse_row_at(slice_at(map, page_start, self.page_size)?, at)?,
-            None => parse_row_at(&self.read(page_start, self.page_size)?, at)?,
-        };
-        let span = |r: &Ref| match r {
-            Ref::Inline(range) => (page_start + range.start as u64, range.len()),
-            Ref::OutOfLine { offset, len } => (*offset, *len),
-        };
-        Ok(RowSpan {
-            flags: raw.flags,
-            seq: raw.seq,
-            create_ts: raw.create_ts,
-            key: span(&raw.key),
-            value: span(&raw.value),
-        })
     }
 
-    /// Copies the row of `span` out of the file, its key and value in one allocation.
-    pub(super) fn decode_span(&self, span: &RowSpan) -> io::Result<RowEntry> {
-        let kind = span.kind();
-        let key = self.read(span.key.0, span.key.1)?;
-        let value = match kind {
-            Kind::Tombstone => Cow::Borrowed(&[][..]),
-            _ => self.read(span.value.0, span.value.1)?,
-        };
-        let (key, value) = copy_key_value(&key, &value);
-        Ok(RowEntry {
-            key,
-            value: value_of(kind, value),
-            seq: span.seq,
-            create_ts: (span.flags & FLAG_CREATE_TS != 0).then_some(span.create_ts),
-            expire_ts: None,
-        })
+    /// The end of the page that holds the row at `offset`, an offset that a writer's
+    /// [`RowLocators`] gave. Pages start at multiples of the page size.
+    pub(super) fn page_end(&self, offset: u64) -> io::Result<u64> {
+        let page_size = self.page_size as u64;
+        let end = offset - offset % page_size + page_size;
+        if end > self.data_end {
+            return Err(corrupt("row offset past the pages"));
+        }
+        Ok(end)
+    }
+
+    /// Decodes the header of the row at `offset`, an offset that a writer's [`RowLocators`]
+    /// gave. The key and the value come back as spans of the file. With positional reads this
+    /// reads the row's page.
+    pub(super) fn row_at(&self, offset: u64) -> io::Result<RowSpan> {
+        let page_end = self.page_end(offset)?;
+        let page_start = page_end - self.page_size as u64;
+        match self.source.mapped() {
+            Some(map) => RowSpan::parse(
+                slice_at(map, page_start, self.page_size)?,
+                page_start,
+                offset,
+            ),
+            None => RowSpan::parse(&self.read(page_start, self.page_size)?, page_start, offset),
+        }
     }
 
     /// Calls `f` with the offset, the key and the sequence number of every row, in file order.
+    #[cfg(test)]
     pub(super) fn for_each_row(
         &self,
         mut f: impl FnMut(u64, &[u8], u64) -> io::Result<()>,
@@ -1325,11 +1449,83 @@ pub(super) struct RowSpan {
     create_ts: i64,
     pub(super) key: (u64, usize),
     value: (u64, usize),
+    /// The file offset just after the row's bytes in its page. A copy of the file from the row's
+    /// offset to here holds the row's header and its inline key and value.
+    pub(super) end: u64,
 }
 
 impl RowSpan {
+    /// Decodes the row at file offset `offset` from `bytes`, which hold the file from offset
+    /// `at`, up to the row's end at least.
+    pub(super) fn parse(bytes: &[u8], at: u64, offset: u64) -> io::Result<Self> {
+        let off = offset
+            .checked_sub(at)
+            .and_then(|off| usize::try_from(off).ok())
+            .ok_or_else(|| corrupt("row before its bytes"))?;
+        let raw = parse_row_at(bytes, off)?;
+        let span = |r: &Ref| match r {
+            Ref::Inline(range) => (at + range.start as u64, range.len()),
+            Ref::OutOfLine { offset, len } => (*offset, *len),
+        };
+        Ok(RowSpan {
+            flags: raw.flags,
+            seq: raw.seq,
+            create_ts: raw.create_ts,
+            key: span(&raw.key),
+            value: span(&raw.value),
+            end: at + raw.end as u64,
+        })
+    }
+
     pub(super) fn kind(&self) -> Kind {
         kind_of(self.flags)
+    }
+
+    /// `len` bytes at file offset `offset`: a slice of `copy`, which holds the file from offset
+    /// `at`, if the row holds them inline, or a copy from `file` if they are out of line.
+    fn bytes_in(
+        inline: bool,
+        (offset, len): (u64, usize),
+        copy: &Bytes,
+        at: u64,
+        file: &RangeFile,
+    ) -> io::Result<Bytes> {
+        if !inline {
+            return Ok(Bytes::copy_from_slice(&file.read(offset, len)?));
+        }
+        let start = offset
+            .checked_sub(at)
+            .and_then(|s| usize::try_from(s).ok())
+            .filter(|s| s + len <= copy.len())
+            .ok_or_else(|| corrupt("row outside its copy"))?;
+        Ok(copy.slice(start..start + len))
+    }
+
+    /// The row's key, as [`RowSpan::entry_in`] returns it.
+    pub(super) fn key_in(&self, copy: &Bytes, at: u64, file: &RangeFile) -> io::Result<Bytes> {
+        let inline = self.flags & FLAG_KEY_OUT_OF_LINE == 0;
+        Self::bytes_in(inline, self.key, copy, at, file)
+    }
+
+    /// The row, with its inline key and value as slices of `copy`, which holds the file from
+    /// offset `at` up to the row's end at least. Out-of-line keys and values are copied on their
+    /// own.
+    pub(super) fn entry_in(&self, copy: &Bytes, at: u64, file: &RangeFile) -> io::Result<RowEntry> {
+        let kind = self.kind();
+        let value = match kind {
+            Kind::Tombstone => Bytes::new(),
+            _ => {
+                let inline = self.flags & FLAG_VALUE_OUT_OF_LINE == 0;
+                Self::bytes_in(inline, self.value, copy, at, file)?
+            }
+        };
+        Ok(RowEntry {
+            key: self.key_in(copy, at, file)?,
+            value: value_of(kind, value),
+            seq: self.seq,
+            create_ts: (self.flags & FLAG_CREATE_TS != 0).then_some(self.create_ts),
+            expire_ts: None,
+        })
     }
 }
 
@@ -1538,14 +1734,6 @@ impl RangeFileCursor {
     /// The sequence number of the current row, or `None` past the end of the range.
     pub(crate) fn seq(&self) -> Option<u64> {
         self.current.as_ref().map(|raw| raw.seq)
-    }
-
-    /// The key of the current row as a slice of the cursor's page copy, without a copy.
-    pub(crate) fn key_bytes(&self) -> Option<Bytes> {
-        match self.current.as_ref()?.key {
-            Ref::Inline(ref range) => Some(self.page_bytes.slice(range.clone())),
-            Ref::OutOfLine { .. } => self.out_of_line_key.clone(),
-        }
     }
 
     /// Returns the current row as slices of the page buffer, and moves to the next row. The

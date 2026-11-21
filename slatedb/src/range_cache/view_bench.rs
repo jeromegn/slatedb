@@ -1,12 +1,12 @@
-//! A benchmark of the delta view against per-run cursors (an ignored test).
+//! A benchmark of reads through the delta view (an ignored test).
 //!
 //! It builds one range as the cache holds it: a base of `RC_VIEW_ROWS` rows (16-byte keys of the
 //! benchmark harness, or 40-byte keys shaped like TPC-C order lines), and a delta split into 1,
-//! 4, 16 and 32 run files by sequence number, with an empty active buffer. Then, on 1 and 16
-//! threads, it times 10-row scans from a random base key (`CachedScan`, the cache's own scan, at
-//! the latest sequence number, with only a row limit as the harness's `db.scan(start..)`) and
-//! point reads of random base keys (hits), with the layers' view off (per-run cursors and
-//! `lookup`) and on (one view cursor and `lookup_view`).
+//! 4, 16 and 32 run files by sequence number, with an empty active buffer, the runs read through
+//! their view. Then, on 1 and 16 threads, it times 10-row scans from a random base key
+//! (`CachedScan`, the cache's own scan, at the latest sequence number, with only a row limit as
+//! the harness's `db.scan(start..)`) and point reads of random base keys (hits, through `lookup`,
+//! which probes the runs' filters).
 //!
 //! Two deltas:
 //!
@@ -17,14 +17,15 @@
 //!   sit in one merged run.
 //!
 //! It also prints the view's bytes per version and the cost of building it run by run, as
-//! flushes do. Run it alone on the machine:
+//! flushes do, from the row locators of the runs' writers. `RC_VIEW_PREAD=1` reads the files with
+//! positional reads instead of memory maps. Run it alone on the machine:
 //!
 //! ```sh
 //! cargo test --profile bench -p slatedb --features range_cache --lib view_bench -- --ignored --nocapture
 //! ```
 //!
-//! Output lines start with `VIEW_BENCH` (keys, delta, runs, op, tasks, variant, ops/s, ns per
-//! op per thread) and `VIEW_BUILD`.
+//! Output lines start with `VIEW_BENCH` (keys, delta, runs, op, tasks, variant `view`, ops/s, ns
+//! per op per thread) and `VIEW_BUILD`.
 
 use std::hint::black_box;
 use std::ops::Bound::{Included, Unbounded};
@@ -35,10 +36,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use super::delta::{Delta, DeltaMemory};
-use super::file::{FileBudget, RangeCachePageSource, RangeFile, RangeFileWriter};
+use super::file::{FileBudget, RangeCachePageSource, RangeFile, RangeFileWriter, RowLocators};
 use super::scan::CachedScan;
 use super::view::{BuildCost, DeltaView, ViewMemory};
-use super::{lookup, lookup_view, Found, Layers, Run};
+use super::{lookup, Found, Layers, Run};
 use crate::bytes_range::BytesRange;
 use crate::iter::RowEntryIterator;
 use crate::types::{RowEntry, ValueDeletable};
@@ -172,11 +173,21 @@ fn write_base(dir: &std::path::Path, table: &KeyTable, n: u64) -> RangeFile {
             .unwrap();
     }
     let path = writer.finish().unwrap();
-    RangeFile::open(path, RangeCachePageSource::Mmap, FileBudget::detached()).unwrap()
+    RangeFile::open(path, page_source(), FileBudget::detached()).unwrap()
+}
+
+/// The page source of the benchmark's files: memory maps, or positional reads with
+/// `RC_VIEW_PREAD=1`.
+fn page_source() -> RangeCachePageSource {
+    match env("RC_VIEW_PREAD", 0) {
+        0 => RangeCachePageSource::Mmap,
+        _ => RangeCachePageSource::PositionalRead,
+    }
 }
 
 /// Writes the runs of `versions`, (key index, seq, run), oldest run first, each run covering
-/// `(BASE_SEQ + r * span, BASE_SEQ + (r + 1) * span]`. Returns them newest first.
+/// `(BASE_SEQ + r * span, BASE_SEQ + (r + 1) * span]`, with the row locators of their writers.
+/// Returns them newest first.
 fn write_runs(
     dir: &std::path::Path,
     table: &KeyTable,
@@ -184,7 +195,7 @@ fn write_runs(
     runs: usize,
     span: u64,
     tag: &str,
-) -> Vec<Arc<Run>> {
+) -> Vec<(Arc<Run>, RowLocators)> {
     let mut out = Vec::with_capacity(runs);
     for r in 0..runs {
         let mut rows: Vec<(u64, u64)> = versions
@@ -193,7 +204,9 @@ fn write_runs(
             .map(|v| (v.0, v.1))
             .collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        let mut writer = RangeFileWriter::create_run(dir, &format!("{tag}-run{r}"), 4096).unwrap();
+        let mut writer = RangeFileWriter::create_run(dir, &format!("{tag}-run{r}"), 4096)
+            .unwrap()
+            .with_locators();
         for (i, seq) in rows {
             let row = RowEntry::new(
                 Bytes::copy_from_slice(table.get(i)),
@@ -204,23 +217,22 @@ fn write_runs(
             );
             writer.push(&row).unwrap();
         }
-        let path = writer.finish().unwrap();
-        let file =
-            RangeFile::open(path, RangeCachePageSource::Mmap, FileBudget::detached()).unwrap();
+        let (path, rows) = writer.finish_with_locators().unwrap();
+        let file = RangeFile::open(path, page_source(), FileBudget::detached()).unwrap();
         let lo = BASE_SEQ + r as u64 * span;
-        out.push(Arc::new(Run::new(file, lo, lo + span).unwrap()));
+        out.push((Arc::new(Run::new(file, lo, lo + span).unwrap()), rows));
     }
     out.reverse();
     out
 }
 
-fn layers(base: &Arc<RangeFile>, runs: &[Arc<Run>], view: Option<Arc<DeltaView>>) -> Range {
+fn layers(base: &Arc<RangeFile>, runs: &[Arc<Run>], view: Arc<DeltaView>) -> Range {
     let covered_to = runs.first().map_or(BASE_SEQ, |r| r.hi);
     let layers = Layers {
         active: Arc::new(Delta::for_test(&DeltaMemory::detached(), covered_to)),
         sealed: Vec::new(),
         runs: runs.to_vec(),
-        view,
+        view: Some(view),
         base: Some(base.clone()),
         base_seq: BASE_SEQ,
         covered_to,
@@ -241,14 +253,7 @@ enum Op {
 
 /// Runs `op` on `tasks` threads for `secs` after a warm-up, and returns (ops/s, ns per op per
 /// thread).
-fn measure(
-    range: &Range,
-    table: &KeyTable,
-    n: u64,
-    op: Op,
-    view: bool,
-    tasks: usize,
-) -> (f64, f64) {
+fn measure(range: &Range, table: &KeyTable, n: u64, op: Op, tasks: usize) -> (f64, f64) {
     let warm = Duration::from_millis(env("RC_VIEW_WARM_MS", 300));
     let secs = Duration::from_millis(env("RC_VIEW_MS", 1500));
     let barrier = Barrier::new(tasks);
@@ -277,12 +282,7 @@ fn measure(
                     }
                     Op::Get => {
                         let key = table.get(rng.below(n));
-                        let found = if view {
-                            lookup_view(&range.layers, key, range.seq)
-                        } else {
-                            lookup(&range.layers, key, range.seq)
-                        };
-                        match found.unwrap() {
+                        match lookup(&range.layers, key, range.seq).unwrap() {
                             Found::Value(kv) => {
                                 black_box(kv);
                             }
@@ -318,25 +318,45 @@ fn measure(
     (ops / secs, secs * tasks as f64 * 1e9 / ops)
 }
 
-/// Checks that the two variants return the same rows, before they are timed.
-fn verify(with: &Range, without: &Range, table: &KeyTable, n: u64) {
+/// Checks that scans and point reads return what the normal iterator stack returns over the
+/// same layers, before they are timed.
+fn verify(range: &Range, table: &KeyTable, n: u64) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let mut rng = Rng(42);
     for _ in 0..2000 {
         let start = Bytes::copy_from_slice(table.get(rng.below(n - 10)));
         let bounds = BytesRange::new(Included(start), Unbounded);
-        let mut a = CachedScan::new(vec![with.layers.clone()], with.seq, &bounds, None).unwrap();
-        let mut b =
-            CachedScan::new(vec![without.layers.clone()], without.seq, &bounds, None).unwrap();
+        let mut scan =
+            CachedScan::new(vec![range.layers.clone()], range.seq, &bounds, None).unwrap();
+        let mut normal = runtime
+            .block_on(super::stack_iterator(
+                &range.layers,
+                range.seq,
+                bounds,
+                None,
+            ))
+            .unwrap();
         for _ in 0..10 {
-            let x = a.next_sync().unwrap().unwrap();
-            let y = b.next_sync().unwrap().unwrap();
+            let x = scan.next_sync().unwrap().unwrap();
+            let y = runtime.block_on(normal.next_entry()).unwrap();
             assert_eq!(x, y);
         }
         let key = table.get(rng.below(n));
-        let x = lookup_view(&with.layers, key, with.seq).unwrap();
-        let y = lookup(&without.layers, key, without.seq).unwrap();
-        match (x, y) {
-            (Found::Value(x), Found::Value(y)) => assert_eq!(x, y),
+        let point = BytesRange::new(
+            Included(Bytes::copy_from_slice(key)),
+            Included(Bytes::copy_from_slice(key)),
+        );
+        let want = runtime
+            .block_on(async {
+                let mut iter = super::stack_iterator(&range.layers, range.seq, point, None).await?;
+                iter.next_entry().await
+            })
+            .unwrap()
+            .map(crate::types::KeyValue::from);
+        match lookup(&range.layers, key, range.seq).unwrap() {
+            Found::Value(kv) => assert_eq!(Some(kv), want),
             _ => panic!("a miss"),
         }
     }
@@ -406,26 +426,25 @@ fn view_bench() {
                     d => panic!("RC_VIEW_DELTAS: {d}"),
                 };
                 let tag = format!("{}-{delta}-{runs}", keys.name());
-                let run_files = write_runs(dir.path(), &table, &versions, runs, span, &tag);
+                let written = write_runs(dir.path(), &table, &versions, runs, span, &tag);
+                let run_files: Vec<Arc<Run>> = written.iter().map(|(r, _)| r.clone()).collect();
                 let run_bytes: u64 = run_files.iter().map(|r| r.file_bytes()).sum();
-                // The view, built run by run as flushes build it; the last build is that of a
-                // flush into a view of `runs - 1` runs.
+                // The view, built run by run as flushes build it, from their writers' row
+                // locators; the last build is that of a flush into a view of `runs - 1` runs.
                 let mut cost = BuildCost::default();
-                let oldest = run_files.last().unwrap().clone();
-                let started = Instant::now();
-                let mut view = DeltaView::from_runs(&[oldest], &memory, &mut cost).unwrap();
-                cost.nanos = started.elapsed().as_nanos() as u64;
+                let mut view = DeltaView::empty(&memory);
                 let mut last = BuildCost::default();
-                for r in run_files.iter().rev().skip(1) {
+                for (r, rows) in written.iter().rev() {
                     last = BuildCost::default();
                     let started = Instant::now();
-                    view = view.with_run(r, &mut last).unwrap();
+                    view = view.with_run(r, rows, &mut last).unwrap();
                     last.nanos = started.elapsed().as_nanos() as u64;
                     cost.nanos += last.nanos;
                     cost.keys_read += last.keys_read;
-                    cost.rows_read += last.rows_read;
+                    cost.rows_added += last.rows_added;
                     cost.bytes_read += last.bytes_read;
                 }
+                drop(written);
                 let mut scratch_cost = BuildCost::default();
                 let started = Instant::now();
                 let scratch = DeltaView::from_runs(&run_files, &memory, &mut scratch_cost).unwrap();
@@ -440,14 +459,13 @@ fn view_bench() {
                     view.bytes() as f64 / view.len() as f64,
                     cost.nanos as f64 / 1e6,
                     last.nanos as f64 / 1e6,
-                    last.rows_read,
+                    last.rows_added,
                     last.keys_read,
                     last.bytes_read,
                     scratch_cost.nanos as f64 / 1e6,
                 );
-                let with = layers(&base, &run_files, Some(Arc::new(view)));
-                let without = layers(&base, &run_files, None);
-                verify(&with, &without, &table, n);
+                let range = layers(&base, &run_files, Arc::new(view));
+                verify(&range, &table, n);
                 let ops: &[Op] = if delta == "dense" {
                     &[Op::Scan10]
                 } else {
@@ -455,14 +473,12 @@ fn view_bench() {
                 };
                 for &op in ops {
                     for &t in &tasks {
-                        for (variant, range) in [("runs", &without), ("view", &with)] {
-                            let (rate, ns) = measure(range, &table, n, op, variant == "view", t);
-                            println!(
-                                "VIEW_BENCH keys={} delta={delta} runs={runs} op={} tasks={t} variant={variant} ops_per_sec={rate:.0} ns_per_op={ns:.0}",
-                                keys.name(),
-                                if op == Op::Scan10 { "scan10" } else { "get_hit" },
-                            );
-                        }
+                        let (rate, ns) = measure(&range, &table, n, op, t);
+                        println!(
+                            "VIEW_BENCH keys={} delta={delta} runs={runs} op={} tasks={t} variant=view ops_per_sec={rate:.0} ns_per_op={ns:.0}",
+                            keys.name(),
+                            if op == Op::Scan10 { "scan10" } else { "get_hit" },
+                        );
                     }
                 }
             }

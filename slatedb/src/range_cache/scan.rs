@@ -1,11 +1,12 @@
 //! The scan path of the range cache.
 //!
 //! [`CachedScan`] walks the pinned layers of cached ranges directly (design 01 section 5.2): a
-//! cursor on the base, and one on each buffer and run that can hold a version visible at the
-//! pinned sequence number. Buffers and runs can hold several versions of a key; their cursors
-//! skip the versions above the sequence number. For each key the scan takes the newest visible
-//! version from the newest source that holds the key (buffers, then runs, then the base), and it
-//! skips tombstones.
+//! cursor on the base, one on each buffer that can hold a version visible at the pinned sequence
+//! number, and one on the range's delta view, which lists the versions of all its runs in order
+//! (see the `view` module), however many runs the range holds. Buffers and runs can hold several
+//! versions of a key; the cursors skip the versions above the sequence number. For each key the
+//! scan takes the newest visible version from the newest source that holds the key (buffers, then
+//! runs, then the base), and it skips tombstones.
 //!
 //! A scan can span adjacent cached ranges. It then walks the parts in key order, all pinned at
 //! the same sequence number. The parts hold disjoint keys, so the scan is their concatenation.
@@ -15,15 +16,28 @@
 //! No other row needs the normal stack: cached ranges hold no expiring rows, and a base holds
 //! only values and base-less merge operands.
 //!
-//! The cursors hold positions, not references: they read their buffer or file through the layers
-//! that the scan holds. So a scan takes one reference count, on its layers, and none per source.
+//! The cursors hold positions, not references: they read their buffer, view or file through the
+//! layers that the scan holds. So a scan takes one reference count, on its layers, and none per
+//! source.
 //!
-//! With the delta view (see the `view` module), the runs have one cursor, on the view, instead of
-//! one each: it walks the view's entries and reads each row from its run file by its locator. The
-//! versions of a key are adjacent in the view, newest first, so the cursor finds the newest visible
-//! version of a key, and leaves the key, with no key comparison between runs. A run whose versions
-//! are all above the scan's sequence number is skipped by its interval, without reading its rows,
+//! The view cursor walks the view's entries and reads each row from its run file by its locator.
+//! The versions of a key are adjacent in the view, newest first, so the cursor finds the newest
+//! visible version of a key, and leaves the key, with no key comparison between runs. A run whose
+//! versions are all above the scan's sequence number is skipped by its interval without a read,
 //! and only a run whose interval holds that number has its rows' sequence numbers read.
+//!
+//! Rows come back as slices of copies of the run files, never of the mapping, so a row that the
+//! caller keeps never keeps a file. The view cursor holds a few copies, the most recently used
+//! one per run ([`PAGE_COPIES`] of them). When it returns a row that no copy holds, it copies the
+//! row's page from that row to the end of the last row of the page that the next entries of the
+//! view take from it, looking a few entries ahead, and not past more runs than it has copies for
+//! ([`DeltaView::page_mates`]): so the rows of one page that a scan returns close together share
+//! one copy and one allocation. For the first copy of a run it looks [`FIRST_LOOKAHEAD`] entries
+//! ahead, and for each next copy of the same run, which replaces the run's last one, twice as far
+//! as for the last, up to [`LOOKAHEAD`]: so a short scan copies about the rows that it returns,
+//! however many runs it reads, and a long scan of one run copies the rest of each page once. With
+//! positional reads, it reads the rest of the page once for the rows that it takes from it, and
+//! parses rows and keys from that copy.
 
 use std::collections::VecDeque;
 use std::io;
@@ -38,12 +52,12 @@ use super::buffer::{Cursor, Kind, Version};
 use super::delta::{past_end, to_row, Delta};
 use super::file::RowSpan;
 use super::view::DeltaView;
-use super::{Layers, Run};
+use super::Layers;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::iter::RowEntryIterator;
 use crate::merge_operator::MergeOperatorType;
-use crate::range_cache::file::{RangeFile, RangeFileCursor};
+use crate::range_cache::file::RangeFileCursor;
 use crate::types::{RowEntry, ValueDeletable};
 
 /// Buffer `i` of `layers`, in the order of [`Layers::buffers`]: 0 is the active buffer.
@@ -58,6 +72,8 @@ fn buffer_of(layers: &Layers, i: usize) -> &Delta {
 /// position in the buffer: the scan reads it through the layers that it holds, so the cursor
 /// takes no reference of its own and reads the buffer in place.
 struct DeltaCursor {
+    /// The buffer, in the order of [`Layers::buffers`].
+    index: usize,
     pos: Cursor,
     seq: u64,
     /// `pos` is at the newest visible version of its key, which the scan has not used yet.
@@ -67,8 +83,9 @@ struct DeltaCursor {
 }
 
 impl DeltaCursor {
-    fn new(delta: &Delta, start: Bound<&[u8]>, seq: u64) -> Self {
+    fn new(index: usize, delta: &Delta, start: Bound<&[u8]>, seq: u64) -> Self {
         Self {
+            index,
             pos: delta.buffer().seek(start),
             seq,
             peeked: false,
@@ -133,86 +150,48 @@ impl DeltaCursor {
     }
 }
 
-/// A cursor over the versions of a run that are visible at one sequence number. Like
-/// [`DeltaCursor`], it reads the run's file through the layers that the scan holds.
-struct RunCursor {
-    cursor: RangeFileCursor,
-    seq: u64,
-    /// The cursor is at the newest visible version of its key, which the scan has not used yet.
-    peeked: bool,
+/// How many page copies a view cursor keeps: so many runs can interleave in a scan before a copy
+/// that still holds rows for it is replaced.
+const PAGE_COPIES: usize = 4;
+/// How far a view cursor looks ahead in the view for the rows of a page that it copies, at most.
+const LOOKAHEAD: usize = 64;
+/// How far a view cursor looks ahead for its first copy of a run. It doubles with each next copy
+/// of the run.
+const FIRST_LOOKAHEAD: usize = 4;
+
+/// Bytes of one page of a run that a view cursor copied: the file from offset `at`.
+struct PageCopy {
+    slot: u8,
+    at: u64,
+    bytes: Bytes,
+    /// The cursor's count of uses when it last used this copy. The least recently used copy is
+    /// the one replaced, unless the run has a copy.
+    used: u64,
+    /// How far the cursor looked ahead for this copy.
+    lookahead: usize,
 }
 
-impl RunCursor {
-    fn new(run: &Run, start: Bound<&[u8]>, end: Bound<Bytes>, seq: u64) -> io::Result<Self> {
-        Ok(Self {
-            cursor: RangeFileCursor::with_bounds(&run.file, start, end)?,
-            seq,
-            peeked: false,
-        })
-    }
-
-    /// Moves to the newest visible version of the next key, unless the cursor is at one.
-    fn fill(&mut self, file: &RangeFile) -> io::Result<()> {
-        while !self.peeked {
-            match self.cursor.seq() {
-                None => return Ok(()),
-                Some(seq) if seq <= self.seq => self.peeked = true,
-                Some(_) => self.cursor.skip(file)?,
-            }
-        }
-        Ok(())
-    }
-
-    fn key(&self) -> Option<&[u8]> {
-        if self.peeked {
-            self.cursor.key()
-        } else {
-            None
-        }
-    }
-
-    /// The version that `fill` found, then leaves its key.
-    fn take(&mut self, file: &RangeFile) -> io::Result<RowEntry> {
-        let row = self.cursor.take(file)?;
-        self.peeked = false;
-        self.skip_key(file, &row.key)?;
-        Ok(row)
-    }
-
-    /// Leaves `key` if the cursor is at one of its versions, visible or not.
-    fn skip_key(&mut self, file: &RangeFile, key: &[u8]) -> io::Result<()> {
-        let mut moved = false;
-        while self.cursor.key() == Some(key) {
-            self.cursor.skip(file)?;
-            moved = true;
-        }
-        if moved {
-            self.peeked = false;
-        }
-        Ok(())
-    }
-
-    /// Moves forward to the first key at or after `key`. It never moves backwards.
-    fn seek(&mut self, file: &RangeFile, key: &[u8]) -> io::Result<()> {
-        if self.cursor.key().is_some_and(|current| current < key) {
-            self.cursor.seek(file, key)?;
-            self.peeked = false;
-        }
-        Ok(())
+impl PageCopy {
+    /// True if the copy holds `[start, end)` of the file of `slot`, or, without an end, the rest
+    /// of the page from `start` (positional reads copy pages to their end).
+    fn holds(&self, slot: u8, start: u64, end: Option<u64>) -> bool {
+        let copy_end = self.at + self.bytes.len() as u64;
+        self.slot == slot && self.at <= start && end.map_or(start < copy_end, |e| e <= copy_end)
     }
 }
 
-/// The key of a view cursor's version: a span of a mapped run file, or a copy (positional reads,
-/// whose files the cursor cannot borrow).
+/// The key of a view cursor's version: a span of a mapped run file, or a slice of a copy
+/// (positional reads, whose files the cursor cannot borrow).
 enum ViewKey {
     None,
     Mapped { slot: u8, at: usize, len: usize },
-    Owned(Bytes),
+    Copied(Bytes),
 }
 
 /// A cursor over the versions of all runs of a range that are visible at one sequence number,
 /// through the range's delta view. Like the other cursors, it is a position: it reads the view and
-/// the run files through the layers that the scan holds.
+/// the run files through the layers that the scan holds. It returns rows as slices of its page
+/// copies (see the module documentation).
 struct ViewCursor {
     /// The entry of the view.
     pos: usize,
@@ -224,6 +203,8 @@ struct ViewCursor {
     /// The row and the key of the peeked version.
     row: Option<RowSpan>,
     key: ViewKey,
+    copies: [Option<PageCopy>; PAGE_COPIES],
+    uses: u64,
 }
 
 /// The view of `layers`. A view cursor exists only for layers with a view.
@@ -243,7 +224,67 @@ impl ViewCursor {
             done: false,
             row: None,
             key: ViewKey::None,
+            copies: Default::default(),
+            uses: 0,
         })
+    }
+
+    /// The copy that holds `[start, end)` of the file of entry `i`'s run, where `start` is the
+    /// offset of entry `i`'s row and `end` its end, if known. A copy is made if none holds it:
+    /// of a mapped file, from `start` to the end of the last row of the page that the next
+    /// entries take ([`DeltaView::page_mates`]); with positional reads, from `start` to the end
+    /// of the page. It replaces the run's copy, whose rows the cursor passed (a run's rows are in
+    /// the view in file order), or else the least recently used copy.
+    fn copy_for(&mut self, view: &DeltaView, i: usize, end: Option<u64>) -> io::Result<&PageCopy> {
+        self.uses += 1;
+        let (slot, start) = (view.slot_of(i), view.offset(i));
+        let found = self
+            .copies
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| c.holds(slot, start, end)));
+        let at = match found {
+            Some(at) => at,
+            None => {
+                let file = &view.run_in(slot).file;
+                let page_end = file.page_end(start)?;
+                let own = self
+                    .copies
+                    .iter()
+                    .position(|c| c.as_ref().is_some_and(|c| c.slot == slot));
+                let lookahead = match own.and_then(|at| self.copies[at].as_ref()) {
+                    Some(copy) => (copy.lookahead * 2).min(LOOKAHEAD),
+                    None => FIRST_LOOKAHEAD,
+                };
+                let copy_end = match (file.mapped(), end) {
+                    (Some(_), Some(end)) => {
+                        match view.page_mates(i, page_end, lookahead, PAGE_COPIES - 1) {
+                            last if last == i => end,
+                            last => view.row(last)?.end.max(end),
+                        }
+                    }
+                    _ => page_end,
+                };
+                let bytes = file.copy_at(start, (copy_end - start) as usize)?;
+                let at = own.unwrap_or_else(|| {
+                    (0..PAGE_COPIES)
+                        .min_by_key(|&c| self.copies[c].as_ref().map_or(0, |c| c.used))
+                        .unwrap_or(0)
+                });
+                self.copies[at] = Some(PageCopy {
+                    slot,
+                    at: start,
+                    bytes,
+                    used: 0,
+                    lookahead,
+                });
+                at
+            }
+        };
+        let copy = self.copies[at]
+            .as_mut()
+            .ok_or_else(|| io::Error::other("range cache view cursor lost a copy"))?;
+        copy.used = self.uses;
+        Ok(copy)
     }
 
     /// Moves to the newest visible version of the next key, unless the cursor is at one. Versions
@@ -260,55 +301,51 @@ impl ViewCursor {
                 self.pos += 1;
                 continue;
             }
-            let row = run.file.row_at(view.offset(self.pos))?;
+            let (row, key) = match run.file.mapped() {
+                Some(map) => {
+                    let row = run.file.row_at(view.offset(self.pos))?;
+                    let (at, len) = row.key;
+                    let at = usize::try_from(at).map_err(|_| io::Error::other("key offset"))?;
+                    if map.len() < at + len {
+                        return Err(io::Error::other("range cache view: key past the file"));
+                    }
+                    let slot = view.slot_of(self.pos);
+                    (row, ViewKey::Mapped { slot, at, len })
+                }
+                None => {
+                    let offset = view.offset(self.pos);
+                    let copy = self.copy_for(view, self.pos, None)?;
+                    let row = RowSpan::parse(&copy.bytes, copy.at, offset)?;
+                    let key = row.key_in(&copy.bytes, copy.at, &run.file)?;
+                    (row, ViewKey::Copied(key))
+                }
+            };
             if run.hi > self.seq && row.seq > self.seq {
                 self.pos += 1;
                 continue;
             }
-            let (at, len) = row.key;
-            let key = match run.file.mapped() {
-                Some(map) => {
-                    let at = usize::try_from(at).map_err(|_| io::Error::other("key offset"))?;
-                    let key = map
-                        .get(at..at + len)
-                        .ok_or_else(|| io::Error::other("range cache view: key past the file"))?;
-                    if past_end(end, key) {
-                        self.done = true;
-                        break;
-                    }
-                    ViewKey::Mapped {
-                        slot: view.slot_of(self.pos),
-                        at,
-                        len,
-                    }
-                }
-                None => {
-                    let key = Bytes::copy_from_slice(&run.file.bytes_at(at, len)?);
-                    if past_end(end, &key) {
-                        self.done = true;
-                        break;
-                    }
-                    ViewKey::Owned(key)
-                }
-            };
             self.row = Some(row);
             self.key = key;
+            if self.key(view).is_none_or(|key| past_end(end, key)) {
+                self.done = true;
+                self.row = None;
+                self.key = ViewKey::None;
+                break;
+            }
             self.peeked = true;
         }
         Ok(())
     }
 
+    /// The key of the version that `fill` found, or of the version it is checking.
     fn key<'a>(&'a self, view: &'a DeltaView) -> Option<&'a [u8]> {
-        if !self.peeked {
-            return None;
-        }
         match &self.key {
             ViewKey::Mapped { slot, at, len } => view
                 .run_in(*slot)
                 .file
                 .mapped()
                 .and_then(|map| map.get(*at..*at + *len)),
-            ViewKey::Owned(key) => Some(key),
+            ViewKey::Copied(key) => Some(key),
             ViewKey::None => None,
         }
     }
@@ -325,7 +362,7 @@ impl ViewCursor {
                 .mapped()
                 .and_then(|map| map.get(*at..*at + *len))
                 .map(StepKey::Buffer),
-            ViewKey::Owned(key) => Some(StepKey::Run(key.clone())),
+            ViewKey::Copied(key) => Some(StepKey::Run(key.clone())),
             ViewKey::None => None,
         }
     }
@@ -338,12 +375,14 @@ impl ViewCursor {
         self.key = ViewKey::None;
     }
 
-    /// The version that `fill` found, copied out, then leaves its key.
+    /// The version that `fill` found, as slices of a page copy, then leaves its key.
     fn take(&mut self, view: &DeltaView) -> io::Result<RowEntry> {
         let row = self
             .row
             .ok_or_else(|| io::Error::other("range cache view cursor has no current row"))?;
-        let entry = view.run_of(self.pos).file.decode_span(&row)?;
+        let pos = self.pos;
+        let copy = self.copy_for(view, pos, Some(row.end))?;
+        let entry = row.entry_in(&copy.bytes, copy.at, &view.run_of(pos).file)?;
         self.leave(view);
         Ok(entry)
     }
@@ -353,9 +392,9 @@ impl ViewCursor {
         if self.done || self.pos >= view.len() {
             return Ok(());
         }
-        let here = match self.key(view) {
-            Some(current) => current == key,
-            None => view_key_at(view, self.pos)?.as_ref() == key,
+        let here = match self.peeked {
+            true => self.key(view) == Some(key),
+            false => view.key(self.pos)?.as_ref() == key,
         };
         if here {
             self.leave(view);
@@ -365,7 +404,7 @@ impl ViewCursor {
 
     /// Moves forward to the first key at or after `key`. It never moves backwards.
     fn seek(&mut self, view: &DeltaView, key: &[u8]) -> io::Result<()> {
-        if self.done || self.key(view).is_some_and(|current| current >= key) {
+        if self.done || (self.peeked && self.key(view).is_some_and(|current| current >= key)) {
             return Ok(());
         }
         let to = view.seek(Included(key))?;
@@ -379,69 +418,8 @@ impl ViewCursor {
     }
 }
 
-/// The key of entry `i` of `view`, read from its run file.
-fn view_key_at(view: &DeltaView, i: usize) -> io::Result<Bytes> {
-    let row = view.row(i)?;
-    let file = &view.run_of(i).file;
-    Ok(Bytes::copy_from_slice(
-        &file.bytes_at(row.key.0, row.key.1)?,
-    ))
-}
-
-/// A cursor over one buffer or run of the current part, or over its delta view, with its place in
-/// the layers. A run's cursor is large (it holds a page copy and the page's row offsets), so it is
-/// boxed.
-enum Source {
-    Buffer(usize, DeltaCursor),
-    Run(usize, Box<RunCursor>),
-    View(ViewCursor),
-}
-
-impl Source {
-    fn fill(&mut self, layers: &Layers, end: &Bound<Bytes>) -> io::Result<()> {
-        match self {
-            Source::Buffer(i, cursor) => {
-                cursor.fill(buffer_of(layers, *i), end);
-                Ok(())
-            }
-            Source::Run(i, cursor) => cursor.fill(&layers.runs[*i].file),
-            Source::View(cursor) => cursor.fill(view_of(layers), end),
-        }
-    }
-
-    /// The key of the version that `fill` found.
-    fn key<'a>(&'a self, layers: &'a Layers) -> Option<&'a [u8]> {
-        match self {
-            Source::Buffer(i, cursor) => cursor.key(buffer_of(layers, *i)),
-            Source::Run(_, cursor) => cursor.key(),
-            Source::View(cursor) => cursor.key(view_of(layers)),
-        }
-    }
-
-    fn skip_key(&mut self, layers: &Layers, key: &[u8]) -> io::Result<()> {
-        match self {
-            Source::Buffer(i, cursor) => {
-                cursor.skip_key(buffer_of(layers, *i), key);
-                Ok(())
-            }
-            Source::Run(i, cursor) => cursor.skip_key(&layers.runs[*i].file, key),
-            Source::View(cursor) => cursor.skip_key(view_of(layers), key),
-        }
-    }
-
-    fn seek(&mut self, layers: &Layers, key: &[u8]) -> io::Result<()> {
-        match self {
-            Source::Buffer(i, cursor) => {
-                cursor.seek(buffer_of(layers, *i), key);
-                Ok(())
-            }
-            Source::Run(i, cursor) => cursor.seek(&layers.runs[*i].file, key),
-            Source::View(cursor) => cursor.seek(view_of(layers), key),
-        }
-    }
-}
-
-/// The key of the version that a step takes, borrowed from a buffer or held by the run's row.
+/// The key of the version that a step takes, borrowed from a buffer or a mapped file, or held by
+/// a copy.
 enum StepKey<'a> {
     Buffer(&'a [u8]),
     Run(Bytes),
@@ -454,16 +432,6 @@ impl StepKey<'_> {
             StepKey::Run(key) => key,
         }
     }
-}
-
-/// Returns true if a run can hold a key of `[start, end)`.
-fn run_meets(run: &Run, start: Bound<&[u8]>, end: &Bound<Bytes>) -> bool {
-    let after_start = match start {
-        Unbounded => true,
-        Included(start) => run.max_key.as_ref() >= start,
-        Excluded(start) => run.max_key.as_ref() > start,
-    };
-    after_start && !past_end(end, &run.min_key)
 }
 
 /// The smaller of a scan's end bound and a range's exclusive end.
@@ -486,6 +454,13 @@ enum Step {
     End,
 }
 
+/// The source of the version that a step takes.
+#[derive(Clone, Copy)]
+enum Best {
+    Buffer(usize),
+    View,
+}
+
 /// A scan of the pinned layers of one or more adjacent cached ranges. See the module
 /// documentation.
 pub(crate) struct CachedScan {
@@ -500,9 +475,12 @@ pub(crate) struct CachedScan {
     seq: u64,
     /// A cursor over the base of the current layers, which it reads through `layers`.
     base: Option<RangeFileCursor>,
-    /// A cursor for each buffer and run of the current layers that can hold a visible version,
-    /// newest first.
-    sources: Vec<Source>,
+    /// A cursor for each buffer of the current layers that can hold a visible version, newest
+    /// first.
+    buffers: Vec<DeltaCursor>,
+    /// A cursor over the view of the current layers' runs, if one of them can hold a visible
+    /// version.
+    view: Option<ViewCursor>,
     merge_operator: Option<MergeOperatorType>,
     /// A merge-operand key that `next_sync` found and left for `next` to resolve.
     unresolved: Option<Bytes>,
@@ -532,7 +510,8 @@ impl CachedScan {
             scan_end,
             seq,
             base: None,
-            sources: Vec::new(),
+            buffers: Vec::new(),
+            view: None,
             merge_operator,
             unresolved: None,
             point: range.as_point().is_some(),
@@ -557,34 +536,21 @@ impl CachedScan {
             None => None,
         };
         let seq = self.seq;
-        self.sources.clear();
+        self.buffers.clear();
         // A buffer that is empty now holds no version at or below `seq`: the writer puts each
         // version in its buffer before it commits it, and `seq` was loaded before this call (see
         // Appendix B of RFC 0040). A buffer or run whose versions are all above `seq` holds
         // nothing for the scan either. So the scan skips them.
         for (i, delta) in layers.buffers().enumerate() {
             if !delta.is_empty() && delta.lo() < seq {
-                self.sources
-                    .push(Source::Buffer(i, DeltaCursor::new(delta, start, seq)));
+                self.buffers.push(DeltaCursor::new(i, delta, start, seq));
             }
         }
-        match &layers.view {
-            // One cursor for every run.
-            Some(view) => {
-                if !view.is_empty() && view.has_visible(seq) {
-                    self.sources
-                        .push(Source::View(ViewCursor::new(view, start, seq)?));
-                }
-            }
-            None => {
-                for (i, run) in layers.runs.iter().enumerate() {
-                    if run.lo < seq && run.file.rows() > 0 && run_meets(run, start, &end) {
-                        let cursor = RunCursor::new(run, start, end.clone(), seq)?;
-                        self.sources.push(Source::Run(i, Box::new(cursor)));
-                    }
-                }
-            }
-        }
+        // One cursor for every run.
+        self.view = match &layers.view {
+            Some(view) if view.has_visible(seq) => Some(ViewCursor::new(view, start, seq)?),
+            _ => None,
+        };
         self.part_end = end;
         Ok(())
     }
@@ -616,16 +582,26 @@ impl CachedScan {
     fn step(&mut self) -> io::Result<Step> {
         loop {
             let layers = &*self.layers;
-            for source in self.sources.iter_mut() {
-                source.fill(layers, &self.part_end)?;
+            for cursor in self.buffers.iter_mut() {
+                cursor.fill(buffer_of(layers, cursor.index), &self.part_end);
             }
-            // The newest source with the smallest key. On a tie, the newer source wins.
-            let mut best: Option<(usize, &[u8])> = None;
-            for (i, source) in self.sources.iter().enumerate() {
-                if let Some(key) = source.key(layers) {
+            if let Some(cursor) = self.view.as_mut() {
+                cursor.fill(view_of(layers), &self.part_end)?;
+            }
+            // The newest source with the smallest key. On a tie, the newer source wins: buffers
+            // are newer than runs, and earlier buffers newer than later ones.
+            let mut best: Option<(Best, &[u8])> = None;
+            for (i, cursor) in self.buffers.iter().enumerate() {
+                if let Some(key) = cursor.key(buffer_of(layers, cursor.index)) {
                     if best.is_none_or(|(_, best_key)| key < best_key) {
-                        best = Some((i, key));
+                        best = Some((Best::Buffer(i), key));
                     }
+                }
+            }
+            let view_key = self.view.as_ref().filter(|c| c.peeked);
+            if let Some(key) = view_key.and_then(|c| c.key(view_of(layers))) {
+                if best.is_none_or(|(_, best_key)| key < best_key) {
+                    best = Some((Best::View, key));
                 }
             }
             let base_key = self.base.as_ref().and_then(|base| base.key());
@@ -635,7 +611,7 @@ impl CachedScan {
                 (None, Some(_)) => Some(std::cmp::Ordering::Greater),
                 (Some(base_key), Some((_, key))) => Some(base_key.cmp(key)),
             };
-            let best = best.map(|(i, _)| i);
+            let best = best.map(|(b, _)| b);
             let Some(order) = order else {
                 if self.next_part()? {
                     continue;
@@ -657,27 +633,37 @@ impl CachedScan {
                     cursor.skip(file)?;
                 }
             }
-            let Some(b) = best else {
+            let Some(best) = best else {
                 return Ok(Step::End);
             };
             // The key of the version to take. Older sources that hold it lose.
-            let key = match &self.sources[b] {
-                Source::Buffer(i, cursor) => cursor.key(buffer_of(layers, *i)).map(StepKey::Buffer),
-                Source::Run(_, cursor) => cursor.cursor.key_bytes().map(StepKey::Run),
-                Source::View(cursor) => cursor.step_key(view_of(layers)),
+            let key = match best {
+                Best::Buffer(b) => {
+                    let cursor = &self.buffers[b];
+                    cursor
+                        .key(buffer_of(layers, cursor.index))
+                        .map(StepKey::Buffer)
+                }
+                Best::View => self.view.as_ref().and_then(|c| c.step_key(view_of(layers))),
             };
             let Some(key) = key else {
                 return Ok(Step::End);
             };
-            for (j, source) in self.sources.iter_mut().enumerate() {
-                if j != b {
-                    source.skip_key(layers, key.as_bytes())?;
+            for (j, cursor) in self.buffers.iter_mut().enumerate() {
+                if !matches!(best, Best::Buffer(b) if b == j) {
+                    cursor.skip_key(buffer_of(layers, cursor.index), key.as_bytes());
+                }
+            }
+            if !matches!(best, Best::View) {
+                if let Some(cursor) = self.view.as_mut() {
+                    cursor.skip_key(view_of(layers), key.as_bytes())?;
                 }
             }
             // Copy out only what the scan returns.
-            let step = match &mut self.sources[b] {
-                Source::Buffer(i, cursor) => {
-                    let delta = buffer_of(layers, *i);
+            let step = match best {
+                Best::Buffer(b) => {
+                    let cursor = &mut self.buffers[b];
+                    let delta = buffer_of(layers, cursor.index);
                     let step = cursor
                         .version(delta)
                         .and_then(|version| match version.kind {
@@ -688,16 +674,11 @@ impl CachedScan {
                     cursor.skip_key(delta, key.as_bytes());
                     step
                 }
-                Source::Run(i, cursor) => {
-                    let row = cursor.take(&layers.runs[*i].file)?;
-                    match row.value {
-                        ValueDeletable::Value(_) => Some(Step::Row(row)),
-                        ValueDeletable::Tombstone => None,
-                        ValueDeletable::Merge(_) => Some(Step::Resolve(row.key)),
-                    }
-                }
-                Source::View(cursor) => {
+                Best::View => {
                     let view = view_of(layers);
+                    let Some(cursor) = self.view.as_mut() else {
+                        return Ok(Step::End);
+                    };
                     // A tombstone or a merge operand needs no copy of its value.
                     match cursor.row.map(|row| row.kind()) {
                         Some(Kind::Tombstone) => {
@@ -789,8 +770,11 @@ impl RowEntryIterator for CachedScan {
             cursor.seek(file, next_key)?;
         }
         let layers = &*self.layers;
-        for source in self.sources.iter_mut() {
-            source.seek(layers, next_key)?;
+        for cursor in self.buffers.iter_mut() {
+            cursor.seek(buffer_of(layers, cursor.index), next_key);
+        }
+        if let Some(cursor) = self.view.as_mut() {
+            cursor.seek(view_of(layers), next_key)?;
         }
         Ok(())
     }
@@ -816,8 +800,9 @@ mod tests {
     use super::*;
     use crate::db_iter::DbIterator;
     use crate::range_cache::delta::DeltaMemory;
-    use crate::range_cache::file::{RangeCachePageSource, RangeFileWriter};
+    use crate::range_cache::file::{RangeCachePageSource, RangeFile, RangeFileWriter, RowLocators};
     use crate::range_cache::view::{BuildCost, ViewMemory};
+    use crate::range_cache::Run;
     use crate::read_trace::ReadTrace;
     use crate::test_utils::StringConcatMergeOperator;
     use proptest::prelude::*;
@@ -886,15 +871,16 @@ mod tests {
     struct Shape {
         cuts: Vec<u64>,
         runs: usize,
-        /// How the delta view of the runs is built, if any: 0 no view (per-run cursors), 1 from
-        /// all runs at once, 2 run by run as flushes build it, 3 run by run on top of two older
-        /// runs below the base that a major merge then drops, as `without` does.
+        /// How the delta view of the runs is built: 0 from the run files alone, 1 run by run as
+        /// flushes build it, 2 run by run on top of two older runs below the base that a major
+        /// merge then drops, 3 run by run with the newest run written as a flush at the run cap,
+        /// which merged a buffer and two runs that the view held and then drops.
         view: u8,
         /// How run `i` is written, by the three bits at `3 * i`: 0 straight from its versions,
-        /// 1 as a flush of two sealed buffers that split its interval, 2 as a minor merge of two
-        /// runs that split it, 3 as a flush-merge of a buffer with a run, 4 and 5 as minor merges
-        /// of three and four runs (cascades of merges by similar size), 6 as a flush-merge of a
-        /// buffer with two runs, 7 as a flush-merge of two buffers with two runs.
+        /// 1 and 2 as a flush of two and three sealed buffers that split its interval, and as a
+        /// flush at the run cap otherwise, which merges buffers with the newest runs: 3 a buffer
+        /// and a run, 4 two buffers and a run, 5 three buffers and two runs, 6 a buffer and two
+        /// runs, 7 two buffers and two runs.
         writes: u32,
     }
 
@@ -902,10 +888,10 @@ mod tests {
     fn merge_inputs(how: u32) -> (usize, usize) {
         match how {
             1 => (2, 0),
-            2 => (0, 2),
+            2 => (3, 0),
             3 => (1, 1),
-            4 => (0, 3),
-            5 => (0, 4),
+            4 => (2, 1),
+            5 => (3, 2),
             6 => (1, 2),
             _ => (2, 2),
         }
@@ -1002,14 +988,20 @@ mod tests {
             .chain(std::iter::once(MAX_SEQ))
             .collect();
         let intervals = bounds.len() - 1;
+        // A run of `(lo, hi]` written as a flush writes it, with its row locators.
+        let finish = |writer: RangeFileWriter, lo: u64, hi: u64| {
+            let (path, rows) = writer.finish_with_locators().unwrap();
+            let file = RangeFile::open(path, page_source, disk.clone()).unwrap();
+            (Arc::new(Run::new(file, lo, hi).unwrap()), rows)
+        };
         let file_of = |file_name: String, lo: u64, hi: u64| {
-            let mut writer = RangeFileWriter::create_run(dir, &file_name, 512).unwrap();
+            let mut writer = RangeFileWriter::create_run(dir, &file_name, 512)
+                .unwrap()
+                .with_locators();
             for row in versions(lo, hi) {
                 writer.push(&row).unwrap();
             }
-            let path = writer.finish().unwrap();
-            let file = RangeFile::open(path, page_source, disk.clone()).unwrap();
-            Run::new(file, lo, hi).unwrap()
+            finish(writer, lo, hi)
         };
         let buffer_of = |lo: u64, hi: u64| {
             let delta = Delta::for_test(&DeltaMemory::detached(), lo);
@@ -1020,16 +1012,25 @@ mod tests {
             drop(writer);
             delta
         };
-        let mut runs = Vec::new();
+        // Oldest first.
+        let mut runs: Vec<(Arc<Run>, RowLocators)> = Vec::new();
+        // With view shape 3, the runs that the newest run's flush replaced, newest first.
+        let mut replaced: Vec<(Arc<Run>, RowLocators)> = Vec::new();
         for i in 0..shape.runs {
             let (lo, hi) = (bounds[i], bounds[i + 1]);
-            let run = match (shape.writes >> (3 * i)) & 7 {
+            let at_cap = shape.view == 3 && i + 1 == shape.runs;
+            let how = if at_cap {
+                6
+            } else {
+                (shape.writes >> (3 * i)) & 7
+            };
+            let run = match how {
                 0 => file_of(format!("{name}-run{i}"), lo, hi),
                 how => {
                     // Inputs that split the interval into parts, written by the merge of
-                    // flushes, flush-merges and minor merges. Part `j`, newest first, covers
+                    // flushes and flushes at the run cap. Part `j`, newest first, covers
                     // `(edges[parts - j - 1], edges[parts - j]]`; the newest parts are the
-                    // sealed buffers, as in a flush-merge. Parts can be empty.
+                    // sealed buffers. Parts can be empty.
                     let (buffer_parts, run_parts) = merge_inputs(how);
                     let parts = buffer_parts + run_parts;
                     let edges: Vec<u64> = (0..=parts)
@@ -1042,28 +1043,30 @@ mod tests {
                             (buffer_of(l, h), h)
                         })
                         .collect();
-                    let merged: Vec<Run> = (buffer_parts..parts)
+                    let merged: Vec<(Arc<Run>, RowLocators)> = (buffer_parts..parts)
                         .map(|j| {
                             let (l, h) = part(j);
                             file_of(format!("{name}-run{i}-part{j}"), l, h)
                         })
                         .collect();
                     let buffers: Vec<(&Delta, u64)> = sealed.iter().map(|(d, s)| (d, *s)).collect();
-                    let inputs: Vec<&Run> = merged.iter().collect();
+                    let inputs: Vec<&Run> = merged.iter().map(|(r, _)| &**r).collect();
                     let mut writer =
-                        RangeFileWriter::create_run(dir, &format!("{name}-run{i}"), 512).unwrap();
+                        RangeFileWriter::create_run(dir, &format!("{name}-run{i}"), 512)
+                            .unwrap()
+                            .with_locators();
                     let written =
                         crate::range_cache::merge::merge_versions(&mut writer, &buffers, &inputs)
                             .unwrap();
                     assert_eq!(written as usize, versions(lo, hi).len());
-                    let path = writer.finish().unwrap();
-                    let file = RangeFile::open(path, page_source, disk.clone()).unwrap();
-                    Run::new(file, lo, hi).unwrap()
+                    if at_cap {
+                        replaced = merged;
+                    }
+                    finish(writer, lo, hi)
                 }
             };
-            runs.push(Arc::new(run));
+            runs.push(run);
         }
-        runs.reverse();
         let buffer = |lo: u64, hi: u64| {
             let delta = Delta::for_test(&DeltaMemory::detached(), lo);
             let mut writer = delta.writer();
@@ -1073,31 +1076,41 @@ mod tests {
             drop(writer);
             Arc::new(delta)
         };
+        let newest_first: Vec<Arc<Run>> = runs.iter().rev().map(|(r, _)| r.clone()).collect();
         let view = match shape.view {
             _ if runs.is_empty() => None,
-            0 => None,
-            1 => Some(DeltaView::from_runs(&runs, &memory, &mut cost).unwrap()),
+            0 => Some(DeltaView::from_runs(&newest_first, &memory, &mut cost).unwrap()),
             how => {
-                // Oldest first, as flushes build it; with `how == 3`, on top of two older runs
+                // Oldest first, as flushes build it; with `how == 2`, on top of two older runs
                 // that hold versions below the base, which a major merge then absorbs.
-                let older: Vec<Arc<Run>> = if how == 3 {
+                let older: Vec<(Arc<Run>, RowLocators)> = if how == 2 {
                     vec![
-                        Arc::new(file_of(format!("{name}-gone0"), 0, BASE_SEQ / 2)),
-                        Arc::new(file_of(format!("{name}-gone1"), BASE_SEQ / 2, BASE_SEQ)),
+                        file_of(format!("{name}-gone0"), 0, BASE_SEQ / 2),
+                        file_of(format!("{name}-gone1"), BASE_SEQ / 2, BASE_SEQ),
                     ]
                 } else {
                     Vec::new()
                 };
-                let mut all = older.iter().chain(runs.iter().rev());
-                let first = all.next().unwrap();
-                let mut view =
-                    DeltaView::from_runs(std::slice::from_ref(first), &memory, &mut cost).unwrap();
-                for run in all {
-                    view = view.with_run(run, &mut cost).unwrap();
+                // With `how == 3`, the newest run comes from a flush at the run cap: the view
+                // held the runs that it replaced, newest last.
+                let flushed = match how {
+                    3 => &runs[..runs.len() - 1],
+                    _ => &runs[..],
+                };
+                let mut view = DeltaView::empty(&memory);
+                for (run, rows) in older.iter().chain(flushed).chain(replaced.iter().rev()) {
+                    view = view.with_run(run, rows, &mut cost).unwrap();
+                }
+                if how == 2 {
+                    let gone: Vec<Arc<Run>> = older.iter().rev().map(|(r, _)| r.clone()).collect();
+                    view = view.without(&gone, &mut cost).unwrap().unwrap();
                 }
                 if how == 3 {
-                    let gone: Vec<Arc<Run>> = older.iter().rev().cloned().collect();
-                    view = view.without(&gone, &mut cost).unwrap().unwrap();
+                    let gone: Vec<Arc<Run>> = replaced.iter().map(|(r, _)| r.clone()).collect();
+                    let (run, rows) = runs.last().unwrap();
+                    view =
+                        DeltaView::after_flush(Some(&view), &gone, run, rows, &memory, &mut cost)
+                            .unwrap();
                 }
                 Some(view)
             }
@@ -1105,6 +1118,7 @@ mod tests {
         if let Some(view) = &view {
             view.check().unwrap();
         }
+        let runs = newest_first;
         let mut sealed = Vec::new();
         for i in shape.runs..intervals - 1 {
             let delta = buffer(bounds[i], bounds[i + 1]);
@@ -1155,7 +1169,9 @@ mod tests {
 
         /// The direct scan returns exactly what the normal iterator stack returns over the same
         /// layers at the same sequence number, also after a seek. The layers have a base, up to
-        /// eight runs, sealed buffers and the active buffer. With `split`, the scan walks two
+        /// nine runs read through a view built from scratch, flush by flush, after a major merge
+        /// or after a flush at the run cap, sealed buffers and the active buffer, in mapped files
+        /// or with positional reads. With `split`, the scan walks two
         /// adjacent ranges, split at that key, and the normal stack reads the unsplit layers.
         #[test]
         fn should_match_the_normal_iterator_stack(
@@ -1224,7 +1240,7 @@ mod tests {
         /// of the whole history at that number, as the normal path over all versions would.
         ///
         /// The history is one table of all versions. The base holds its state at `BASE_SEQ`,
-        /// written the way a load or a major merge writes it; up to eight runs, sealed buffers and
+        /// written the way a load or a major merge writes it; up to nine runs, sealed buffers and
         /// the active buffer hold the versions after the base. Unlike the test above, which reads
         /// the same layers both ways, the expected answer here does not come from the layers.
         /// Keys have many versions, so a run often holds several versions of a key, across its
@@ -1289,19 +1305,6 @@ mod tests {
                         .unwrap(),
                     };
                     assert_eq!(got, want, "key {k} at {seq} in {shape:?}");
-                    // The same read with the runs searched through the view.
-                    let through_view = match crate::range_cache::lookup_view(&layers, &key(k), seq).unwrap() {
-                        crate::range_cache::Found::Value(kv) => Some(kv),
-                        crate::range_cache::Found::Absent => None,
-                        crate::range_cache::Found::Merge => crate::range_cache::Pinned {
-                            layers: layers.clone(),
-                            seq,
-                        }
-                        .get(&key(k), Some(merge.clone()))
-                        .await
-                        .unwrap(),
-                    };
-                    assert_eq!(through_view, want, "view read of key {k} at {seq} in {shape:?}");
                 }
             });
         }

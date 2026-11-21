@@ -49,6 +49,13 @@ pub const LOAD_BYTES: &str = range_cache_stat_name!("load_bytes");
 pub const LOAD_REJECTED_COUNT: &str = range_cache_stat_name!("load_rejected_count");
 /// Major merges: rebuilds of a range's base from its base and runs.
 pub const REBUILD_COUNT: &str = range_cache_stat_name!("rebuild_count");
+/// Major merges that started because the range's runs reached `max_runs` less its headroom,
+/// before their bytes reached `major_merge_factor` times the base. The others started by bytes.
+pub const REBUILD_BY_RUNS_COUNT: &str = range_cache_stat_name!("rebuild_by_runs_count");
+/// Flushes of a range that installed while a major merge of the range waited for a slot or ran,
+/// counted when the major merge installs. Divide by `rebuild_count` for the flushes per major
+/// merge, which the headroom of the run count trigger follows.
+pub const REBUILD_FLUSH_COUNT: &str = range_cache_stat_name!("rebuild_flush_count");
 /// Bytes of base files that major merges wrote. With `flush_bytes`, divide by the bytes of the
 /// writes to cached ranges to get the local write amplification.
 pub const REBUILD_BYTES: &str = range_cache_stat_name!("rebuild_bytes");
@@ -65,22 +72,15 @@ pub const FLUSH_BYTES: &str = range_cache_stat_name!("flush_bytes");
 pub const FLUSHED_BUFFER_COUNT: &str = range_cache_stat_name!("flushed_buffer_count");
 /// Flushes that wrote more than one sealed buffer.
 pub const MULTI_BUFFER_FLUSH_COUNT: &str = range_cache_stat_name!("multi_buffer_flush_count");
-/// Flushes of a range that held the most runs (`max_runs`, 4 by default): the run they wrote also
-/// holds the versions of the range's newest runs, at most two, which it replaced.
+/// Flushes of a range that held the most runs (`max_runs`): the run they wrote also holds the
+/// versions of the range's newest runs, at most two, which it replaced, so that the flush does
+/// not wait for the major merge.
 pub const FLUSH_MERGE_COUNT: &str = range_cache_stat_name!("flush_merge_count");
 /// Bytes of run files that flush-merges wrote.
 pub const FLUSH_MERGE_BYTES: &str = range_cache_stat_name!("flush_merge_bytes");
 /// Runs that flush-merges replaced. Divide by `flush_merge_count` for the runs per flush-merge:
-/// two, or one when a merge in flight held the second newest run.
+/// two, or one when a major merge in flight held the second newest run.
 pub const FLUSH_MERGE_RUN_COUNT: &str = range_cache_stat_name!("flush_merge_run_count");
-/// Minor merges: adjacent runs of a range merged into one, every version kept.
-pub const MINOR_MERGE_COUNT: &str = range_cache_stat_name!("minor_merge_count");
-/// Bytes of run files that minor merges wrote.
-pub const MINOR_MERGE_BYTES: &str = range_cache_stat_name!("minor_merge_bytes");
-/// Minor merges by the number of runs that each one took, in the `runs` label, from `1` to `8`.
-/// Over all labels they add up to `minor_merge_count`. The default rule always takes two; merges
-/// by similar size take more when they do a cascade.
-pub const MINOR_MERGE_RUNS_COUNT: &str = range_cache_stat_name!("minor_merge_runs_count");
 /// Flushed runs and merged bases that the writer rejected because the range changed meanwhile:
 /// it was removed, registered again, or its buffers or runs moved on.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
@@ -107,21 +107,22 @@ pub const META_BYTES: &str = range_cache_stat_name!("meta_bytes");
 /// free room. It never exceeds `max_recent_bytes`.
 pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_bytes");
 
-// The delta view (`RangeCacheTuning::delta_view`).
+// The delta views of the ranges' runs (see the `view` module).
 
-/// Delta views that flushes and major merges built. The `job` label is `flush` or `major`. A
-/// build that the writer rejected because the view moved on and that its job built again counts
-/// twice.
+/// Delta views that flushes and major merges built. The `job` label is `flush` (flushes and
+/// flush-merges) or `major`. A build that the writer rejected because the view moved on and that
+/// its job built again counts twice.
 pub const VIEW_BUILD_COUNT: &str = range_cache_stat_name!("view_build_count");
 /// Wall time of the view builds in nanoseconds, by `job`. A build runs on one blocking thread and
 /// does no I/O wait when the files are in the page cache, so this is about its CPU time.
 pub const VIEW_BUILD_NANOS: &str = range_cache_stat_name!("view_build_nanos");
-/// Rows of new runs that view builds read in file order, by `job`.
+/// Rows of new runs that view builds added, from the row locators that the runs' writers
+/// collected, by `job`.
 pub const VIEW_BUILD_ROWS: &str = range_cache_stat_name!("view_build_rows");
 /// Keys of older runs that view builds read from their files by locator, by `job`.
 pub const VIEW_BUILD_KEYS: &str = range_cache_stat_name!("view_build_keys");
-/// Bytes that view builds read: the data bytes of the new runs, and the row header and key of each
-/// older key read. By `job`.
+/// Bytes that view builds read from run files: the row header and key of each older key read.
+/// By `job`.
 pub const VIEW_BUILD_BYTES: &str = range_cache_stat_name!("view_build_bytes");
 /// Installs that the writer rejected because the range's view moved on, and that their job sent
 /// again with a view built on the new one. By `job`.
@@ -411,11 +412,6 @@ impl AutoStats {
     }
 }
 
-/// The values of the `runs` label of `minor_merge_runs_count`: as many as the most runs a range
-/// can hold.
-const MINOR_MERGE_RUNS_LABELS: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
-const _: () = assert!(MINOR_MERGE_RUNS_LABELS.len() == *super::MAX_RUNS_RANGE.end());
-
 /// The metrics of the range cache, except the counters of the read path. Those go through the
 /// `hits` module. See [`read_counters`].
 pub(crate) struct RangeCacheStats {
@@ -424,6 +420,8 @@ pub(crate) struct RangeCacheStats {
     pub(crate) loads_rejected_memory: Arc<dyn CounterFn>,
     pub(crate) rebuilds: Arc<dyn CounterFn>,
     pub(crate) rebuild_bytes: Arc<dyn CounterFn>,
+    pub(crate) rebuilds_by_runs: Arc<dyn CounterFn>,
+    pub(crate) rebuild_flushes: Arc<dyn CounterFn>,
     pub(crate) seals_full: Arc<dyn CounterFn>,
     pub(crate) seals_pressure: Arc<dyn CounterFn>,
     pub(crate) flushes: Arc<dyn CounterFn>,
@@ -433,11 +431,6 @@ pub(crate) struct RangeCacheStats {
     pub(crate) flush_merges: Arc<dyn CounterFn>,
     pub(crate) flush_merge_bytes: Arc<dyn CounterFn>,
     pub(crate) flush_merge_runs: Arc<dyn CounterFn>,
-    pub(crate) minor_merges: Arc<dyn CounterFn>,
-    pub(crate) minor_merge_bytes: Arc<dyn CounterFn>,
-    /// Indexed by the number of runs a minor merge took, minus one; the last one also counts
-    /// larger merges.
-    minor_merges_by_runs: [Arc<dyn CounterFn>; MINOR_MERGE_RUNS_LABELS.len()],
     pub(crate) installs_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
@@ -482,7 +475,7 @@ impl ViewStats {
     pub(crate) fn built(&self, cost: &super::view::BuildCost) {
         self.builds.increment(1);
         self.nanos.increment(cost.nanos);
-        self.rows.increment(cost.rows_read);
+        self.rows.increment(cost.rows_added);
         self.keys.increment(cost.keys_read);
         self.bytes.increment(cost.bytes_read);
     }
@@ -499,6 +492,8 @@ impl RangeCacheStats {
             loads_rejected_memory: labeled(LOAD_REJECTED_COUNT, "reason", "memory"),
             rebuilds: recorder.counter(REBUILD_COUNT).register(),
             rebuild_bytes: recorder.counter(REBUILD_BYTES).register(),
+            rebuilds_by_runs: recorder.counter(REBUILD_BY_RUNS_COUNT).register(),
+            rebuild_flushes: recorder.counter(REBUILD_FLUSH_COUNT).register(),
             seals_full: labeled(SEAL_COUNT, "reason", "full"),
             seals_pressure: labeled(SEAL_COUNT, "reason", "pressure"),
             flushes: recorder.counter(FLUSH_COUNT).register(),
@@ -508,10 +503,6 @@ impl RangeCacheStats {
             flush_merges: recorder.counter(FLUSH_MERGE_COUNT).register(),
             flush_merge_bytes: recorder.counter(FLUSH_MERGE_BYTES).register(),
             flush_merge_runs: recorder.counter(FLUSH_MERGE_RUN_COUNT).register(),
-            minor_merges: recorder.counter(MINOR_MERGE_COUNT).register(),
-            minor_merge_bytes: recorder.counter(MINOR_MERGE_BYTES).register(),
-            minor_merges_by_runs: MINOR_MERGE_RUNS_LABELS
-                .map(|runs| labeled(MINOR_MERGE_RUNS_COUNT, "runs", runs)),
             installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
@@ -530,12 +521,6 @@ impl RangeCacheStats {
             ],
             view_bytes: recorder.gauge(VIEW_BYTES).register(),
         }
-    }
-
-    /// Counts a minor merge of `runs` runs in `minor_merge_runs_count`.
-    pub(crate) fn minor_merge_of(&self, runs: usize) {
-        let at = runs.clamp(1, MINOR_MERGE_RUNS_LABELS.len()) - 1;
-        self.minor_merges_by_runs[at].increment(1);
     }
 
     pub(crate) fn removed(&self, reason: RemoveReason) {

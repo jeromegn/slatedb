@@ -1,6 +1,5 @@
-//! Lossless merges of versions into one run file: the flush of several sealed buffers, the
-//! flush-merge of buffers with the newest runs (design 01 section 7.3), and the minor merge of
-//! runs (7.4).
+//! Lossless merges of versions into one run file: the flush of several sealed buffers, and the
+//! flush at the run cap, which merges buffers with the newest runs (design 01 section 7.3).
 //!
 //! The inputs hold disjoint intervals of sequence numbers, each in the order of a run (key
 //! ascending, then sequence number descending). So their versions have one total order with no

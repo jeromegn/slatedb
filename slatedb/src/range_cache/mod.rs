@@ -11,7 +11,9 @@
 //!   interval of sequence numbers `(lo, hi]`; and a *base*, a file of the state of the range at
 //!   `base_seq`. The runs cover `(base_seq, covered_to]` without a gap, and the buffers hold
 //!   every version above `covered_to`. A buffer is a sorted map that only the writer appends to
-//!   and that reads search without a shared write (see the `buffer` and `delta` modules).
+//!   and that reads search without a shared write (see the `buffer` and `delta` modules). A range
+//!   with runs also has a *view*, one sorted list of the versions of all its runs, through which
+//!   scans read them (see the `view` module); point reads probe the runs' filters.
 //! - The batch writer applies each write to the active buffer after it puts the write in the
 //!   memtable and before it advances the last committed sequence number. Reads at the latest
 //!   committed state read the layers with that sequence number as the bound, so a write becomes
@@ -19,9 +21,10 @@
 //!   transaction use the snapshot's sequence number as the bound instead: buffers and runs keep
 //!   every version.
 //! - The writer seals the active buffer when it reaches `range_seal_bytes`. The maintenance task
-//!   (the `maintain` module) flushes the oldest sealed buffer of a range to a run, and merges
-//!   the base with the runs into a new base when the runs grow (a *major merge*). The memory of
-//!   all buffers has a hard cap: a write that does not fit removes its range instead of waiting.
+//!   (the `maintain` module) flushes the sealed buffers of a range to a run, and merges the base
+//!   with the runs into a new base when the runs grow (a *major merge*). Runs never merge with
+//!   each other, except in a flush of a range that holds `max_runs` runs. The memory of all
+//!   buffers has a hard cap: a write that does not fit removes its range instead of waiting.
 //! - Only the batch writer changes the set of ranges and the layers of a range. Loads, flushes,
 //!   merges and removals send it requests, which it applies between batches (see the `writer`
 //!   module). Neither reads nor writes take a lock.
@@ -128,13 +131,10 @@ use writer::{Padded, Target, WriterQueue};
 /// The number of times a read tries to pin a range before it uses the normal read path.
 const PIN_ATTEMPTS: usize = 3;
 
-/// The values that [`RangeCacheTuning::max_runs`] may take. Nothing in the read path is sized by
-/// it: reads walk the runs that a range holds.
-pub(crate) const MAX_RUNS_RANGE: std::ops::RangeInclusive<usize> = 4..=8;
-
-/// The values that [`RangeCacheTuning::max_runs`] may take with [`RangeCacheTuning::delta_view`]:
-/// a view holds at most 64 runs, one per slot of its selector byte.
-pub(crate) const MAX_VIEW_RUNS_RANGE: std::ops::RangeInclusive<usize> = 4..=view::VIEW_SLOTS;
+/// The values that [`RangeCacheTuning::max_runs`] may take: a view holds at most 64 runs, one
+/// per slot of its selector byte. Nothing in the read path is sized by it: reads walk the runs
+/// that a range holds.
+pub(crate) const MAX_RUNS_RANGE: std::ops::RangeInclusive<usize> = 4..=view::VIEW_SLOTS;
 
 /// Options for the range cache. See [`crate::DbBuilder::with_range_cache`].
 ///
@@ -184,43 +184,25 @@ impl RangeCacheOptions {
 pub struct RangeCacheTuning {
     /// The page size of range cache files. It must be a power of two from 512 to 65536.
     pub page_size: usize,
-    /// The smallest run bytes that cause a major merge (a rebuild of the base). A major merge
-    /// starts when the run files of a range are larger than this value and larger than `f` times
-    /// its base, where `f` is `major_merge_factor` (design 01 sections 7.5 and 7.9).
+    /// The smallest run bytes that cause a major merge (a rebuild of the base from the base and
+    /// the runs). Below it, no major merge starts, by bytes or by run count; `usize::MAX` turns
+    /// major merges off.
     pub min_rebuild_delta_bytes: usize,
     /// The major-merge factor `f`: a major merge of a range starts when its run files reach `f`
-    /// times its base (and `min_rebuild_delta_bytes`). `None`, the default, chooses
-    /// `f = sqrt(2r / B)` for each range from its average flush `r` and its base `B`, between
-    /// 0.05 and 1, which writes least with the default `minor_merge_ratio` (design 01 section
-    /// 7.9). `Some(f)` fixes it; it must be positive and finite. With similar-size minor merges a
-    /// byte is rewritten by minor merges about `log n` times over `n` flushes instead of `n / 2`,
-    /// so the best fixed `f` is larger, close to 1 whatever the base and run sizes (inferred from
-    /// a model, not measured). The runs of a range then take up to `f` times its base on disk.
-    pub major_merge_factor: Option<f64>,
-    /// How the maintenance task picks the runs of a minor merge, which merges adjacent runs of a
-    /// range into one run, every version kept, without touching the base.
-    ///
-    /// With a finite ratio, runs merge by similar size. From the newest run towards the oldest,
-    /// the first two adjacent runs where the older one holds at most `ratio` times the bytes of
-    /// the newer one start a group, and the group takes each next older run while that run holds
-    /// at most `ratio` times the bytes of the group so far. So one merge does a whole cascade:
-    /// runs of 1, 1, 2 and 4 MiB, newest first, merge into one run of 8 MiB. Each byte is
-    /// rewritten about `log n` times over `n` flushes, and a range holds a few runs most of the
-    /// time. Any finite value, however large, merges cascades from the newest end. It must be at
-    /// least 1.
-    ///
-    /// `f64::INFINITY`, the default, keeps the rule of stage 2c: whenever a range holds two runs
-    /// or more, its two oldest runs merge. A range then holds one or two runs most of the time,
-    /// and each byte is rewritten about `n / 2` times over `n` flushes.
-    ///
-    /// Either way, a merge leaves alone the runs that a flush in flight merges, and while the
-    /// range holds `max_runs` runs it leaves the newest one, so that a flush can always merge it.
-    pub minor_merge_ratio: f64,
-    /// The most runs that a range holds (design 01's `D_hard`), from 4 to 8. A flush of a range
-    /// that holds this many merges the range's newest runs, at most two, into the run it writes.
-    /// A read searches every run that its interval, key bounds and filter do not rule out, so
-    /// more runs cost reads only when a range holds them: a filtered run that a read rules out
-    /// costs a point read about 7 ns and a 10-row scan about 0.25 µs (stage 2b measurement).
+    /// times its base (and `min_rebuild_delta_bytes`). Runs never merge with each other, so each
+    /// flushed byte is written about `1 + 1/f` times on local disk (once by its flush, `1/f` times
+    /// by base rewrites), and the runs of a range take up to `f` times its base on disk. It must
+    /// be positive and finite. The default, 0.25, wrote least of the factors measured on TPC-C.
+    pub major_merge_factor: f64,
+    /// The most runs that a range holds, from 4 to 64 (the slots of a view). A major merge also
+    /// starts when a range's runs reach this many less a headroom for the flushes that land while
+    /// the merge waits and runs, which the maintenance task measures for each range (see the
+    /// `maintain` module); a flush of a range that holds this many merges the range's newest runs,
+    /// at most two, into its run, so it never waits. Scans read every run through one view, so
+    /// runs cost a scan nothing by their number. A point read probes the filter of every run
+    /// whose interval and key bounds do not rule it out, about 5 ns each (measured from 1 to 32
+    /// runs); a run also holds an open file mapping and a few hundred bytes of heap for its
+    /// handles and file name, besides its filter and fence index, which grow with its rows.
     pub max_runs: usize,
     /// The chunk bytes at which the writer seals a range's active write buffer, so that the
     /// maintenance task can flush it to a run.
@@ -304,16 +286,6 @@ pub struct RangeCacheTuning {
     /// time at the 1st, 2nd, 4th, 8th and so on counted event after it last added them, so a
     /// thread that keeps reading adds its counts within about twice this time.
     pub stats_fold_interval: Duration,
-    /// The delta view (prototype, off by default): each range keeps one sorted view over the
-    /// versions of all its runs in memory, which a scan reads with one cursor however many runs
-    /// the range holds (see the `view` module). With it on, runs never merge with each other: no
-    /// minor merge and no flush-merge. A flush builds the view of its run from the range's view
-    /// and installs both in one store; a major merge absorbs every run of the range and installs a
-    /// view without them. `max_runs` may then be up to 64. A range that holds `max_runs` runs
-    /// waits for its major merge before it flushes, and a major merge is due when the runs reach
-    /// half of `max_runs`, whatever their bytes. Point reads still probe the runs' filters, newest
-    /// first.
-    pub delta_view: bool,
 }
 
 impl Default for RangeCacheTuning {
@@ -321,9 +293,8 @@ impl Default for RangeCacheTuning {
         Self {
             page_size: 4096,
             min_rebuild_delta_bytes: 1024 * 1024,
-            major_merge_factor: None,
-            minor_merge_ratio: f64::INFINITY,
-            max_runs: 4,
+            major_merge_factor: 0.25,
+            max_runs: 64,
             range_seal_bytes: 4 * 1024 * 1024,
             max_recent_bytes: 256 * 1024 * 1024,
             min_seal_bytes: 64 * 1024,
@@ -350,21 +321,11 @@ impl Default for RangeCacheTuning {
             load_fetch_tasks: 4,
             stats_fold_events: 4096,
             stats_fold_interval: Duration::from_millis(10),
-            delta_view: false,
         }
     }
 }
 
 impl RangeCacheTuning {
-    /// The values that `max_runs` may take.
-    fn max_runs_range(&self) -> std::ops::RangeInclusive<usize> {
-        if self.delta_view {
-            MAX_VIEW_RUNS_RANGE
-        } else {
-            MAX_RUNS_RANGE
-        }
-    }
-
     /// How the cache's write buffers size themselves.
     fn delta_shape(&self) -> DeltaShape {
         DeltaShape {
@@ -418,7 +379,7 @@ pub struct CachedRangeInfo {
     /// True while the cache loads the range. A loading range serves no reads.
     pub loading: bool,
     /// True while the cache writes the range's recent writes to disk: a sealed write buffer waits
-    /// for its flush, or a merge, minor or major, is due or runs.
+    /// for its flush, or a major merge is due or runs.
     pub rebuilding: bool,
     /// The size of the range's base file on disk.
     pub file_bytes: u64,
@@ -496,8 +457,7 @@ pub(crate) struct Layers {
     /// Runs, newest first, at most [`RangeCacheTuning::max_runs`]: run `i` covers
     /// `(lo_i, hi_i]` with `hi_{i+1} = lo_i`, and the oldest one's `lo` is `base_seq`.
     runs: Vec<Arc<Run>>,
-    /// With [`RangeCacheTuning::delta_view`], the view of exactly `runs` once the range has a run;
-    /// scans read the runs through it. `None` otherwise.
+    /// The view of exactly `runs`, which scans read them through; `None` when there is no run.
     view: Option<Arc<DeltaView>>,
     /// `None` while the range loads.
     base: Option<Arc<RangeFile>>,
@@ -535,13 +495,16 @@ impl Layers {
             to = run.lo;
         }
         assert_eq!(to, self.base_seq, "the runs do not reach the base");
+        assert_eq!(
+            self.view.is_some(),
+            !self.runs.is_empty(),
+            "a range with runs and no view, or a view and no runs"
+        );
         if let Some(view) = &self.view {
             let in_view = view.runs().count();
             assert_eq!(in_view, self.runs.len(), "the view does not hold the runs");
             assert!(
-                self.runs
-                    .iter()
-                    .all(|r| view.runs().any(|v| Arc::ptr_eq(r, v))),
+                self.runs.iter().all(|r| view.holds(r)),
                 "the view holds other runs"
             );
             let rows: u64 = self.runs.iter().map(|r| r.file.rows()).sum();
@@ -711,7 +674,7 @@ impl CachedRange {
             loading: layers.base.is_none(),
             rebuilding: !layers.sealed.is_empty()
                 || self.jobs.merging()
-                || maintain::merge_due(self, &layers, tuning).is_some(),
+                || maintain::major_due(self, &layers, tuning).is_some(),
             file_bytes: layers.base.as_ref().map_or(0, |f| f.file_len()),
             file_rows: layers.base.as_ref().map_or(0, |f| f.rows()),
             delta_bytes: self.delta_bytes(&layers),
@@ -921,27 +884,19 @@ impl RangeCache {
                 "range cache load_fetch_bytes and load_fetch_tasks must be positive".to_string(),
             ));
         }
-        let runs_range = options.tuning.max_runs_range();
-        if !runs_range.contains(&options.tuning.max_runs) {
+        if !MAX_RUNS_RANGE.contains(&options.tuning.max_runs) {
             return Err(SlateDBError::InvalidConfiguration(format!(
                 "range cache max_runs {} is not in {}..={}",
                 options.tuning.max_runs,
-                runs_range.start(),
-                runs_range.end()
+                MAX_RUNS_RANGE.start(),
+                MAX_RUNS_RANGE.end()
             )));
         }
-        let ratio = options.tuning.minor_merge_ratio;
-        if ratio.is_nan() || ratio < 1.0 {
+        let f = options.tuning.major_merge_factor;
+        if !f.is_finite() || f <= 0.0 {
             return Err(SlateDBError::InvalidConfiguration(format!(
-                "range cache minor_merge_ratio {ratio} is not at least 1"
+                "range cache major_merge_factor {f} is not positive and finite"
             )));
-        }
-        if let Some(f) = options.tuning.major_merge_factor {
-            if !f.is_finite() || f <= 0.0 {
-                return Err(SlateDBError::InvalidConfiguration(format!(
-                    "range cache major_merge_factor {f} is not positive and finite"
-                )));
-            }
         }
         std::fs::create_dir_all(&options.root_folder)?;
         for entry in std::fs::read_dir(&options.root_folder)? {
@@ -1701,57 +1656,13 @@ fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
     })
 }
 
-/// [`lookup`] with the runs searched through the delta view, when the layers have one: one seek in
-/// the view for all runs, in place of a filter probe per run and a search of each run whose filter
-/// passes. Reads do not use it; tests check it and the view benchmark measures it against
-/// `lookup`.
-#[cfg(test)]
-fn lookup_view(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
-    let Some(view) = &layers.view else {
-        return lookup(layers, key, seq);
-    };
-    let mut hash = None;
-    let mut hash_of = || *hash.get_or_insert_with(|| hash_key(key));
-    for delta in layers.buffers() {
-        if delta.is_empty() || delta.lo() >= seq {
-            continue;
-        }
-        if let Some(filter) = delta.filter() {
-            if !filter.may_contain(hash_of()) {
-                continue;
-            }
-        }
-        if let Some(version) = delta.newest(key, seq) {
-            return Ok(match version.kind {
-                Kind::Value => Found::Value(KeyValue::from(delta::to_row(&version))),
-                Kind::Tombstone => Found::Absent,
-                Kind::Merge => Found::Merge,
-            });
-        }
-    }
-    if let Some((i, span)) = view.newest(key, seq)? {
-        return Ok(match span.kind() {
-            Kind::Value => Found::Value(KeyValue::from(view.run_of(i).file.decode_span(&span)?)),
-            Kind::Tombstone => Found::Absent,
-            Kind::Merge => Found::Merge,
-        });
-    }
-    let row = match &layers.base {
-        Some(file) => file.get(key)?,
-        None => None,
-    };
-    Ok(match row {
-        Some(row) => match row.value {
-            ValueDeletable::Value(_) => Found::Value(KeyValue::from(row)),
-            ValueDeletable::Merge(_) => Found::Merge,
-            ValueDeletable::Tombstone => Found::Absent,
-        },
-        None => Found::Absent,
-    })
-}
-
 /// Returns an iterator over `range` of `layers` at `seq`, through the iterator stack of the
 /// normal read path. So merge operands resolve the same way as in the normal path.
+///
+/// A run that holds no version at or below `seq`, or no key of `range` by its key bounds, adds
+/// nothing, and neither does a run whose filter rules out the one key of a range of one key (a
+/// merge resolution): the stack leaves them out, so that resolving a key does not open a cursor
+/// on every run of a range that holds many.
 async fn stack_iterator(
     layers: &Layers,
     seq: u64,
@@ -1765,7 +1676,15 @@ async fn stack_iterator(
                 as Box<dyn RowEntryIterator + 'static>
         })
         .collect();
+    let hash = one_key(&range).map(hash_key);
     for run in &layers.runs {
+        if run.lo >= seq
+            || run.file.rows() == 0
+            || !run_meets(run, &range)
+            || hash.is_some_and(|hash| !run.filter.may_contain(hash))
+        {
+            continue;
+        }
         sources.push(Box::new(RangeFileIterator::new(
             run.file.clone(),
             range.clone(),
@@ -1788,6 +1707,40 @@ async fn stack_iterator(
         ReadTrace::none(),
     )
     .await
+}
+
+/// The key of `range` if it holds one key only: `[k, k]`, or `[k, k + 0x00)` as a scan's merge
+/// resolution reads it.
+fn one_key(range: &BytesRange) -> Option<&[u8]> {
+    if let Some(key) = range.as_point() {
+        return Some(key);
+    }
+    match (
+        RangeBounds::start_bound(range),
+        RangeBounds::end_bound(range),
+    ) {
+        (Included(start), Excluded(end))
+            if end.len() == start.len() + 1 && end.starts_with(start) && end.ends_with(&[0]) =>
+        {
+            Some(start)
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if a non-empty run can hold a key of `range`, by its key bounds.
+fn run_meets(run: &Run, range: &BytesRange) -> bool {
+    let after_start = match RangeBounds::start_bound(range) {
+        Unbounded => true,
+        Included(start) => run.max_key >= start,
+        Excluded(start) => run.max_key > start,
+    };
+    let before_end = match RangeBounds::end_bound(range) {
+        Unbounded => true,
+        Included(end) => run.min_key <= end,
+        Excluded(end) => run.min_key < end,
+    };
+    after_start && before_end
 }
 
 /// Returns the first key that a scan of `range` can return, for sampling.
