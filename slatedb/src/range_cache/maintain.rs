@@ -8,25 +8,47 @@
 //!   filter of its keys. So one flush absorbs a backlog of buffers. The job sends `InstallRun`
 //!   to the writer, which puts the run first, raises `covered_to` and removes the buffers in one
 //!   store, or rejects it if the state moved on; a rejected run's file is deleted when it drops.
-//! - **Flush-merge** (7.3). When the range holds [`MAX_RUNS`] runs, the flush also merges its
-//!   [`FLUSH_MERGE_RUNS`] newest runs into the run it writes, and the install replaces them. A
-//!   flush never waits for a merge.
-//! - **Minor merge** (7.4). A range with [`MERGE_RUNS`] runs or more has its oldest two merged
-//!   into one run of their union interval, every version kept, installed by `InstallMinor`.
-//! - **Major merge** (7.5). When the run files of a range reach `f` times its base, with
-//!   `f = sqrt(2r / B)` for its average flush `r` and its base `B` (7.9), between [`F_MIN`] and
-//!   [`F_MAX`], and at least `min_rebuild_delta_bytes`, a job merges the base with its oldest
-//!   runs, at most [`MERGE_RUNS`], into a new base at the newest absorbed run's `hi`, and sends
-//!   `InstallMajor`. Flushes go on meanwhile; their runs stay. An automatic range whose reads do
-//!   not pay for the merge leaves the cache instead.
+//! - **Flush-merge** (7.3). When the range holds `max_runs` runs, the flush also merges its
+//!   newest runs, at most [`FLUSH_MERGE_RUNS`], into the run it writes, and the install replaces
+//!   them. A flush never waits for a merge.
+//! - **Minor merge** (7.4). Adjacent runs of a range merge into one run of their union interval,
+//!   every version kept, installed by `InstallMinor`. `minor_merge_ratio` picks the runs (see
+//!   [`minor_group`]): by default the two oldest whenever the range holds two or more, the rule
+//!   of stage 2c; with a finite ratio, runs of similar size, a whole cascade in one job.
+//! - **Major merge** (7.5). When the run files of a range reach `f` times its base, and at least
+//!   `min_rebuild_delta_bytes`, a job merges the base with its oldest runs into a new base at the
+//!   newest absorbed run's `hi`, and sends `InstallMajor`. `f` is `major_merge_factor`, or by
+//!   default `sqrt(2r / B)` for the range's average flush `r` and its base `B` (7.9), between
+//!   [`F_MIN`] and [`F_MAX`]. The merge absorbs at most [`MERGE_RUNS`] runs with the default
+//!   minor rule, and every run it may take with merges by similar size (see [`major_runs`]).
+//!   Flushes go on meanwhile; their runs stay. An automatic range whose reads do not pay for the
+//!   merge leaves the cache instead.
 //! - **Pressure** (7.1, 9). Above half of `max_recent_bytes`, the task asks the writer to seal the
 //!   largest active buffers that hold at least `min_seal_bytes`, so that flushes can free them.
 //!
-//! A merge only ever takes a range's oldest runs, at most two, and a flush-merge its two newest
-//! runs when the range holds four: so the two never take the same run, and a flush-merge never
-//! waits for a merge. Each range has at most one flush and one merge in flight. Flushes and
-//! merges have their own limits on concurrent jobs, so a long merge never holds back the
-//! flushes that free memory.
+//! **Which runs a job takes.** The task chooses the inputs of each job when it starts it, and
+//! notes what the job holds: for a flush, how many of the newest runs it replaces; for a merge,
+//! the `hi` of its newest run. Each range has at most one flush and one merge in flight, and two
+//! rules keep them off each other's runs:
+//!
+//! 1. A merge, minor or major, takes none of the runs that the flush in flight replaces, and its
+//!    runs together with all older runs number at most `max_runs - 1` (see [`mergeable_from`]).
+//! 2. A flush of a range that holds `max_runs` runs replaces the newest runs that are newer than
+//!    the runs of the merge in flight, at most [`FLUSH_MERGE_RUNS`] (see [`flush_replaces`]).
+//!
+//! While a merge is in flight, only flushes change the runs of its range, and only runs newer
+//! than the merge's. So the merge's runs and the older ones keep their number `c <= max_runs - 1`,
+//! and when the range holds `max_runs` runs, `max_runs - c >= 1` of them are newer than the
+//! merge's: a flush always finds a run to merge, never waits, and never takes a run that the
+//! merge holds. A merge that starts while a flush-merge is in flight leaves the flush's runs
+//! alone by rule 1, also after an earlier merge lowered the run count. So no install is rejected
+//! because a flush and a merge took the same run, and no file is written for nothing. A major
+//! merge absorbs the oldest runs, so rule 1 covers it as it covers a minor merge. With the
+//! default minor rule a merge holds the two oldest runs (`c = 2`), so a flush-merge always takes
+//! the two newest, as in stage 2c.
+//!
+//! Flushes and merges have their own limits on concurrent jobs, so a long merge never holds back
+//! the flushes that free memory.
 //!
 //! The writer notifies the task of a range when it seals one of its buffers or attaches its
 //! base, and a job notifies it of its range when it ends. The task looks only at the notified
@@ -38,6 +60,7 @@
 //! workers that reads use.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -53,7 +76,7 @@ use super::file::{RangeFile, RangeFileIterator, RangeFileWriter};
 use super::merge::merge_versions;
 use super::stats::RemoveReason;
 use super::writer::Target;
-use super::{CachedRange, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run, MAX_RUNS};
+use super::{CachedRange, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run, MAX_RUNS_RANGE};
 use crate::bytes_range::BytesRange;
 use crate::db::DbInner;
 use crate::db_iter::DbIterator;
@@ -74,20 +97,24 @@ const MAX_FLUSHES: usize = 2;
 const MAX_MERGES: usize = 2;
 /// The most early seals that one pass asks for.
 const PRESSURE_SEALS: usize = 4;
-/// The runs at which a range has its oldest runs merged (design 01's `D_minor`), and the most
-/// runs that one merge takes.
+/// With the default minor rule (an infinite `minor_merge_ratio`): the runs at which a range has
+/// its oldest runs merged (design 01's `D_minor`), the runs that a minor merge takes, and the
+/// most runs that a major merge absorbs.
 pub(super) const MERGE_RUNS: usize = 2;
-/// The newest runs that a flush merges into its run when the range holds [`MAX_RUNS`] (design
-/// 01's `j`). Two brings the range back to three runs, so the next flush is a plain one; the
-/// newest runs are the youngest and so the smallest, as older ones grew by merges; and merges
-/// take only the two oldest runs, so these two are never in one.
+/// The most newest runs that a flush merges into its run when the range holds `max_runs` (design
+/// 01's `j`). Two brings the range below the most, so the next flush is a plain one, and the
+/// newest runs are the youngest and so the smallest, as older ones grew by merges. A flush takes
+/// one when a merge in flight holds the second newest run.
 pub(super) const FLUSH_MERGE_RUNS: usize = 2;
-/// The bounds of the major-merge factor `f`. At most 1: the runs of a range never grow past its
-/// base, whose rewrite is then cheap anyway. At least 0.05: a base of more than 800 flushes
-/// still merges after a twentieth of its size.
+/// The bounds of the adaptive major-merge factor `f`. At most 1: the runs of a range never grow
+/// past its base, whose rewrite is then cheap anyway. At least 0.05: a base of more than 800
+/// flushes still merges after a twentieth of its size. A fixed `major_merge_factor` is not
+/// bounded by them.
 pub(super) const F_MIN: f64 = 0.05;
 pub(super) const F_MAX: f64 = 1.0;
-const _: () = assert!(MERGE_RUNS + FLUSH_MERGE_RUNS <= MAX_RUNS);
+// With the default minor rule a merge holds the two oldest runs, so a flush-merge always finds
+// the two newest free, as in stage 2c; and a merge of two runs always fits rule 1.
+const _: () = assert!(MERGE_RUNS + FLUSH_MERGE_RUNS <= *MAX_RUNS_RANGE.start());
 
 /// A reason for the task to look for work.
 pub(crate) enum MaintenanceMessage {
@@ -156,6 +183,12 @@ pub(super) struct RangeJobs {
     /// Only the task loads and stores them.
     flush_queued: AtomicBool,
     merge_queued: AtomicBool,
+    /// The newest runs that the flush in flight replaces, 0 for a plain flush. Only the task
+    /// stores it, before it sets `flushing`, and it means nothing while `flushing` is false.
+    flush_replaces: AtomicUsize,
+    /// The `hi` of the newest run that the merge in flight holds. Only the task stores it, before
+    /// it sets `merging`, and it means nothing while `merging` is false.
+    merge_hi: AtomicU64,
 }
 
 impl RangeJobs {
@@ -166,6 +199,28 @@ impl RangeJobs {
 
     fn flushing(&self) -> bool {
         self.flushing.load(Ordering::Acquire)
+    }
+
+    /// The newest runs that the flush in flight replaces, which a merge must leave alone. Until
+    /// the flush's end clears `flushing`, it may count runs that the flush already replaced, which
+    /// only leaves a merge fewer runs.
+    fn flush_held(&self) -> usize {
+        if self.flushing() {
+            self.flush_replaces.load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
+    /// The newest of `runs` (newest first) that no merge in flight holds: all of them, or the ones
+    /// above the newest run of the merge. Until the merge's end clears `merging`, its output or a
+    /// rejected merge's inputs count as held, which only leaves a flush fewer runs.
+    fn free_newest(&self, runs: &[Arc<Run>]) -> usize {
+        if !self.merging() {
+            return runs.len();
+        }
+        let hi = self.merge_hi.load(Ordering::Relaxed);
+        runs.iter().take_while(|r| r.hi > hi).count()
     }
 
     /// The average bytes that a flush adds, or `default` before the first flush.
@@ -209,37 +264,135 @@ pub(super) enum Merge {
 }
 
 /// The run bytes at which a major merge of a range with this base starts: `f` times the base,
-/// `f = sqrt(2r / B)` between [`F_MIN`] and [`F_MAX`] (design 01 section 7.9), and at least
-/// `min_rebuild_delta_bytes`.
+/// and at least `min_rebuild_delta_bytes`. `f` is `major_merge_factor`, or by default
+/// `sqrt(2r / B)` between [`F_MIN`] and [`F_MAX`] (design 01 section 7.9).
 pub(super) fn major_threshold(
     range: &CachedRange,
     base_bytes: u64,
     tuning: &RangeCacheTuning,
 ) -> u64 {
-    let r = range.jobs.average_flush(tuning.range_seal_bytes as u64) as f64;
-    let b = base_bytes.max(1) as f64;
-    let f = (2.0 * r / b).sqrt().clamp(F_MIN, F_MAX);
+    let f = tuning.major_merge_factor.unwrap_or_else(|| {
+        let r = range.jobs.average_flush(tuning.range_seal_bytes as u64) as f64;
+        let b = base_bytes.max(1) as f64;
+        (2.0 * r / b).sqrt().clamp(F_MIN, F_MAX)
+    });
     ((f * base_bytes as f64) as u64).max(tuning.min_rebuild_delta_bytes as u64)
 }
 
-/// The merge that `layers`, the layers of `range`, call for: a major merge when the range has a
-/// base and its run bytes reach [`major_threshold`], else a minor merge when it holds
-/// [`MERGE_RUNS`] runs or more.
-pub(super) fn merge_due(
+/// The first of a range's `runs` runs (positions newest first) that a merge may take, when the
+/// flush in flight replaces the `flush_held` newest ones. A merge never takes those, and its runs
+/// together with all older ones number at most `max_runs - 1`, so that a flush of a full range
+/// always finds its newest run free (rule 1 of the module documentation).
+pub(super) fn mergeable_from(runs: usize, flush_held: usize, max_runs: usize) -> usize {
+    flush_held
+        .max(runs.saturating_sub(max_runs.saturating_sub(1)))
+        .min(runs)
+}
+
+/// The runs of a minor merge, as positions `a..b` of a range's runs (newest first, `sizes` in
+/// bytes), none before `first` (see [`mergeable_from`]). `None` if no runs call for one.
+///
+/// With a finite `ratio`, by similar size: the newest two adjacent runs from `first` on where
+/// the older one holds at most `ratio` times the bytes of the newer one start the group, and the
+/// group takes each next older run while that run holds at most `ratio` times the bytes of the
+/// group so far. So runs of 1, 1, 2 and 4 units, newest first, merge in one job.
+///
+/// With an infinite `ratio` every pair qualifies, and the rule is that of stage 2c: the two
+/// oldest runs, once there are two. (Read literally, the similar-size rule would merge all runs
+/// from the newest at once; any finite ratio, however large, does that.)
+pub(super) fn minor_group(sizes: &[u64], first: usize, ratio: f64) -> Option<Range<usize>> {
+    let n = sizes.len();
+    if n < first + 2 {
+        return None;
+    }
+    if ratio == f64::INFINITY {
+        return Some(n - MERGE_RUNS..n);
+    }
+    let within = |older: u64, newer: u64| older as f64 <= ratio * newer as f64;
+    let a = (first..n - 1).find(|&i| within(sizes[i + 1], sizes[i]))?;
+    let mut group = sizes[a] + sizes[a + 1];
+    let mut b = a + 2;
+    while b < n && within(sizes[b], group) {
+        group += sizes[b];
+        b += 1;
+    }
+    Some(a..b)
+}
+
+/// The oldest runs that a major merge absorbs, of the `runs - first` that it may take (see
+/// [`mergeable_from`]): at most [`MERGE_RUNS`] with the default minor rule, as in stage 2c, and
+/// all of them with merges by similar size, whose runs are a few of growing size: what the merge
+/// leaves would otherwise start the next cycle as runs to merge again.
+pub(super) fn major_runs(runs: usize, first: usize, ratio: f64) -> usize {
+    let may = runs.saturating_sub(first);
+    if ratio == f64::INFINITY {
+        may.min(MERGE_RUNS)
+    } else {
+        may
+    }
+}
+
+/// The newest runs that a flush of a range with `runs` runs replaces, when `free` of its newest
+/// runs are newer than the runs of the merge in flight: none below `max_runs`, else the newest
+/// `free`, at most [`FLUSH_MERGE_RUNS`] (rule 2 of the module documentation). `None` if the range
+/// is full and the merge holds its newest run, which rule 1 rules out.
+pub(super) fn flush_replaces(runs: usize, free: usize, max_runs: usize) -> Option<usize> {
+    if runs < max_runs {
+        return Some(0);
+    }
+    match free.min(FLUSH_MERGE_RUNS) {
+        0 => None,
+        replaced => Some(replaced),
+    }
+}
+
+/// A merge that a range's layers call for, with its runs as positions newest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MergePlan {
+    pub(super) merge: Merge,
+    pub(super) runs: Range<usize>,
+}
+
+/// The merge that `layers`, the layers of `range`, call for, when the flush in flight replaces
+/// the `flush_held` newest runs: a major merge of the oldest runs of [`major_runs`] when the range
+/// has a base and its run bytes reach [`major_threshold`], else the minor merge of
+/// [`minor_group`], if any.
+pub(super) fn plan_merge(
     range: &CachedRange,
     layers: &Layers,
     tuning: &RangeCacheTuning,
-) -> Option<Merge> {
-    if layers.runs.is_empty() {
+    flush_held: usize,
+) -> Option<MergePlan> {
+    let n = layers.runs.len();
+    let first = mergeable_from(n, flush_held, tuning.max_runs);
+    if first == n {
         return None;
     }
     if let Some(base) = &layers.base {
         let run_bytes: u64 = layers.runs.iter().map(|r| r.file_bytes()).sum();
         if run_bytes >= major_threshold(range, base.file_len(), tuning) {
-            return Some(Merge::Major);
+            let absorbed = major_runs(n, first, tuning.minor_merge_ratio);
+            return Some(MergePlan {
+                merge: Merge::Major,
+                runs: n - absorbed..n,
+            });
         }
     }
-    (layers.runs.len() >= MERGE_RUNS).then_some(Merge::Minor)
+    let sizes: Vec<u64> = layers.runs.iter().map(|r| r.file_bytes()).collect();
+    minor_group(&sizes, first, tuning.minor_merge_ratio).map(|runs| MergePlan {
+        merge: Merge::Minor,
+        runs,
+    })
+}
+
+/// The merge that `layers`, the layers of `range`, call for when no flush is in flight. A flush
+/// in flight only defers it: its end notifies the task, which looks at the range again.
+pub(super) fn merge_due(
+    range: &CachedRange,
+    layers: &Layers,
+    tuning: &RangeCacheTuning,
+) -> Option<Merge> {
+    plan_merge(range, layers, tuning, 0).map(|plan| plan.merge)
 }
 
 impl RangeCache {
@@ -248,24 +401,17 @@ impl RangeCache {
         self.maintenance.rx.clone()
     }
 
-    /// Writes every sealed buffer of `range` to one run and installs it. When the range holds
-    /// [`MAX_RUNS`] runs, the run also takes the versions of its [`FLUSH_MERGE_RUNS`] newest runs,
-    /// and replaces them. Does nothing if the range has no sealed buffer.
-    async fn flush(self: &Arc<Self>, range: &Arc<CachedRange>) -> Result<(), SlateDBError> {
-        let layers = range.layers.load_full();
-        let buffers = layers.sealed.clone();
-        let Some(newest) = buffers.first() else {
-            return Ok(());
-        };
-        let hi = newest.sealed_at().load(Ordering::Acquire);
-        let merged = if layers.runs.len() >= MAX_RUNS {
-            FLUSH_MERGE_RUNS
-        } else {
-            0
-        };
-        let replaces = layers.runs[..merged].to_vec();
-        let lo = replaces.last().map_or(layers.covered_to, |r| r.lo);
-        drop(layers);
+    /// Writes `buffers`, the sealed buffers of `range` (newest first), with the versions of
+    /// `replaces`, its newest runs (newest first, none for a plain flush), to one run of
+    /// `(lo, hi]`, and installs it in their place. The task chose them (see [`Job::Flush`]).
+    async fn flush(
+        self: &Arc<Self>,
+        range: &Arc<CachedRange>,
+        buffers: Vec<Arc<Delta>>,
+        replaces: Vec<Arc<Run>>,
+        lo: u64,
+        hi: u64,
+    ) -> Result<(), SlateDBError> {
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-flush");
         let run = {
             let (cache, buffers, replaces) = (self.clone(), buffers.clone(), replaces.clone());
@@ -312,37 +458,38 @@ impl RangeCache {
         Ok(Run::new(file, lo, hi)?)
     }
 
-    /// Merges the oldest [`MERGE_RUNS`] runs of `range` into one run, every version kept, and
-    /// installs it.
-    async fn minor_merge(self: &Arc<Self>, range: &Arc<CachedRange>) -> Result<(), SlateDBError> {
-        let layers = range.layers.load_full();
-        let Some(first) = layers.runs.len().checked_sub(MERGE_RUNS) else {
+    /// Merges `inputs`, adjacent runs of `range` (newest first), into one run of their union
+    /// interval, every version kept, and installs it in their place, wherever they are by then.
+    async fn minor_merge(
+        self: &Arc<Self>,
+        range: &Arc<CachedRange>,
+        inputs: Vec<Arc<Run>>,
+    ) -> Result<(), SlateDBError> {
+        let (Some(newest), Some(oldest)) = (inputs.first(), inputs.last()) else {
             return Ok(());
         };
-        let inputs = layers.runs[first..].to_vec();
-        drop(layers);
-        let (lo, hi) = (inputs[inputs.len() - 1].lo, inputs[0].hi);
+        let (lo, hi) = (oldest.lo, newest.hi);
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-minor-merge");
         let output = {
             let (cache, inputs) = (self.clone(), inputs.clone());
             Arc::new(off_workers(move || cache.write_run(&[], &inputs, lo, hi)).await?)
         };
+        // Checkers hold the merged run here while flushes put runs before its inputs.
+        fail_point!(Arc::clone(&self.fp_registry), "range-cache-install-minor");
         if self.install_minor(range, inputs, output).await {
             self.evict(None).await;
         }
         Ok(())
     }
 
-    /// Merges the base of `range` with its oldest runs, at most [`MERGE_RUNS`], into a new base
-    /// at the newest absorbed run's `hi`, and installs it.
-    async fn major_merge(self: &Arc<Self>, range: &Arc<CachedRange>) -> Result<(), SlateDBError> {
-        let layers = range.layers.load_full();
-        let Some(base) = layers.base.clone() else {
-            return Ok(());
-        };
-        let first = layers.runs.len().saturating_sub(MERGE_RUNS);
-        let absorbed = layers.runs[first..].to_vec();
-        drop(layers);
+    /// Merges `base`, the base of `range`, with `absorbed`, its oldest runs (newest first), into
+    /// a new base at the newest absorbed run's `hi`, and installs it.
+    async fn major_merge(
+        self: &Arc<Self>,
+        range: &Arc<CachedRange>,
+        base: Arc<RangeFile>,
+        absorbed: Vec<Arc<Run>>,
+    ) -> Result<(), SlateDBError> {
         let Some(base_seq) = absorbed.first().map(|r| r.hi) else {
             return Ok(());
         };
@@ -429,11 +576,34 @@ pub(crate) struct Maintainer {
     major_queue: VecDeque<Weak<CachedRange>>,
 }
 
-/// A job of the maintenance task.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A job of the maintenance task, with the inputs that the task chose when it started it (see
+/// "Which runs a job takes" in the module documentation).
 enum Job {
-    Flush,
-    Merge(Merge),
+    /// Write `buffers`, every sealed buffer of the range (newest first), and the versions of
+    /// `replaces`, its newest runs (newest first), to one run of `(lo, hi]`.
+    Flush {
+        buffers: Vec<Arc<Delta>>,
+        replaces: Vec<Arc<Run>>,
+        lo: u64,
+        hi: u64,
+    },
+    /// Merge these adjacent runs (newest first) into one run.
+    Minor(Vec<Arc<Run>>),
+    /// Merge `base` with `absorbed`, the oldest runs (newest first), into a new base.
+    Major {
+        base: Arc<RangeFile>,
+        absorbed: Vec<Arc<Run>>,
+    },
+}
+
+impl Job {
+    fn name(&self) -> &'static str {
+        match self {
+            Job::Flush { .. } => "range_cache_flush",
+            Job::Minor(_) => "range_cache_minor_merge",
+            Job::Major { .. } => "range_cache_major_merge",
+        }
+    }
 }
 
 impl Maintainer {
@@ -496,17 +666,52 @@ impl Maintainer {
         if jobs.merging() || jobs.merge_queued.load(Ordering::Relaxed) {
             return;
         }
-        let queue = match merge_due(range, &layers, &self.cache.options.tuning) {
-            Some(Merge::Minor) => &mut self.minor_queue,
-            Some(Merge::Major) => &mut self.major_queue,
+        let tuning = &self.cache.options.tuning;
+        let queue = match plan_merge(range, &layers, tuning, jobs.flush_held()) {
+            Some(MergePlan {
+                merge: Merge::Minor,
+                ..
+            }) => &mut self.minor_queue,
+            Some(MergePlan {
+                merge: Merge::Major,
+                ..
+            }) => &mut self.major_queue,
+            // A flush in flight may defer the merge: its end notifies the task.
             None => return,
         };
         jobs.merge_queued.store(true, Ordering::Relaxed);
         queue.push_back(Arc::downgrade(range));
     }
 
+    /// The flush that `range` calls for, with its inputs: every sealed buffer, and when the range
+    /// holds `max_runs` runs, its newest runs that the merge in flight does not hold, at most
+    /// [`FLUSH_MERGE_RUNS`]. `None` if the range has no sealed buffer.
+    fn plan_flush(&self, range: &CachedRange) -> Option<Job> {
+        let layers = range.layers.load();
+        let newest = layers.sealed.first()?;
+        let hi = newest.sealed_at().load(Ordering::Acquire);
+        let (runs, max_runs) = (layers.runs.len(), self.cache.options.tuning.max_runs);
+        let free = range.jobs.free_newest(&layers.runs);
+        debug_assert!(
+            runs < max_runs || free > 0,
+            "a merge holds the newest run of a full range"
+        );
+        // Unreachable by rule 1. Were it not, the flush would wait for the merge, whose end
+        // notifies the task, rather than take a run that the merge holds.
+        let replaced = flush_replaces(runs, free, max_runs)?;
+        let replaces = layers.runs[..replaced].to_vec();
+        let lo = replaces.last().map_or(layers.covered_to, |r| r.lo);
+        Some(Job::Flush {
+            buffers: layers.sealed.clone(),
+            replaces,
+            lo,
+            hi,
+        })
+    }
+
     /// Starts queued jobs while slots are free: flushes, then minor merges, then major merges.
-    /// A job's range is checked again when it starts, as it may have changed while it waited.
+    /// A job's range is checked again when it starts, as it may have changed while it waited,
+    /// and the job's inputs are chosen then.
     fn start_queued(&mut self) {
         let cache = self.cache.clone();
         while cache.maintenance.flushes.load(Ordering::Acquire) < MAX_FLUSHES {
@@ -517,11 +722,11 @@ impl Maintainer {
                 continue;
             };
             range.jobs.flush_queued.store(false, Ordering::Relaxed);
-            if !range.jobs.flushing()
-                && !range.layers.load().sealed.is_empty()
-                && cache.is_indexed(&range)
-            {
-                self.start(&range, Job::Flush);
+            if range.jobs.flushing() || !cache.is_indexed(&range) {
+                continue;
+            }
+            if let Some(job) = self.plan_flush(&range) {
+                self.start(&range, job);
             }
         }
         while cache.maintenance.merges.load(Ordering::Acquire) < MAX_MERGES {
@@ -540,20 +745,33 @@ impl Maintainer {
                 continue;
             }
             let layers = range.layers.load();
-            let Some(merge) = merge_due(&range, &layers, &cache.options.tuning) else {
+            let tuning = &cache.options.tuning;
+            let Some(plan) = plan_merge(&range, &layers, tuning, range.jobs.flush_held()) else {
                 continue;
             };
-            if merge == Merge::Major {
-                let base_bytes = layers.base.as_ref().map_or(0, |b| b.file_len());
-                if !cache.rebuild_pays(&range, base_bytes) {
-                    // The range's buffers and runs hold its recent writes, so it stays exact
-                    // until the writer removes it.
-                    cache.request_removal(Target::Range(range.clone()), RemoveReason::NotWorthIt);
-                    continue;
+            let runs = layers.runs[plan.runs].to_vec();
+            let job = match (plan.merge, &layers.base) {
+                (Merge::Minor, _) => Job::Minor(runs),
+                (Merge::Major, Some(base)) => {
+                    if !cache.rebuild_pays(&range, base.file_len()) {
+                        // The range's buffers and runs hold its recent writes, so it stays exact
+                        // until the writer removes it.
+                        cache.request_removal(
+                            Target::Range(range.clone()),
+                            RemoveReason::NotWorthIt,
+                        );
+                        continue;
+                    }
+                    Job::Major {
+                        base: base.clone(),
+                        absorbed: runs,
+                    }
                 }
-            }
+                // A major merge is due only with a base.
+                (Merge::Major, None) => continue,
+            };
             drop(layers);
-            self.start(&range, Job::Merge(merge));
+            self.start(&range, job);
         }
     }
 
@@ -583,29 +801,39 @@ impl Maintainer {
         }
     }
 
-    /// Starts `job` on `range` as its own task.
+    /// Starts `job` on `range` as its own task, after it notes what the job holds.
     fn start(&mut self, range: &Arc<CachedRange>, job: Job) {
-        let (flag, running) = match job {
-            Job::Flush => (&range.jobs.flushing, &self.cache.maintenance.flushes),
-            Job::Merge(_) => (&range.jobs.merging, &self.cache.maintenance.merges),
+        let jobs = &range.jobs;
+        let flush = match &job {
+            Job::Flush { replaces, .. } => {
+                jobs.flush_replaces.store(replaces.len(), Ordering::Relaxed);
+                true
+            }
+            Job::Minor(runs) | Job::Major { absorbed: runs, .. } => {
+                jobs.merge_hi
+                    .store(runs.first().map_or(0, |r| r.hi), Ordering::Relaxed);
+                false
+            }
+        };
+        let (flag, running) = if flush {
+            (&jobs.flushing, &self.cache.maintenance.flushes)
+        } else {
+            (&jobs.merging, &self.cache.maintenance.merges)
         };
         flag.store(true, Ordering::Release);
         running.fetch_add(1, Ordering::AcqRel);
         let (cache, range) = (self.cache.clone(), range.clone());
         let (done_cache, done_range) = (cache.clone(), range.clone());
-        let name = match job {
-            Job::Flush => "range_cache_flush",
-            Job::Merge(Merge::Minor) => "range_cache_minor_merge",
-            Job::Merge(Merge::Major) => "range_cache_major_merge",
-        };
+        let name = job.name();
         let handle = spawn_bg_task(
             name.to_string(),
             &self.cache.handle,
             move |result: &Result<(), SlateDBError>| {
                 // Runs after the job, also if it failed or panicked.
-                let (flag, running) = match job {
-                    Job::Flush => (&done_range.jobs.flushing, &done_cache.maintenance.flushes),
-                    Job::Merge(_) => (&done_range.jobs.merging, &done_cache.maintenance.merges),
+                let (flag, running) = if flush {
+                    (&done_range.jobs.flushing, &done_cache.maintenance.flushes)
+                } else {
+                    (&done_range.jobs.merging, &done_cache.maintenance.merges)
                 };
                 flag.store(false, Ordering::Release);
                 running.fetch_sub(1, Ordering::AcqRel);
@@ -619,9 +847,16 @@ impl Maintainer {
             },
             async move {
                 match job {
-                    Job::Flush => cache.flush(&range).await,
-                    Job::Merge(Merge::Minor) => cache.minor_merge(&range).await,
-                    Job::Merge(Merge::Major) => cache.major_merge(&range).await,
+                    Job::Flush {
+                        buffers,
+                        replaces,
+                        lo,
+                        hi,
+                    } => cache.flush(&range, buffers, replaces, lo, hi).await,
+                    Job::Minor(inputs) => cache.minor_merge(&range, inputs).await,
+                    Job::Major { base, absorbed } => {
+                        cache.major_merge(&range, base, absorbed).await
+                    }
                 }
             },
         );
@@ -679,8 +914,8 @@ mod tests {
     use crate::range_cache::filter::hash_key;
     use crate::range_cache::stats::{
         Unfit, FLUSHED_BUFFER_COUNT, FLUSH_BYTES, FLUSH_COUNT, FLUSH_MERGE_COUNT,
-        INSTALL_REJECTED_COUNT, LOAD_REJECTED_COUNT, MINOR_MERGE_COUNT, MULTI_BUFFER_FLUSH_COUNT,
-        REBUILD_COUNT, REMOVE_COUNT, SEAL_COUNT,
+        FLUSH_MERGE_RUN_COUNT, INSTALL_REJECTED_COUNT, LOAD_REJECTED_COUNT, MINOR_MERGE_COUNT,
+        MINOR_MERGE_RUNS_COUNT, MULTI_BUFFER_FLUSH_COUNT, REBUILD_COUNT, REMOVE_COUNT, SEAL_COUNT,
     };
     use crate::range_cache::{CachedRangeInfo, RangeCacheOptions};
 
@@ -1273,8 +1508,9 @@ mod tests {
         load(&t, 0, 100).await;
         let range = t.range(&key(0));
         let snapshot = t.db.snapshot().unwrap();
+        let max_runs = RangeCacheTuning::default().max_runs;
         t.fail("range-cache-minor-merge", "pause");
-        for runs in 1..=MAX_RUNS {
+        for runs in 1..=max_runs {
             seal_and_flush(&t, 0, 100).await;
             assert_eq!(t.info(&key(0)).runs, runs);
         }
@@ -1282,8 +1518,12 @@ mod tests {
         t.assert_reads(0, 100, Some(&snapshot)).await;
         seal_and_flush(&t, 0, 100).await;
         assert_eq!(t.metric(FLUSH_MERGE_COUNT, &[]), 1);
+        assert_eq!(
+            t.metric(FLUSH_MERGE_RUN_COUNT, &[]),
+            FLUSH_MERGE_RUNS as i64
+        );
         let three = range.layers.load_full();
-        assert_eq!(three.runs.len(), MAX_RUNS - FLUSH_MERGE_RUNS + 1);
+        assert_eq!(three.runs.len(), max_runs - FLUSH_MERGE_RUNS + 1);
         let merged = &three.runs[0];
         assert_eq!(merged.lo, four.runs[FLUSH_MERGE_RUNS - 1].lo);
         assert_eq!(merged.hi, three.covered_to);
@@ -1360,8 +1600,11 @@ mod tests {
             CompactionWorkerOptions, CompactorOptions, FlushOptions, FlushType, Settings,
             SizeTieredCompactionSchedulerOptions,
         };
+        // One memtable flush writes one L0 SST with every row, so the compactor forms one sorted
+        // run, of several SSTs: the split points come from the largest sorted run only, and rows
+        // in a second run would stay in one part past its last block.
         let settings = Settings {
-            l0_sst_size_bytes: 64 * 1024,
+            l0_sst_size_bytes: 4 * 1024 * 1024,
             compactor_options: Some(CompactorOptions {
                 poll_interval: Duration::from_millis(5),
                 scheduler_options: SizeTieredCompactionSchedulerOptions {
@@ -1371,6 +1614,7 @@ mod tests {
                 .into(),
                 worker: Some(CompactionWorkerOptions {
                     compactions_poll_interval: Duration::from_millis(5),
+                    max_sst_size: 128 * 1024,
                     ..Default::default()
                 }),
                 ..CompactorOptions::default()
@@ -1484,6 +1728,22 @@ mod tests {
             ..RangeCacheTuning::default()
         };
         assert_eq!(major_threshold(&range, 1024, &floor), 5 * mib);
+        // A fixed factor ignores the run size and the adaptive bounds, but keeps the floor.
+        let fixed = |f: f64, floor: usize| RangeCacheTuning {
+            major_merge_factor: Some(f),
+            min_rebuild_delta_bytes: floor,
+            ..RangeCacheTuning::default()
+        };
+        assert_eq!(major_threshold(&range, 64 * mib, &fixed(0.5, 0)), 32 * mib);
+        assert_eq!(major_threshold(&range, 64 * mib, &fixed(2.0, 0)), 128 * mib);
+        assert_eq!(
+            major_threshold(&range, 1 << 40, &fixed(0.01, 0)),
+            (0.01 * (1u64 << 40) as f64) as u64
+        );
+        assert_eq!(
+            major_threshold(&range, 1024, &fixed(1.0, 5 * mib as usize)),
+            5 * mib
+        );
     }
 
     /// The cap of 32 KiB, with no seal: buffers grow by chunks of 4, 8, 16 and 32 KiB.
@@ -1597,5 +1857,443 @@ mod tests {
         assert!(passed < 50, "{passed} of 700 absent keys passed");
         t.assert_reads(0, 1000, Some(&early)).await;
         t.db.close().await.unwrap();
+    }
+
+    /// The minor rule of `minor_merge_ratio`: an infinite ratio takes the two oldest runs, as in
+    /// stage 2c; a finite one takes runs of similar size from the newest end, a whole cascade at
+    /// once, and never a run before `first`.
+    #[test]
+    fn should_pick_minor_merge_groups_by_size() {
+        let inf = f64::INFINITY;
+        // The stage 2c rule, whatever the sizes.
+        assert_eq!(minor_group(&[], 0, inf), None);
+        assert_eq!(minor_group(&[1], 0, inf), None);
+        assert_eq!(minor_group(&[1, 1], 0, inf), Some(0..2));
+        assert_eq!(minor_group(&[1, 100], 0, inf), Some(0..2));
+        assert_eq!(minor_group(&[7, 1, 100, 3], 0, inf), Some(2..4));
+        assert_eq!(minor_group(&[7, 1, 100, 3], 1, inf), Some(2..4));
+        assert_eq!(minor_group(&[7, 1, 100], 2, inf), None);
+        // By similar size at ratio 2: a cascade is one merge.
+        assert_eq!(minor_group(&[1, 1, 2, 4], 0, 2.0), Some(0..4));
+        assert_eq!(minor_group(&[1, 2, 5, 13], 0, 2.0), Some(0..4));
+        assert_eq!(minor_group(&[1, 1, 3, 8], 0, 2.0), Some(0..4));
+        // The group stops before a run of more than twice its bytes.
+        assert_eq!(minor_group(&[1, 1, 5], 0, 2.0), Some(0..2));
+        assert_eq!(minor_group(&[1, 1, 2, 9, 1], 0, 2.0), Some(0..3));
+        // No pair qualifies: each older run holds more than twice the newer one.
+        assert_eq!(minor_group(&[1, 3], 0, 2.0), None);
+        assert_eq!(minor_group(&[1, 3, 8, 21], 0, 2.0), None);
+        // The newest qualifying pair starts the group, and an older run may be the smaller.
+        assert_eq!(minor_group(&[1, 3, 4, 5], 0, 2.0), Some(1..4));
+        assert_eq!(minor_group(&[4, 1, 1], 0, 2.0), Some(0..3));
+        // Runs before `first` are left alone.
+        assert_eq!(minor_group(&[1, 1, 2, 4], 1, 2.0), Some(1..4));
+        assert_eq!(minor_group(&[1, 1, 9], 1, 2.0), None);
+        // Ratio 1 merges an older run only if it is no larger than the newer ones.
+        assert_eq!(minor_group(&[2, 2], 0, 1.0), Some(0..2));
+        assert_eq!(minor_group(&[2, 3], 0, 1.0), None);
+        // Any finite ratio, however large, merges from the newest end; infinity does not.
+        assert_eq!(minor_group(&[1, 1, 1], 0, 1e12), Some(0..3));
+        assert_eq!(minor_group(&[1, 1, 1], 0, inf), Some(1..3));
+    }
+
+    /// Rules 1 and 2 of the module documentation, and the runs of major merges, as numbers.
+    #[test]
+    fn should_bound_the_runs_of_flushes_and_merges() {
+        // Rule 1: a merge leaves the flush's runs alone, and the newest run of a full range.
+        assert_eq!(mergeable_from(0, 0, 4), 0);
+        assert_eq!(mergeable_from(3, 0, 4), 0);
+        assert_eq!(mergeable_from(4, 0, 4), 1);
+        assert_eq!(mergeable_from(7, 0, 8), 0);
+        assert_eq!(mergeable_from(8, 0, 8), 1);
+        assert_eq!(mergeable_from(4, 2, 4), 2);
+        assert_eq!(mergeable_from(3, 2, 4), 2);
+        assert_eq!(mergeable_from(2, 2, 4), 2);
+        // Rule 2: the flush of a full range merges its free newest runs, at most two.
+        assert_eq!(flush_replaces(3, 0, 4), Some(0));
+        assert_eq!(flush_replaces(4, 4, 4), Some(2));
+        assert_eq!(flush_replaces(4, 2, 4), Some(2));
+        assert_eq!(flush_replaces(4, 1, 4), Some(1));
+        assert_eq!(flush_replaces(4, 0, 4), None);
+        assert_eq!(flush_replaces(8, 3, 8), Some(2));
+        // Major merges: the two oldest runs with the default rule, every one they may take by
+        // size.
+        assert_eq!(major_runs(4, 1, f64::INFINITY), 2);
+        assert_eq!(major_runs(1, 0, f64::INFINITY), 1);
+        assert_eq!(major_runs(4, 1, 2.0), 3);
+        assert_eq!(major_runs(3, 2, 2.0), 1);
+    }
+
+    /// A model of one range under rules 1 and 2, with the task's planning functions. Flushes and
+    /// merges start, install and end as separate steps in a random order, as the task and the
+    /// writer see them, so a job's flag stays set for a while after its install. Every flush of a
+    /// full range finds a run to merge, no run is held by a flush and a merge at once, every
+    /// install's precondition holds when it arrives, and no range passes `max_runs`.
+    #[test]
+    fn should_keep_flushes_and_merges_off_each_others_runs() {
+        /// A run by its interval, which identifies it (intervals are never empty here), and its
+        /// bytes.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        struct R {
+            lo: u64,
+            hi: u64,
+            bytes: u64,
+        }
+        /// A job in flight: the runs it holds, newest first.
+        struct InFlight {
+            runs: Vec<R>,
+            installed: bool,
+            major: bool,
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let ratios = [f64::INFINITY, 1.0, 2.0, 4.0, 1e9];
+        // Flush-merges of one run and of two, minor merges of more than two runs, major merges.
+        let mut seen = [0u64; 4];
+        for case in 0..2_000 {
+            let max_runs = 4 + case % 5;
+            let ratio = ratios[case / 5 % ratios.len()];
+            let mut runs: Vec<R> = Vec::new();
+            let (mut seq, mut covered_to) = (0u64, 0u64);
+            let mut flush: Option<InFlight> = None;
+            let mut merge: Option<InFlight> = None;
+            for _ in 0..400 {
+                match rand(6) {
+                    // The task starts a flush.
+                    0 if flush.is_none() => {
+                        let free = match &merge {
+                            Some(m) => runs.iter().take_while(|r| r.hi > m.runs[0].hi).count(),
+                            None => runs.len(),
+                        };
+                        let replaced = flush_replaces(runs.len(), free, max_runs)
+                            .expect("a flush of a full range found no run to merge");
+                        let held = runs[..replaced].to_vec();
+                        if let Some(m) = merge.as_ref().filter(|m| !m.installed) {
+                            assert!(held.iter().all(|r| !m.runs.contains(r)));
+                        }
+                        flush = Some(InFlight {
+                            runs: held,
+                            installed: false,
+                            major: false,
+                        });
+                    }
+                    // The writer installs it, with the checks of `install_run_at`.
+                    1 => {
+                        if let Some(f) = flush.as_mut().filter(|f| !f.installed) {
+                            assert_eq!(&runs[..f.runs.len()], &f.runs[..], "a flush's runs moved");
+                            assert!(runs.len() - f.runs.len() < max_runs);
+                            let lo = f.runs.last().map_or(covered_to, |r| r.lo);
+                            seq += 1 + rand(4);
+                            let bytes = f.runs.iter().map(|r| r.bytes).sum::<u64>() + 1 + rand(8);
+                            runs.splice(..f.runs.len(), [R { lo, hi: seq, bytes }]);
+                            covered_to = seq;
+                            match f.runs.len() {
+                                1 => seen[0] += 1,
+                                2 => seen[1] += 1,
+                                _ => {}
+                            }
+                            f.installed = true;
+                        }
+                    }
+                    // The flush's end clears its flag.
+                    2 => {
+                        if flush.as_ref().is_some_and(|f| f.installed) {
+                            flush = None;
+                        }
+                    }
+                    // The task starts a merge, major or minor.
+                    3 if merge.is_none() => {
+                        let flush_held = flush.as_ref().map_or(0, |f| f.runs.len());
+                        let n = runs.len();
+                        let first = mergeable_from(n, flush_held, max_runs);
+                        let major = rand(4) == 0;
+                        let plan = if first == n {
+                            None
+                        } else if major {
+                            Some(n - major_runs(n, first, ratio)..n)
+                        } else {
+                            let sizes: Vec<u64> = runs.iter().map(|r| r.bytes).collect();
+                            minor_group(&sizes, first, ratio)
+                        };
+                        if let Some(at) = plan {
+                            let taken = runs[at].to_vec();
+                            if let Some(f) = flush.as_ref().filter(|f| !f.installed) {
+                                assert!(taken.iter().all(|r| !f.runs.contains(r)));
+                            }
+                            merge = Some(InFlight {
+                                runs: taken,
+                                installed: false,
+                                major,
+                            });
+                        }
+                    }
+                    // The writer installs it, with the checks of `install_minor_at` and
+                    // `install_major_at`.
+                    4 => {
+                        if let Some(m) = merge.as_mut().filter(|m| !m.installed) {
+                            let at = runs
+                                .iter()
+                                .position(|r| *r == m.runs[0])
+                                .expect("a merge's newest run is gone");
+                            let end = at + m.runs.len();
+                            assert_eq!(&runs[at..end], &m.runs[..], "a merge's runs moved");
+                            if m.major {
+                                assert_eq!(end, runs.len(), "absorbed runs are not the oldest");
+                                runs.truncate(at);
+                                seen[3] += 1;
+                            } else {
+                                let lo = m.runs[m.runs.len() - 1].lo;
+                                let bytes = m.runs.iter().map(|r| r.bytes).sum();
+                                let hi = m.runs[0].hi;
+                                runs.splice(at..end, [R { lo, hi, bytes }]);
+                                if m.runs.len() > 2 {
+                                    seen[2] += 1;
+                                }
+                            }
+                            m.installed = true;
+                        }
+                    }
+                    // The merge's end clears its flag.
+                    5 => {
+                        if merge.as_ref().is_some_and(|m| m.installed) {
+                            merge = None;
+                        }
+                    }
+                    _ => {}
+                }
+                assert!(runs.len() <= max_runs);
+                for pair in runs.windows(2) {
+                    assert_eq!(pair[0].lo, pair[1].hi, "runs are not contiguous");
+                }
+            }
+        }
+        assert!(seen.iter().all(|n| *n > 0), "a path never ran: {seen:?}");
+    }
+
+    /// With merges by similar size, a minor merge takes the two newest runs and leaves an older,
+    /// larger one. Flushes then put runs before its runs, so it installs in the middle of the
+    /// runs, and the flush of the full range merges only the newest run, the one that the merge
+    /// does not hold. No install is rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_install_a_merge_by_size_in_the_middle_of_the_runs() {
+        let t = open(|o| {
+            o.tuning.range_seal_bytes = 16 * 1024;
+            o.tuning.minor_merge_ratio = 2.0;
+        })
+        .await;
+        load(&t, 0, 1000).await;
+        let range = t.range(&key(0));
+        let snapshot = t.db.snapshot().unwrap();
+        // A large run first: a batch of every key seals the buffer once, at its end.
+        let mut batch = crate::WriteBatch::new();
+        for i in 0..1000 {
+            batch.put(key(i), value(i, 1));
+        }
+        let seals = t.seals();
+        t.db.write(batch).await.unwrap();
+        t.wait("the seal", |t| t.seals() == seals + 1).await;
+        t.wait("the flush", |t| {
+            let info = t.info(&key(0));
+            info.sealed_buffers == 0 && info.runs == 1
+        })
+        .await;
+        assert_eq!(t.seals(), seals + 1);
+        // Then small runs. A small run on the large one is no pair; two small ones are, and
+        // their merge waits before its install.
+        t.fail("range-cache-install-minor", "pause");
+        seal_and_flush(&t, 0, 100).await;
+        assert_eq!(t.info(&key(0)).runs, 2);
+        assert!(!t.info(&key(0)).rebuilding);
+        seal_and_flush(&t, 0, 100).await;
+        let three = range.layers.load_full();
+        assert_eq!(three.runs.len(), 3);
+        t.wait("the minor merge", |_| range.jobs.merging()).await;
+        // A plain flush puts a fourth run before the merge's runs.
+        seal_and_flush(&t, 0, 100).await;
+        assert_eq!(t.info(&key(0)).runs, 4);
+        // The range is full, and the merge holds its second newest run: the flush merges the
+        // newest one only.
+        seal_and_flush(&t, 0, 100).await;
+        let four = range.layers.load_full();
+        assert_eq!(four.runs.len(), 4);
+        assert_eq!(t.metric(FLUSH_MERGE_COUNT, &[]), 1);
+        assert_eq!(t.metric(FLUSH_MERGE_RUN_COUNT, &[]), 1);
+        for i in 0..3 {
+            assert!(Arc::ptr_eq(&four.runs[i + 1], &three.runs[i]));
+        }
+        t.assert_reads(0, 1000, Some(&snapshot)).await;
+        // The merge installs in the middle. The next merge waits before it writes, so the
+        // layers hold still.
+        t.fail("range-cache-minor-merge", "pause");
+        t.fail("range-cache-install-minor", "off");
+        t.wait("the minor merge", |t| t.metric(MINOR_MERGE_COUNT, &[]) == 1)
+            .await;
+        let after = range.layers.load_full();
+        assert_eq!(after.runs.len(), 3);
+        assert!(Arc::ptr_eq(&after.runs[0], &four.runs[0]));
+        let merged = &after.runs[1];
+        assert_eq!((merged.lo, merged.hi), (three.runs[1].lo, three.runs[0].hi));
+        assert_eq!(
+            merged.file.rows(),
+            three.runs[0].file.rows() + three.runs[1].file.rows()
+        );
+        assert!(Arc::ptr_eq(&after.runs[2], &three.runs[2]));
+        assert_eq!(after.covered_to, four.covered_to);
+        assert_eq!(t.metric(MINOR_MERGE_RUNS_COUNT, &[("runs", "2")]), 1);
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 0);
+        t.assert_reads(0, 1000, Some(&snapshot)).await;
+        t.fail("range-cache-minor-merge", "off");
+        t.wait("quiet", |t| !t.info(&key(0)).rebuilding).await;
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 0);
+        t.assert_reads(0, 1000, Some(&snapshot)).await;
+        t.db.close().await.unwrap();
+    }
+
+    /// The writer installs a minor merge wherever its runs are, at the newest end and in the
+    /// middle, and rejects runs that are not adjacent or not newest first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_install_minor_merges_anywhere_in_the_runs() {
+        let t = open(|o| o.tuning.range_seal_bytes = 16 * 1024).await;
+        load(&t, 0, 100).await;
+        let range = t.range(&key(0));
+        let cache = t.cache().clone();
+        let snapshot = t.db.snapshot().unwrap();
+        // The task's merge takes the two oldest runs and waits, while flushes reach four runs.
+        t.fail("range-cache-minor-merge", "pause");
+        for _ in 0..4 {
+            seal_and_flush(&t, 0, 100).await;
+        }
+        let four = range.layers.load_full();
+        assert_eq!(four.runs.len(), 4);
+        let merged = |inputs: &[Arc<Run>], lo: u64, hi: u64| {
+            Arc::new(cache.write_run(&[], inputs, lo, hi).unwrap())
+        };
+        let (r0, r1, r2) = (&four.runs[0], &four.runs[1], &four.runs[2]);
+        // Not adjacent, and not newest first.
+        let gap = vec![r0.clone(), r2.clone()];
+        let out = merged(&gap, r2.lo, r0.hi);
+        assert!(!cache.install_minor(&range, gap, out).await);
+        let out = merged(&[r0.clone(), r1.clone()], r1.lo, r0.hi);
+        assert!(
+            !cache
+                .install_minor(&range, vec![r1.clone(), r0.clone()], out)
+                .await
+        );
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 2);
+        // At the newest end.
+        let newest = vec![r0.clone(), r1.clone()];
+        let out = merged(&newest, r1.lo, r0.hi);
+        assert!(cache.install_minor(&range, newest, out.clone()).await);
+        let three = range.layers.load_full();
+        assert_eq!(three.runs.len(), 3);
+        assert!(Arc::ptr_eq(&three.runs[0], &out));
+        assert!(Arc::ptr_eq(&three.runs[1], &four.runs[2]));
+        assert!(Arc::ptr_eq(&three.runs[2], &four.runs[3]));
+        assert_eq!(three.covered_to, four.covered_to);
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        // A flush puts a run before it; then a merge of it and the next older run is in the
+        // middle. That run is one that the task's merge holds.
+        seal_and_flush(&t, 0, 100).await;
+        let again = range.layers.load_full();
+        assert_eq!(again.runs.len(), 4);
+        let middle = vec![again.runs[1].clone(), again.runs[2].clone()];
+        let out = merged(&middle, again.runs[2].lo, again.runs[1].hi);
+        assert!(cache.install_minor(&range, middle, out.clone()).await);
+        let after = range.layers.load_full();
+        assert_eq!(after.runs.len(), 3);
+        assert!(Arc::ptr_eq(&after.runs[0], &again.runs[0]));
+        assert!(Arc::ptr_eq(&after.runs[1], &out));
+        assert!(Arc::ptr_eq(&after.runs[2], &again.runs[3]));
+        assert_eq!(after.covered_to, again.covered_to);
+        assert_eq!(t.metric(MINOR_MERGE_RUNS_COUNT, &[("runs", "2")]), 2);
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        // The task's merge lost a run to the middle merge: its install is rejected.
+        let rejected = t.metric(INSTALL_REJECTED_COUNT, &[]);
+        t.fail("range-cache-minor-merge", "off");
+        t.wait("the held merge's rejection", |t| {
+            t.metric(INSTALL_REJECTED_COUNT, &[]) == rejected + 1
+        })
+        .await;
+        t.wait("quiet", |t| !t.info(&key(0)).rebuilding).await;
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        drop((four, three, again, after));
+        t.db.close().await.unwrap();
+    }
+
+    /// `max_runs` raises the most runs of a range: with the oldest two held by a merge, flushes
+    /// reach eight runs, and the next one merges the two newest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_hold_up_to_max_runs() {
+        let t = open(|o| {
+            o.tuning.range_seal_bytes = 16 * 1024;
+            o.tuning.max_runs = 8;
+        })
+        .await;
+        load(&t, 0, 100).await;
+        let snapshot = t.db.snapshot().unwrap();
+        t.fail("range-cache-minor-merge", "pause");
+        for runs in 1..=8 {
+            seal_and_flush(&t, 0, 100).await;
+            assert_eq!(t.info(&key(0)).runs, runs);
+        }
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        seal_and_flush(&t, 0, 100).await;
+        assert_eq!(t.info(&key(0)).runs, 7);
+        assert_eq!(t.metric(FLUSH_MERGE_COUNT, &[]), 1);
+        assert_eq!(t.metric(FLUSH_MERGE_RUN_COUNT, &[]), 2);
+        t.fail("range-cache-minor-merge", "off");
+        t.wait("quiet", |t| !t.info(&key(0)).rebuilding).await;
+        assert_eq!(t.info(&key(0)).runs, 1);
+        assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 0);
+        t.assert_reads(0, 100, Some(&snapshot)).await;
+        t.db.close().await.unwrap();
+    }
+
+    /// Run settings out of their bounds fail the build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_reject_run_settings_out_of_bounds() {
+        type Tune = fn(&mut RangeCacheTuning);
+        let cases: [(&str, Tune); 8] = [
+            ("max_runs 3", |t| t.max_runs = 3),
+            ("max_runs 9", |t| t.max_runs = 9),
+            ("ratio 0.5", |t| t.minor_merge_ratio = 0.5),
+            ("ratio NaN", |t| t.minor_merge_ratio = f64::NAN),
+            ("factor 0", |t| t.major_merge_factor = Some(0.0)),
+            ("factor -1", |t| t.major_merge_factor = Some(-1.0)),
+            ("factor infinite", |t| {
+                t.major_merge_factor = Some(f64::INFINITY)
+            }),
+            ("factor NaN", |t| t.major_merge_factor = Some(f64::NAN)),
+        ];
+        let build = |tune: fn(&mut RangeCacheTuning)| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = RangeCacheOptions::new(dir.path());
+            tune(&mut options.tuning);
+            let built = Db::builder("range_cache_settings", Arc::new(InMemory::new()))
+                .with_range_cache(options)
+                .build()
+                .await;
+            (built, dir)
+        };
+        for (name, tune) in cases {
+            assert!(build(tune).await.0.is_err(), "{name} was accepted");
+        }
+        let bounds: [Tune; 3] = [
+            |t| t.max_runs = 4,
+            |t| {
+                t.max_runs = 8;
+                t.minor_merge_ratio = 1.0;
+            },
+            |t| t.major_merge_factor = Some(2.0),
+        ];
+        for tune in bounds {
+            let (db, _dir) = build(tune).await;
+            db.unwrap().close().await.unwrap();
+        }
     }
 }

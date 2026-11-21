@@ -656,17 +656,32 @@ mod tests {
     struct Shape {
         cuts: Vec<u64>,
         runs: usize,
-        /// How run `i` is written, by the two bits at `2 * i`: 0 straight from its versions, 1
-        /// as a flush of two sealed buffers that split its interval, 2 as a minor merge of two
-        /// runs that split it, 3 as a flush-merge of a buffer with a run.
-        writes: u8,
+        /// How run `i` is written, by the three bits at `3 * i`: 0 straight from its versions,
+        /// 1 as a flush of two sealed buffers that split its interval, 2 as a minor merge of two
+        /// runs that split it, 3 as a flush-merge of a buffer with a run, 4 and 5 as minor merges
+        /// of three and four runs (cascades of merges by similar size), 6 as a flush-merge of a
+        /// buffer with two runs, 7 as a flush-merge of two buffers with two runs.
+        writes: u32,
+    }
+
+    /// The sealed buffers and the runs, newest first, whose merge writes a run of `how`.
+    fn merge_inputs(how: u32) -> (usize, usize) {
+        match how {
+            1 => (2, 0),
+            2 => (0, 2),
+            3 => (1, 1),
+            4 => (0, 3),
+            5 => (0, 4),
+            6 => (1, 2),
+            _ => (2, 2),
+        }
     }
 
     fn shape() -> impl Strategy<Value = Shape> {
-        proptest::collection::btree_set(BASE_SEQ + 1..MAX_SEQ, 0..6).prop_flat_map(|cuts| {
+        proptest::collection::btree_set(BASE_SEQ + 1..MAX_SEQ, 0..10).prop_flat_map(|cuts| {
             let cuts: Vec<u64> = cuts.into_iter().collect();
-            let most = cuts.len().min(crate::range_cache::MAX_RUNS);
-            (Just(cuts), 0..=most, any::<u8>()).prop_map(|(cuts, runs, writes)| Shape {
+            let most = cuts.len().min(*crate::range_cache::MAX_RUNS_RANGE.end());
+            (Just(cuts), 0..=most, any::<u32>()).prop_map(|(cuts, runs, writes)| Shape {
                 cuts,
                 runs,
                 writes,
@@ -768,20 +783,33 @@ mod tests {
         let mut runs = Vec::new();
         for i in 0..shape.runs {
             let (lo, hi) = (bounds[i], bounds[i + 1]);
-            let mid = lo + (hi - lo) / 2;
-            let run = match (shape.writes >> (2 * i)) & 3 {
+            let run = match (shape.writes >> (3 * i)) & 7 {
                 0 => file_of(format!("{name}-run{i}"), lo, hi),
                 how => {
-                    // Two inputs that split the interval at `mid`, written by the merge of
-                    // flushes, flush-merges and minor merges.
-                    let (low_buffer, high_buffer) = (buffer_of(lo, mid), buffer_of(mid, hi));
-                    let low_run = file_of(format!("{name}-run{i}-low"), lo, mid);
-                    let high_run = file_of(format!("{name}-run{i}-high"), mid, hi);
-                    let (buffers, inputs): (Vec<(&Delta, u64)>, Vec<&Run>) = match how {
-                        1 => (vec![(&high_buffer, hi), (&low_buffer, mid)], vec![]),
-                        2 => (vec![], vec![&high_run, &low_run]),
-                        _ => (vec![(&high_buffer, hi)], vec![&low_run]),
-                    };
+                    // Inputs that split the interval into parts, written by the merge of
+                    // flushes, flush-merges and minor merges. Part `j`, newest first, covers
+                    // `(edges[parts - j - 1], edges[parts - j]]`; the newest parts are the
+                    // sealed buffers, as in a flush-merge. Parts can be empty.
+                    let (buffer_parts, run_parts) = merge_inputs(how);
+                    let parts = buffer_parts + run_parts;
+                    let edges: Vec<u64> = (0..=parts)
+                        .map(|k| lo + (hi - lo) * k as u64 / parts as u64)
+                        .collect();
+                    let part = |j: usize| (edges[parts - j - 1], edges[parts - j]);
+                    let sealed: Vec<(Delta, u64)> = (0..buffer_parts)
+                        .map(|j| {
+                            let (l, h) = part(j);
+                            (buffer_of(l, h), h)
+                        })
+                        .collect();
+                    let merged: Vec<Run> = (buffer_parts..parts)
+                        .map(|j| {
+                            let (l, h) = part(j);
+                            file_of(format!("{name}-run{i}-part{j}"), l, h)
+                        })
+                        .collect();
+                    let buffers: Vec<(&Delta, u64)> = sealed.iter().map(|(d, s)| (d, *s)).collect();
+                    let inputs: Vec<&Run> = merged.iter().collect();
                     let mut writer =
                         RangeFileWriter::create_run(dir, &format!("{name}-run{i}"), 512).unwrap();
                     let written =
@@ -821,7 +849,7 @@ mod tests {
             covered_to: bounds[shape.runs],
             end,
         };
-        layers.check();
+        layers.check(*crate::range_cache::MAX_RUNS_RANGE.end());
         Arc::new(layers)
     }
 
@@ -854,7 +882,7 @@ mod tests {
 
         /// The direct scan returns exactly what the normal iterator stack returns over the same
         /// layers at the same sequence number, also after a seek. The layers have a base, up to
-        /// four runs, sealed buffers and the active buffer. With `split`, the scan walks two
+        /// eight runs, sealed buffers and the active buffer. With `split`, the scan walks two
         /// adjacent ranges, split at that key, and the normal stack reads the unsplit layers.
         #[test]
         fn should_match_the_normal_iterator_stack(
@@ -923,7 +951,7 @@ mod tests {
         /// of the whole history at that number, as the normal path over all versions would.
         ///
         /// The history is one table of all versions. The base holds its state at `BASE_SEQ`,
-        /// written the way a load or a major merge writes it; up to four runs, sealed buffers and
+        /// written the way a load or a major merge writes it; up to eight runs, sealed buffers and
         /// the active buffer hold the versions after the base. Unlike the test above, which reads
         /// the same layers both ways, the expected answer here does not come from the layers.
         /// Keys have many versions, so a run often holds several versions of a key, across its

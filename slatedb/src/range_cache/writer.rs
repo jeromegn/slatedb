@@ -37,9 +37,7 @@ use tokio::sync::oneshot;
 use super::auto::Removal;
 use super::file::RangeFile;
 use super::stats::RemoveReason;
-use super::{
-    covering, uncovered, CachedRange, Delta, Layers, Origin, RangeCache, RangeIndex, Run, MAX_RUNS,
-};
+use super::{covering, uncovered, CachedRange, Delta, Layers, Origin, RangeCache, RangeIndex, Run};
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
@@ -618,7 +616,7 @@ impl RangeCache {
 
     /// Publishes a new layer set of `range`.
     fn store_layers(&self, range: &CachedRange, layers: Layers) {
-        layers.check();
+        layers.check(self.options.tuning.max_runs);
         range.layers.store(Arc::new(layers));
     }
 
@@ -816,8 +814,9 @@ impl RangeCache {
     /// Preconditions: the range is indexed; `buffers` (newest first) are still its oldest sealed
     /// buffers; `replaces` (newest first) are still its newest runs; the run starts where the
     /// oldest replaced run starts, or at `covered_to` for a plain flush, and ends at the newest
-    /// buffer's seal; the range holds at most [`MAX_RUNS`] runs afterwards. Otherwise the run is
-    /// rejected, and its file is deleted when it drops.
+    /// buffer's seal; the range holds at most `max_runs` runs afterwards. Otherwise the run is
+    /// rejected, and its file is deleted when it drops. A merge in flight that holds other runs,
+    /// anywhere in the range, does not matter: the run goes first and the other runs stay.
     pub(super) fn install_run_at(
         &self,
         range: &Arc<CachedRange>,
@@ -840,7 +839,7 @@ impl RangeCache {
             || !newest
             || run.lo != lo
             || run.hi != buffers[0].sealed_at().load(Ordering::Acquire)
-            || layers.runs.len() - replaces.len() >= MAX_RUNS
+            || layers.runs.len() - replaces.len() >= self.options.tuning.max_runs
         {
             self.stats.installs_rejected.increment(1);
             return false;
@@ -855,6 +854,7 @@ impl RangeCache {
         } else {
             self.stats.flush_merges.increment(1);
             self.stats.flush_merge_bytes.increment(run.file_bytes());
+            self.stats.flush_merge_runs.increment(replaces.len() as u64);
         }
         let mut runs = Vec::with_capacity(layers.runs.len() + 1 - replaces.len());
         let covered_to = run.hi;
@@ -880,7 +880,11 @@ impl RangeCache {
     /// store that puts `output` in place of `inputs`. Every other part of the layer set stays.
     ///
     /// Preconditions: the range is indexed; `inputs` (newest first) are still a contiguous slice
-    /// of its runs; `output` covers their union. Otherwise the run is rejected.
+    /// of its runs; `output` covers their union. Otherwise the run is rejected. The slice is found
+    /// by identity, wherever it is now: at the oldest end, in the middle, or at the newest end,
+    /// and flushes may have put runs before it since the merge took it. The runs before and after
+    /// it keep their intervals, and the union interval joins them, so the runs stay contiguous.
+    /// `covered_to` does not change: at the newest end, the newest input's `hi` is `covered_to`.
     pub(super) fn install_minor_at(
         &self,
         range: &Arc<CachedRange>,
@@ -909,6 +913,7 @@ impl RangeCache {
         };
         self.stats.minor_merges.increment(1);
         self.stats.minor_merge_bytes.increment(output.file_bytes());
+        self.stats.minor_merge_of(inputs.len());
         let mut runs = Vec::with_capacity(layers.runs.len() + 1 - inputs.len());
         runs.extend(layers.runs[..at].iter().cloned());
         runs.push(output);

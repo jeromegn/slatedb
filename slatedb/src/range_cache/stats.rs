@@ -65,15 +65,22 @@ pub const FLUSH_BYTES: &str = range_cache_stat_name!("flush_bytes");
 pub const FLUSHED_BUFFER_COUNT: &str = range_cache_stat_name!("flushed_buffer_count");
 /// Flushes that wrote more than one sealed buffer.
 pub const MULTI_BUFFER_FLUSH_COUNT: &str = range_cache_stat_name!("multi_buffer_flush_count");
-/// Flushes of a range that held the most runs (4): the run they wrote also holds the versions of
-/// the range's two newest runs, which it replaced.
+/// Flushes of a range that held the most runs (`max_runs`, 4 by default): the run they wrote also
+/// holds the versions of the range's newest runs, at most two, which it replaced.
 pub const FLUSH_MERGE_COUNT: &str = range_cache_stat_name!("flush_merge_count");
 /// Bytes of run files that flush-merges wrote.
 pub const FLUSH_MERGE_BYTES: &str = range_cache_stat_name!("flush_merge_bytes");
-/// Minor merges: two runs of a range merged into one, every version kept.
+/// Runs that flush-merges replaced. Divide by `flush_merge_count` for the runs per flush-merge:
+/// two, or one when a merge in flight held the second newest run.
+pub const FLUSH_MERGE_RUN_COUNT: &str = range_cache_stat_name!("flush_merge_run_count");
+/// Minor merges: adjacent runs of a range merged into one, every version kept.
 pub const MINOR_MERGE_COUNT: &str = range_cache_stat_name!("minor_merge_count");
 /// Bytes of run files that minor merges wrote.
 pub const MINOR_MERGE_BYTES: &str = range_cache_stat_name!("minor_merge_bytes");
+/// Minor merges by the number of runs that each one took, in the `runs` label, from `1` to `8`.
+/// Over all labels they add up to `minor_merge_count`. The default rule always takes two; merges
+/// by similar size take more when they do a cascade.
+pub const MINOR_MERGE_RUNS_COUNT: &str = range_cache_stat_name!("minor_merge_runs_count");
 /// Flushed runs and merged bases that the writer rejected because the range changed meanwhile:
 /// it was removed, registered again, or its buffers or runs moved on.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
@@ -381,6 +388,11 @@ impl AutoStats {
     }
 }
 
+/// The values of the `runs` label of `minor_merge_runs_count`: as many as the most runs a range
+/// can hold.
+const MINOR_MERGE_RUNS_LABELS: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
+const _: () = assert!(MINOR_MERGE_RUNS_LABELS.len() == *super::MAX_RUNS_RANGE.end());
+
 /// The metrics of the range cache, except the counters of the read path. Those go through the
 /// `hits` module. See [`read_counters`].
 pub(crate) struct RangeCacheStats {
@@ -397,8 +409,12 @@ pub(crate) struct RangeCacheStats {
     pub(crate) multi_buffer_flushes: Arc<dyn CounterFn>,
     pub(crate) flush_merges: Arc<dyn CounterFn>,
     pub(crate) flush_merge_bytes: Arc<dyn CounterFn>,
+    pub(crate) flush_merge_runs: Arc<dyn CounterFn>,
     pub(crate) minor_merges: Arc<dyn CounterFn>,
     pub(crate) minor_merge_bytes: Arc<dyn CounterFn>,
+    /// Indexed by the number of runs a minor merge took, minus one; the last one also counts
+    /// larger merges.
+    minor_merges_by_runs: [Arc<dyn CounterFn>; MINOR_MERGE_RUNS_LABELS.len()],
     pub(crate) installs_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
@@ -432,8 +448,11 @@ impl RangeCacheStats {
             multi_buffer_flushes: recorder.counter(MULTI_BUFFER_FLUSH_COUNT).register(),
             flush_merges: recorder.counter(FLUSH_MERGE_COUNT).register(),
             flush_merge_bytes: recorder.counter(FLUSH_MERGE_BYTES).register(),
+            flush_merge_runs: recorder.counter(FLUSH_MERGE_RUN_COUNT).register(),
             minor_merges: recorder.counter(MINOR_MERGE_COUNT).register(),
             minor_merge_bytes: recorder.counter(MINOR_MERGE_BYTES).register(),
+            minor_merges_by_runs: MINOR_MERGE_RUNS_LABELS
+                .map(|runs| labeled(MINOR_MERGE_RUNS_COUNT, "runs", runs)),
             installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
@@ -447,6 +466,12 @@ impl RangeCacheStats {
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
             meta_bytes: recorder.gauge(META_BYTES).register(),
         }
+    }
+
+    /// Counts a minor merge of `runs` runs in `minor_merge_runs_count`.
+    pub(crate) fn minor_merge_of(&self, runs: usize) {
+        let at = runs.clamp(1, MINOR_MERGE_RUNS_LABELS.len()) - 1;
+        self.minor_merges_by_runs[at].increment(1);
     }
 
     pub(crate) fn removed(&self, reason: RemoveReason) {

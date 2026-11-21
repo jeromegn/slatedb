@@ -7,11 +7,11 @@
 //!   in it needs no other source.
 //! - A cached range has one *layer set* (design 01 section 4.3), newest first: the *active
 //!   buffer*, which the writer appends to; *sealed buffers*, which wait for their flush; up to
-//!   [`MAX_RUNS`] *runs*, each a file of every version of the range in an interval of sequence
-//!   numbers `(lo, hi]`; and a *base*, a file of the state of the range at `base_seq`. The runs
-//!   cover `(base_seq, covered_to]` without a gap, and the buffers hold every version above
-//!   `covered_to`. A buffer is a sorted map that only the writer appends to and that reads search
-//!   without a shared write (see the `buffer` and `delta` modules).
+//!   [`RangeCacheTuning::max_runs`] *runs*, each a file of every version of the range in an
+//!   interval of sequence numbers `(lo, hi]`; and a *base*, a file of the state of the range at
+//!   `base_seq`. The runs cover `(base_seq, covered_to]` without a gap, and the buffers hold
+//!   every version above `covered_to`. A buffer is a sorted map that only the writer appends to
+//!   and that reads search without a shared write (see the `buffer` and `delta` modules).
 //! - The batch writer applies each write to the active buffer after it puts the write in the
 //!   memtable and before it advances the last committed sequence number. Reads at the latest
 //!   committed state read the layers with that sequence number as the bound, so a write becomes
@@ -124,9 +124,9 @@ use writer::{Padded, Target, WriterQueue};
 /// The number of times a read tries to pin a range before it uses the normal read path.
 const PIN_ATTEMPTS: usize = 3;
 
-/// The most runs that a range holds (design 01's `D_hard`). While a range holds this many, its
-/// flushes wait for a major merge.
-pub(crate) const MAX_RUNS: usize = 4;
+/// The values that [`RangeCacheTuning::max_runs`] may take. Nothing in the read path is sized by
+/// it: reads walk the runs that a range holds.
+pub(crate) const MAX_RUNS_RANGE: std::ops::RangeInclusive<usize> = 4..=8;
 
 /// Options for the range cache. See [`crate::DbBuilder::with_range_cache`].
 ///
@@ -178,9 +178,42 @@ pub struct RangeCacheTuning {
     pub page_size: usize,
     /// The smallest run bytes that cause a major merge (a rebuild of the base). A major merge
     /// starts when the run files of a range are larger than this value and larger than `f` times
-    /// its base, where `f = sqrt(2r / B)` for the range's average flush `r` and base `B`, between
-    /// 0.05 and 1 (design 01 sections 7.5 and 7.9).
+    /// its base, where `f` is `major_merge_factor` (design 01 sections 7.5 and 7.9).
     pub min_rebuild_delta_bytes: usize,
+    /// The major-merge factor `f`: a major merge of a range starts when its run files reach `f`
+    /// times its base (and `min_rebuild_delta_bytes`). `None`, the default, chooses
+    /// `f = sqrt(2r / B)` for each range from its average flush `r` and its base `B`, between
+    /// 0.05 and 1, which writes least with the default `minor_merge_ratio` (design 01 section
+    /// 7.9). `Some(f)` fixes it; it must be positive and finite. With similar-size minor merges a
+    /// byte is rewritten by minor merges about `log n` times over `n` flushes instead of `n / 2`,
+    /// so the best fixed `f` is larger, close to 1 whatever the base and run sizes (inferred from
+    /// a model, not measured). The runs of a range then take up to `f` times its base on disk.
+    pub major_merge_factor: Option<f64>,
+    /// How the maintenance task picks the runs of a minor merge, which merges adjacent runs of a
+    /// range into one run, every version kept, without touching the base.
+    ///
+    /// With a finite ratio, runs merge by similar size. From the newest run towards the oldest,
+    /// the first two adjacent runs where the older one holds at most `ratio` times the bytes of
+    /// the newer one start a group, and the group takes each next older run while that run holds
+    /// at most `ratio` times the bytes of the group so far. So one merge does a whole cascade:
+    /// runs of 1, 1, 2 and 4 MiB, newest first, merge into one run of 8 MiB. Each byte is
+    /// rewritten about `log n` times over `n` flushes, and a range holds a few runs most of the
+    /// time. Any finite value, however large, merges cascades from the newest end. It must be at
+    /// least 1.
+    ///
+    /// `f64::INFINITY`, the default, keeps the rule of stage 2c: whenever a range holds two runs
+    /// or more, its two oldest runs merge. A range then holds one or two runs most of the time,
+    /// and each byte is rewritten about `n / 2` times over `n` flushes.
+    ///
+    /// Either way, a merge leaves alone the runs that a flush in flight merges, and while the
+    /// range holds `max_runs` runs it leaves the newest one, so that a flush can always merge it.
+    pub minor_merge_ratio: f64,
+    /// The most runs that a range holds (design 01's `D_hard`), from 4 to 8. A flush of a range
+    /// that holds this many merges the range's newest runs, at most two, into the run it writes.
+    /// A read searches every run that its interval, key bounds and filter do not rule out, so
+    /// more runs cost reads only when a range holds them: a filtered run that a read rules out
+    /// costs a point read about 7 ns and a 10-row scan about 0.25 µs (stage 2b measurement).
+    pub max_runs: usize,
     /// The chunk bytes at which the writer seals a range's active write buffer, so that the
     /// maintenance task can flush it to a run.
     pub range_seal_bytes: usize,
@@ -270,6 +303,9 @@ impl Default for RangeCacheTuning {
         Self {
             page_size: 4096,
             min_rebuild_delta_bytes: 1024 * 1024,
+            major_merge_factor: None,
+            minor_merge_ratio: f64::INFINITY,
+            max_runs: 4,
             range_seal_bytes: 4 * 1024 * 1024,
             max_recent_bytes: 256 * 1024 * 1024,
             min_seal_bytes: 64 * 1024,
@@ -429,8 +465,8 @@ pub(crate) struct Layers {
     /// Sealed buffers that wait for their flush, newest first. Each one's `lo` is the seal of the
     /// next one, and the oldest one's `lo` is `covered_to`.
     sealed: Vec<Arc<Delta>>,
-    /// Runs, newest first, at most [`MAX_RUNS`]: run `i` covers `(lo_i, hi_i]` with
-    /// `hi_{i+1} = lo_i`, and the oldest one's `lo` is `base_seq`.
+    /// Runs, newest first, at most [`RangeCacheTuning::max_runs`]: run `i` covers
+    /// `(lo_i, hi_i]` with `hi_{i+1} = lo_i`, and the oldest one's `lo` is `base_seq`.
     runs: Vec<Arc<Run>>,
     /// `None` while the range loads.
     base: Option<Arc<RangeFile>>,
@@ -450,13 +486,14 @@ impl Layers {
         std::iter::once(&self.active).chain(self.sealed.iter())
     }
 
-    /// Checks the layer set's invariants (design 01 section 10.1, I4, I5 and I7) in debug builds.
-    fn check(&self) {
+    /// Checks the layer set's invariants (design 01 section 10.1, I4, I5 and I7) in debug builds,
+    /// with at most `max_runs` runs.
+    fn check(&self, max_runs: usize) {
         if !cfg!(debug_assertions) {
             return;
         }
         assert!(
-            self.runs.len() <= MAX_RUNS,
+            self.runs.len() <= max_runs,
             "a range holds {} runs",
             self.runs.len()
         );
@@ -829,6 +866,27 @@ impl RangeCache {
             return Err(SlateDBError::InvalidConfiguration(
                 "range cache load_fetch_bytes and load_fetch_tasks must be positive".to_string(),
             ));
+        }
+        if !MAX_RUNS_RANGE.contains(&options.tuning.max_runs) {
+            return Err(SlateDBError::InvalidConfiguration(format!(
+                "range cache max_runs {} is not in {}..={}",
+                options.tuning.max_runs,
+                MAX_RUNS_RANGE.start(),
+                MAX_RUNS_RANGE.end()
+            )));
+        }
+        let ratio = options.tuning.minor_merge_ratio;
+        if ratio.is_nan() || ratio < 1.0 {
+            return Err(SlateDBError::InvalidConfiguration(format!(
+                "range cache minor_merge_ratio {ratio} is not at least 1"
+            )));
+        }
+        if let Some(f) = options.tuning.major_merge_factor {
+            if !f.is_finite() || f <= 0.0 {
+                return Err(SlateDBError::InvalidConfiguration(format!(
+                    "range cache major_merge_factor {f} is not positive and finite"
+                )));
+            }
         }
         std::fs::create_dir_all(&options.root_folder)?;
         for entry in std::fs::read_dir(&options.root_folder)? {
