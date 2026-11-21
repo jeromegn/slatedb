@@ -698,6 +698,33 @@ impl Drop for RangeFileWriter {
     }
 }
 
+/// What the open files of one cache take: their bytes on disk, and their metadata on the heap
+/// (fence indexes and run filters), from their open until their last holder drops them. Each
+/// file adds its own bytes once when it opens and subtracts them once when it drops.
+#[derive(Debug, Default)]
+pub(crate) struct FileBudget {
+    disk: AtomicU64,
+    meta: AtomicU64,
+}
+
+impl FileBudget {
+    /// A budget that nothing else counts in, for tests.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The bytes on disk of all open files.
+    pub(crate) fn disk(&self) -> u64 {
+        self.disk.load(Ordering::Relaxed)
+    }
+
+    /// The heap bytes of the fence indexes and filters of all open files.
+    pub(crate) fn meta(&self) -> u64 {
+        self.meta.load(Ordering::Relaxed)
+    }
+}
+
 /// What [`RangeFile::read_version`] found.
 pub(crate) enum FileRead {
     /// A value, copied out with its key.
@@ -732,8 +759,10 @@ pub(crate) struct RangeFile {
     run: bool,
     /// A run's filter, copied from the file, until [`RangeFile::take_filter`].
     filter: Option<Filter>,
-    /// The bytes of all open range cache files of one cache.
-    disk_bytes: Arc<AtomicU64>,
+    /// The heap bytes of the fence index and the filter, which count as metadata.
+    meta_bytes: u64,
+    /// The open files of one cache.
+    budget: Arc<FileBudget>,
 }
 
 impl std::fmt::Debug for RangeFile {
@@ -752,9 +781,9 @@ impl RangeFile {
     pub(crate) fn open(
         path: PathBuf,
         page_source: RangeCachePageSource,
-        disk_bytes: Arc<AtomicU64>,
+        budget: Arc<FileBudget>,
     ) -> io::Result<Self> {
-        match Self::open_inner(&path, page_source, disk_bytes) {
+        match Self::open_inner(&path, page_source, budget) {
             Ok(file) => Ok(file),
             Err(e) => {
                 let _ = fs::remove_file(&path);
@@ -766,7 +795,7 @@ impl RangeFile {
     fn open_inner(
         path: &Path,
         page_source: RangeCachePageSource,
-        disk_bytes: Arc<AtomicU64>,
+        budget: Arc<FileBudget>,
     ) -> io::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
@@ -842,12 +871,18 @@ impl RangeFile {
             0 => 0,
             _ => common_prefix_len(fence(0), fence(pages - 1)),
         };
-        let fence_prefixes = (0..pages)
+        let fence_prefixes: Vec<u64> = (0..pages)
             .map(|i| prefix64(fence(i).get(fence_lcp..).unwrap_or_default()))
             .collect();
         drop(fence_region);
         drop(trailer);
-        disk_bytes.fetch_add(file_len, Ordering::Relaxed);
+        let meta_bytes = (page_offsets.capacity() * size_of::<u64>()
+            + fence_keys.capacity()
+            + fence_key_offsets.capacity() * size_of::<usize>()
+            + fence_prefixes.capacity() * size_of::<u64>()
+            + filter.as_ref().map_or(0, Filter::bytes)) as u64;
+        budget.disk.fetch_add(file_len, Ordering::Relaxed);
+        budget.meta.fetch_add(meta_bytes, Ordering::Relaxed);
         Ok(Self {
             path: path.to_path_buf(),
             source,
@@ -864,8 +899,14 @@ impl RangeFile {
             data_end: fence_off,
             run,
             filter,
-            disk_bytes,
+            meta_bytes,
+            budget,
         })
+    }
+
+    /// The heap bytes of the file's fence index and filter.
+    pub(crate) fn meta_bytes(&self) -> u64 {
+        self.meta_bytes
     }
 
     pub(crate) fn rows(&self) -> u64 {
@@ -1200,7 +1241,10 @@ impl RangeFile {
 
 impl Drop for RangeFile {
     fn drop(&mut self) {
-        self.disk_bytes.fetch_sub(self.file_len, Ordering::Relaxed);
+        self.budget.disk.fetch_sub(self.file_len, Ordering::Relaxed);
+        self.budget
+            .meta
+            .fetch_sub(self.meta_bytes, Ordering::Relaxed);
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -1535,7 +1579,7 @@ mod tests {
             writer.push(r).unwrap();
         }
         let path = writer.finish().unwrap();
-        Arc::new(RangeFile::open(path, source, Arc::new(AtomicU64::new(0))).unwrap())
+        Arc::new(RangeFile::open(path, source, FileBudget::detached()).unwrap())
     }
 
     fn key(i: usize) -> Vec<u8> {
@@ -1726,15 +1770,17 @@ mod tests {
     #[tokio::test]
     async fn should_delete_the_file_when_the_last_reference_drops() {
         let dir = tempfile::tempdir().unwrap();
-        let disk_bytes = Arc::new(AtomicU64::new(0));
+        let budget = FileBudget::detached();
         let mut writer = RangeFileWriter::create(dir.path(), "life", 4096).unwrap();
         writer.push(&row(b"a", b"1", 1)).unwrap();
         assert!(dir.path().join("life.rcf.tmp").exists());
         let path = writer.finish().unwrap();
         let file = Arc::new(
-            RangeFile::open(path.clone(), RangeCachePageSource::Mmap, disk_bytes.clone()).unwrap(),
+            RangeFile::open(path.clone(), RangeCachePageSource::Mmap, budget.clone()).unwrap(),
         );
-        assert_eq!(disk_bytes.load(Ordering::Relaxed), file.file_len());
+        assert_eq!(budget.disk(), file.file_len());
+        assert_eq!(budget.meta(), file.meta_bytes());
+        assert!(file.meta_bytes() > 0);
         let mut iter = RangeFileIterator::new(file.clone(), BytesRange::unbounded());
         iter.init().await.unwrap();
         drop(file);
@@ -1742,7 +1788,7 @@ mod tests {
         assert_eq!(iter.next().await.unwrap().unwrap().key.as_ref(), b"a");
         drop(iter);
         assert!(!path.exists(), "the last reference deletes the file");
-        assert_eq!(disk_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!((budget.disk(), budget.meta()), (0, 0));
 
         // A writer that does not finish removes its temporary file.
         let mut writer = RangeFileWriter::create(dir.path(), "abandoned", 4096).unwrap();
@@ -1908,7 +1954,7 @@ mod tests {
             writer.push(r).unwrap();
         }
         let path = writer.finish().unwrap();
-        RangeFile::open(path, source, Arc::new(AtomicU64::new(0))).unwrap()
+        RangeFile::open(path, source, FileBudget::detached()).unwrap()
     }
 
     /// A run holds every version: a scan returns them in order, and a read at any sequence
@@ -2019,12 +2065,8 @@ mod tests {
         assert!(writer.push(&row(b"a", b"1", 1)).is_err());
         assert!(writer.push(&row(b"c", b"", 2).with_expire_ts(10)).is_err());
         let path = writer.finish().unwrap();
-        let mut run = RangeFile::open(
-            path,
-            RangeCachePageSource::Mmap,
-            Arc::new(AtomicU64::new(0)),
-        )
-        .unwrap();
+        let mut run =
+            RangeFile::open(path, RangeCachePageSource::Mmap, FileBudget::detached()).unwrap();
         assert!(run.is_run());
         assert!(run.take_filter().is_some());
         // A base has no filter, and holds one row per key.
@@ -2047,7 +2089,7 @@ mod tests {
         let err = RangeFile::open(
             path.clone(),
             RangeCachePageSource::PositionalRead,
-            Arc::new(AtomicU64::new(0)),
+            FileBudget::detached(),
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

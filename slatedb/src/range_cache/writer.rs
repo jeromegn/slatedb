@@ -55,10 +55,12 @@ pub(super) struct Padded<T>(pub(super) T);
 
 /// A change that a task asks the writer to make. See the module documentation.
 pub(super) enum Request {
-    /// Register loading ranges for the parts of `[start, end)` that no range holds.
+    /// Register loading ranges for the parts of `[start, end)` that no range holds, split at
+    /// `splits` (ascending keys) so that no range is much larger than the range target.
     Register {
         start: Bytes,
         end: Option<Bytes>,
+        splits: Vec<Bytes>,
         origin: Origin,
         reply: oneshot::Sender<Result<Registered, SlateDBError>>,
     },
@@ -69,11 +71,22 @@ pub(super) enum Request {
         base_seq: u64,
         reply: oneshot::Sender<bool>,
     },
-    /// Install `run`, which a flush wrote from `buffer`, the oldest sealed buffer of `range`.
+    /// Install `run`, which a flush wrote from `buffers`, the oldest sealed buffers of `range`
+    /// (newest first), and from `replaces`, its newest runs (newest first, empty for a plain
+    /// flush).
     InstallRun {
         range: Arc<CachedRange>,
         run: Arc<Run>,
-        buffer: Arc<Delta>,
+        buffers: Vec<Arc<Delta>>,
+        replaces: Vec<Arc<Run>>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Replace `inputs`, runs of `range` (newest first), with `output`, which a minor merge wrote
+    /// from them.
+    InstallMinor {
+        range: Arc<CachedRange>,
+        inputs: Vec<Arc<Run>>,
+        output: Arc<Run>,
         reply: oneshot::Sender<bool>,
     },
     /// Replace the base `base_was` of `range` and its oldest runs `absorbed` (newest first) with
@@ -116,6 +129,7 @@ impl Request {
             }
             Request::AttachBase { reply, .. }
             | Request::InstallRun { reply, .. }
+            | Request::InstallMinor { reply, .. }
             | Request::InstallMajor { reply, .. } => {
                 let _ = reply.send(false);
             }
@@ -281,12 +295,14 @@ impl RangeCache {
         &self,
         start: Bytes,
         end: Option<Bytes>,
+        splits: Vec<Bytes>,
         origin: Origin,
     ) -> Result<Registered, SlateDBError> {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::Register {
             start,
             end,
+            splits,
             origin,
             reply,
         });
@@ -311,19 +327,40 @@ impl RangeCache {
         answer.await.unwrap_or(false)
     }
 
-    /// Installs a run that a flush wrote from `buffer`. Returns false if the state moved on (see
-    /// [`RangeCache::install_run_at`]): then the run's file is deleted when it drops.
+    /// Installs a run that a flush wrote from `buffers` and `replaces`. Returns false if the
+    /// state moved on (see [`RangeCache::install_run_at`]): then the run's file is deleted when it
+    /// drops.
     pub(super) async fn install_run(
         &self,
         range: &Arc<CachedRange>,
         run: Arc<Run>,
-        buffer: &Arc<Delta>,
+        buffers: Vec<Arc<Delta>>,
+        replaces: Vec<Arc<Run>>,
     ) -> bool {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::InstallRun {
             range: range.clone(),
             run,
-            buffer: buffer.clone(),
+            buffers,
+            replaces,
+            reply,
+        });
+        answer.await.unwrap_or(false)
+    }
+
+    /// Installs a run that a minor merge wrote from `inputs`. Returns false if the state moved on
+    /// (see [`RangeCache::install_minor_at`]).
+    pub(super) async fn install_minor(
+        &self,
+        range: &Arc<CachedRange>,
+        inputs: Vec<Arc<Run>>,
+        output: Arc<Run>,
+    ) -> bool {
+        let (reply, answer) = oneshot::channel();
+        self.submit(Request::InstallMinor {
+            range: range.clone(),
+            inputs,
+            output,
             reply,
         });
         answer.await.unwrap_or(false)
@@ -576,7 +613,7 @@ impl RangeCache {
                 end: range.end.clone(),
             },
         );
-        self.maintenance.wake();
+        self.maintenance.notify(range);
     }
 
     /// Publishes a new layer set of `range`.
@@ -608,6 +645,7 @@ impl RangeCache {
             Request::Register {
                 start,
                 end,
+                splits,
                 origin,
                 reply,
             } => {
@@ -619,7 +657,7 @@ impl RangeCache {
                         "the range cache's write buffers are nearly full",
                     ))
                 } else {
-                    Ok(self.register_at(start, end, origin, w))
+                    Ok(self.register_at(start, end, &splits, origin, w))
                 };
                 let _ = reply.send(answer);
             }
@@ -634,10 +672,19 @@ impl RangeCache {
             Request::InstallRun {
                 range,
                 run,
-                buffer,
+                buffers,
+                replaces,
                 reply,
             } => {
-                let _ = reply.send(self.install_run_at(&range, run, &buffer));
+                let _ = reply.send(self.install_run_at(&range, run, &buffers, &replaces));
+            }
+            Request::InstallMinor {
+                range,
+                inputs,
+                output,
+                reply,
+            } => {
+                let _ = reply.send(self.install_minor_at(&range, &inputs, output));
             }
             Request::InstallMajor {
                 range,
@@ -671,7 +718,7 @@ impl RangeCache {
             }
             Request::Evict { victims, reply } => {
                 for victim in victims {
-                    if self.attached_bytes() <= self.options.max_disk_bytes {
+                    if self.within_budgets() {
                         break;
                     }
                     if victim.layers.load().base.is_some() {
@@ -689,10 +736,17 @@ impl RangeCache {
     /// New loading ranges for the uncovered parts of `[start, end)`, which load the state at
     /// `w`: every batch at or below `w` is committed and in the load's view, and every later
     /// batch finds the new ranges and goes to their buffers.
-    fn register_at(&self, start: Bytes, end: Option<Bytes>, origin: Origin, w: u64) -> Registered {
+    fn register_at(
+        &self,
+        start: Bytes,
+        end: Option<Bytes>,
+        splits: &[Bytes],
+        origin: Origin,
+        w: u64,
+    ) -> Registered {
         let now = self.now_ms();
         let mut index = RangeIndex::clone(&self.index.load());
-        let parts = uncovered(&index, &start, end.as_ref());
+        let parts = split_parts(uncovered(&index, &start, end.as_ref()), splits);
         let mut ranges = Vec::with_capacity(parts.len());
         for (part_start, part_end) in parts {
             let layers = Layers {
@@ -751,43 +805,62 @@ impl RangeCache {
                 end: range.end.clone(),
             },
         );
-        self.maintenance.wake();
+        self.maintenance.notify(range);
         true
     }
 
-    /// Installs a flushed run (`InstallRun`, design 01 section 6.2): one store that puts the run
-    /// first, raises `covered_to` to its `hi` and removes its buffer from the sealed list.
+    /// Installs a flushed run (`InstallRun`, design 01 sections 6.2 and 7.3): one store that puts
+    /// the run first in place of the runs it replaces, raises `covered_to` to its `hi` and removes
+    /// its buffers from the sealed list.
     ///
-    /// Preconditions: the range is indexed; `buffer` is still its oldest sealed buffer; the run
-    /// starts at `covered_to` and ends at the buffer's seal; the range holds fewer than
-    /// [`MAX_RUNS`] runs. Otherwise the run is rejected, and its file is deleted when it drops.
+    /// Preconditions: the range is indexed; `buffers` (newest first) are still its oldest sealed
+    /// buffers; `replaces` (newest first) are still its newest runs; the run starts where the
+    /// oldest replaced run starts, or at `covered_to` for a plain flush, and ends at the newest
+    /// buffer's seal; the range holds at most [`MAX_RUNS`] runs afterwards. Otherwise the run is
+    /// rejected, and its file is deleted when it drops.
     pub(super) fn install_run_at(
         &self,
         range: &Arc<CachedRange>,
         run: Arc<Run>,
-        buffer: &Arc<Delta>,
+        buffers: &[Arc<Delta>],
+        replaces: &[Arc<Run>],
     ) -> bool {
         if !self.is_indexed(range) {
             self.stats.installs_rejected.increment(1);
             return false;
         }
         let layers = range.layers.load_full();
-        let oldest = layers.sealed.last().is_some_and(|b| Arc::ptr_eq(b, buffer));
+        let kept = layers.sealed.len().checked_sub(buffers.len());
+        let oldest = !buffers.is_empty()
+            && kept.is_some_and(|kept| same_arcs(&layers.sealed[kept..], buffers));
+        let newest = replaces.len() <= layers.runs.len()
+            && same_arcs(&layers.runs[..replaces.len()], replaces);
+        let lo = replaces.last().map_or(layers.covered_to, |r| r.lo);
         if !oldest
-            || run.lo != layers.covered_to
-            || run.hi != buffer.sealed_at().load(Ordering::Acquire)
-            || layers.runs.len() >= MAX_RUNS
+            || !newest
+            || run.lo != lo
+            || run.hi != buffers[0].sealed_at().load(Ordering::Acquire)
+            || layers.runs.len() - replaces.len() >= MAX_RUNS
         {
             self.stats.installs_rejected.increment(1);
             return false;
         }
         self.stats.flushes.increment(1);
-        self.stats.flush_bytes.increment(run.file_bytes());
-        let mut runs = Vec::with_capacity(layers.runs.len() + 1);
+        self.stats.flushed_buffers.increment(buffers.len() as u64);
+        if buffers.len() > 1 {
+            self.stats.multi_buffer_flushes.increment(1);
+        }
+        if replaces.is_empty() {
+            self.stats.flush_bytes.increment(run.file_bytes());
+        } else {
+            self.stats.flush_merges.increment(1);
+            self.stats.flush_merge_bytes.increment(run.file_bytes());
+        }
+        let mut runs = Vec::with_capacity(layers.runs.len() + 1 - replaces.len());
         let covered_to = run.hi;
         runs.push(run);
-        runs.extend(layers.runs.iter().cloned());
-        let sealed = layers.sealed[..layers.sealed.len() - 1].to_vec();
+        runs.extend(layers.runs[replaces.len()..].iter().cloned());
+        let sealed = layers.sealed[..kept.unwrap_or(0)].to_vec();
         self.store_layers(
             range,
             Layers {
@@ -797,6 +870,58 @@ impl RangeCache {
                 base: layers.base.clone(),
                 base_seq: layers.base_seq,
                 covered_to,
+                end: range.end.clone(),
+            },
+        );
+        true
+    }
+
+    /// Installs a run from a minor merge (`InstallMinor`, design 01 sections 6.2 and 7.4): one
+    /// store that puts `output` in place of `inputs`. Every other part of the layer set stays.
+    ///
+    /// Preconditions: the range is indexed; `inputs` (newest first) are still a contiguous slice
+    /// of its runs; `output` covers their union. Otherwise the run is rejected.
+    pub(super) fn install_minor_at(
+        &self,
+        range: &Arc<CachedRange>,
+        inputs: &[Arc<Run>],
+        output: Arc<Run>,
+    ) -> bool {
+        if !self.is_indexed(range) {
+            self.stats.installs_rejected.increment(1);
+            return false;
+        }
+        let layers = range.layers.load_full();
+        let at = inputs
+            .first()
+            .and_then(|first| layers.runs.iter().position(|r| Arc::ptr_eq(r, first)));
+        let slice = at.filter(|at| {
+            at + inputs.len() <= layers.runs.len()
+                && same_arcs(&layers.runs[*at..at + inputs.len()], inputs)
+        });
+        let union = inputs
+            .first()
+            .zip(inputs.last())
+            .is_some_and(|(newest, oldest)| output.hi == newest.hi && output.lo == oldest.lo);
+        let Some(at) = slice.filter(|_| union) else {
+            self.stats.installs_rejected.increment(1);
+            return false;
+        };
+        self.stats.minor_merges.increment(1);
+        self.stats.minor_merge_bytes.increment(output.file_bytes());
+        let mut runs = Vec::with_capacity(layers.runs.len() + 1 - inputs.len());
+        runs.extend(layers.runs[..at].iter().cloned());
+        runs.push(output);
+        runs.extend(layers.runs[at + inputs.len()..].iter().cloned());
+        self.store_layers(
+            range,
+            Layers {
+                active: layers.active.clone(),
+                sealed: layers.sealed.clone(),
+                runs,
+                base: layers.base.clone(),
+                base_seq: layers.base_seq,
+                covered_to: layers.covered_to,
                 end: range.end.clone(),
             },
         );
@@ -956,6 +1081,35 @@ impl RangeCache {
         fence(Ordering::SeqCst);
         self.refuse_queued();
     }
+}
+
+/// Returns true if `a` and `b` hold the same objects, in the same order.
+fn same_arcs<T>(a: &[Arc<T>], b: &[Arc<T>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y))
+}
+
+/// Splits each part `[start, end)` at the keys of `splits` (ascending) that fall strictly inside
+/// it.
+fn split_parts(
+    parts: Vec<(Bytes, Option<Bytes>)>,
+    splits: &[Bytes],
+) -> Vec<(Bytes, Option<Bytes>)> {
+    if splits.is_empty() {
+        return parts;
+    }
+    let mut out = Vec::with_capacity(parts.len() + splits.len());
+    for (start, end) in parts {
+        let mut from = start;
+        for split in splits {
+            let inside = *split > from && end.as_ref().is_none_or(|end| split < end);
+            if inside {
+                out.push((from, Some(split.clone())));
+                from = split.clone();
+            }
+        }
+        out.push((from, end));
+    }
+    out
 }
 
 #[cfg(test)]

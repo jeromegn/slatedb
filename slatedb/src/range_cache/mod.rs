@@ -65,6 +65,7 @@ mod file;
 mod filter;
 mod hits;
 mod maintain;
+mod merge;
 mod mixed;
 mod scan;
 pub mod stats;
@@ -109,7 +110,8 @@ use buffer::Kind;
 use delta::{Delta, DeltaIterator, DeltaMemory, DeltaShape};
 pub use file::RangeCachePageSource;
 use file::{
-    FileRead, RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION, TEMP_FILE_EXTENSION,
+    FileBudget, FileRead, RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION,
+    TEMP_FILE_EXTENSION,
 };
 use filter::{hash_key, Filter};
 use hits::{HitStats, RangeHits};
@@ -175,8 +177,9 @@ pub struct RangeCacheTuning {
     /// The page size of range cache files. It must be a power of two from 512 to 65536.
     pub page_size: usize,
     /// The smallest run bytes that cause a major merge (a rebuild of the base). A major merge
-    /// starts when the run files of a range are larger than this value and larger than a quarter
-    /// of its base, or when the range holds `major_merge_runs` runs.
+    /// starts when the run files of a range are larger than this value and larger than `f` times
+    /// its base, where `f = sqrt(2r / B)` for the range's average flush `r` and base `B`, between
+    /// 0.05 and 1 (design 01 sections 7.5 and 7.9).
     pub min_rebuild_delta_bytes: usize,
     /// The chunk bytes at which the writer seals a range's active write buffer, so that the
     /// maintenance task can flush it to a run.
@@ -195,10 +198,16 @@ pub struct RangeCacheTuning {
     /// key that the buffer does not hold skips it after one probe. `usize::MAX` turns buffer
     /// filters off.
     pub buffer_filter_bytes: usize,
-    /// A range that holds this many runs starts a major merge. At most [`MAX_RUNS`] (4), the
-    /// most runs that a range ever holds: while it holds 4, its flushes wait. A larger value
-    /// turns the count off, which only benchmarks use, to hold a range at 4 runs.
-    pub major_merge_runs: usize,
+    /// The size of a range that `cache_range` registers: it splits a larger request at block
+    /// boundaries of the largest sorted run, so that a major merge rewrites at most about this
+    /// much. 0 turns splitting off.
+    pub range_target_bytes: u64,
+    /// The limit on the heap metadata of the cached ranges: the fence indexes and filters of
+    /// their files and their layer sets. When they pass it, the cache evicts ranges as it does
+    /// for the disk budget. `None`, the default, means a sixteenth of `max_disk_bytes`, and at
+    /// least 64 MiB. Fence indexes and filters take about 2% of the files' bytes (inferred from
+    /// 4 KiB pages and 10 bits per key), so the default rarely binds before the disk budget.
+    pub max_meta_bytes: Option<u64>,
     /// How often the promoter looks for candidates.
     pub evaluate_interval: Duration,
     /// The most candidates that one evaluation forms or re-evaluates. Each new candidate costs
@@ -265,7 +274,8 @@ impl Default for RangeCacheTuning {
             max_recent_bytes: 256 * 1024 * 1024,
             min_seal_bytes: 64 * 1024,
             buffer_filter_bytes: 128 * 1024,
-            major_merge_runs: MAX_RUNS,
+            range_target_bytes: 64 * 1024 * 1024,
+            max_meta_bytes: None,
             evaluate_interval: Duration::from_millis(250),
             max_candidates_per_evaluation: 2,
             min_evidence: 8,
@@ -297,6 +307,12 @@ impl RangeCacheTuning {
             seal_bytes: self.range_seal_bytes as u64,
             filter_from: u64::try_from(self.buffer_filter_bytes).unwrap_or(u64::MAX),
         }
+    }
+
+    /// The limit on the heap metadata of the cached ranges.
+    fn meta_limit(&self, max_disk_bytes: u64) -> u64 {
+        self.max_meta_bytes
+            .unwrap_or((max_disk_bytes / 16).max(64 * 1024 * 1024))
     }
 
     /// The memory of the write buffers above which the cache rejects loads.
@@ -338,7 +354,7 @@ pub struct CachedRangeInfo {
     /// True while the cache loads the range. A loading range serves no reads.
     pub loading: bool,
     /// True while the cache writes the range's recent writes to disk: a sealed write buffer waits
-    /// for its flush, or a major merge is due or runs.
+    /// for its flush, or a merge, minor or major, is due or runs.
     pub rebuilding: bool,
     /// The size of the range's base file on disk.
     pub file_bytes: u64,
@@ -546,8 +562,9 @@ struct CachedRange {
     /// The sequence number of the last batch that wrote to the range. Only the writer stores
     /// it. Nothing reads it yet: persistence will (design 01 section 15, R3).
     last_write_seq: Padded<AtomicU64>,
-    /// The maintenance task's jobs on the range: a flush and a major merge, at most one of each
-    /// at a time. Only the maintenance task and its jobs store them; no read loads them.
+    /// The maintenance task's jobs on the range: a flush and a merge, at most one of each at a
+    /// time, and its notifications. Only the maintenance task, its jobs and the writer's
+    /// notifications store them; no read loads them.
     jobs: maintain::RangeJobs,
 }
 
@@ -610,7 +627,7 @@ impl CachedRange {
             loading: layers.base.is_none(),
             rebuilding: !layers.sealed.is_empty()
                 || self.jobs.merging()
-                || maintain::merge_due(&layers, tuning),
+                || maintain::merge_due(self, &layers, tuning).is_some(),
             file_bytes: layers.base.as_ref().map_or(0, |f| f.file_len()),
             file_rows: layers.base.as_ref().map_or(0, |f| f.rows()),
             delta_bytes: self.delta_bytes(&layers),
@@ -637,6 +654,26 @@ impl CachedRange {
         let layers = self.layers.load();
         layers.base.as_ref().map_or(0, |f| f.file_len())
             + layers.runs.iter().map(|r| r.file_bytes()).sum::<u64>()
+    }
+
+    /// The heap metadata of the range's files: the fence indexes and filters of its base and
+    /// runs.
+    fn files_meta_bytes(&self) -> u64 {
+        let layers = self.layers.load();
+        layers.base.as_ref().map_or(0, |f| f.meta_bytes())
+            + layers.runs.iter().map(|r| r.file.meta_bytes()).sum::<u64>()
+    }
+
+    /// The heap metadata of the range, which counts against the metadata budget: the fence
+    /// indexes and filters of its base and runs, and its layer set with its run handles.
+    fn meta_bytes(&self) -> u64 {
+        let files = self.files_meta_bytes();
+        let layers = self.layers.load();
+        let handles = size_of::<CachedRange>()
+            + size_of::<Layers>()
+            + (layers.sealed.capacity() + layers.runs.capacity()) * size_of::<usize>()
+            + layers.runs.len() * size_of::<Run>();
+        files + handles as u64
     }
 }
 
@@ -743,9 +780,9 @@ pub(crate) struct RangeCache {
     index: ArcSwap<RangeIndex>,
     /// The queue of requests to the writer, and the writer's own state.
     writer: WriterQueue,
-    /// The bytes of all open range cache files, including files that only a reader or a
-    /// maintenance job keeps open.
-    disk_bytes: Arc<AtomicU64>,
+    /// The disk and heap bytes of all open range cache files, including files that only a
+    /// reader or a maintenance job keeps open.
+    files: Arc<FileBudget>,
     /// The memory of all write buffers, including buffers that only a reader or a flush holds.
     delta_memory: Arc<DeltaMemory>,
     /// The queue to the maintenance task.
@@ -793,11 +830,6 @@ impl RangeCache {
                 "range cache load_fetch_bytes and load_fetch_tasks must be positive".to_string(),
             ));
         }
-        if options.tuning.major_merge_runs == 0 {
-            return Err(SlateDBError::InvalidConfiguration(
-                "range cache major_merge_runs must be positive".to_string(),
-            ));
-        }
         std::fs::create_dir_all(&options.root_folder)?;
         for entry in std::fs::read_dir(&options.root_folder)? {
             let path = entry?.path();
@@ -841,7 +873,7 @@ impl RangeCache {
             options,
             index: ArcSwap::from_pointee(RangeIndex::new()),
             writer: WriterQueue::new(),
-            disk_bytes: Arc::new(AtomicU64::new(0)),
+            files: Arc::new(FileBudget::default()),
             delta_memory: DeltaMemory::new(recorder.gauge(stats::DELTA_ALLOCATED_BYTES).register()),
             maintenance: maintain::MaintenanceQueue::new(),
             next_file_id: AtomicU64::new(0),
@@ -912,7 +944,7 @@ impl RangeCache {
     /// The caller computes the order, off the writer: read densities take each range's rate
     /// lock. The writer applies it (see [`writer::Request::Evict`]).
     fn eviction_order(&self, skip: Option<&Arc<CachedRange>>) -> Vec<Arc<CachedRange>> {
-        if self.attached_bytes() <= self.options.max_disk_bytes {
+        if self.within_budgets() {
             return Vec::new();
         }
         let now = self.now_ms();
@@ -981,9 +1013,26 @@ impl RangeCache {
             .sum();
         self.stats.delta_bytes.set(delta_bytes as i64);
         self.delta_memory.publish();
+        self.stats.file_bytes.set(self.files.disk() as i64);
+        let layers: u64 = index
+            .values()
+            .map(|r| r.meta_bytes().saturating_sub(r.files_meta_bytes()))
+            .sum();
         self.stats
-            .file_bytes
-            .set(self.disk_bytes.load(Ordering::Relaxed) as i64);
+            .meta_bytes
+            .set((self.files.meta() + layers) as i64);
+    }
+
+    /// Returns true if the cached ranges fit the disk budget and the metadata budget. Only
+    /// indexed ranges count: files that only a reader holds go when the reader drops them.
+    fn within_budgets(&self) -> bool {
+        let index = self.index.load();
+        let disk: u64 = index.values().map(|r| r.file_bytes()).sum();
+        if disk > self.options.max_disk_bytes {
+            return false;
+        }
+        let meta: u64 = index.values().map(|r| r.meta_bytes()).sum();
+        meta <= self.options.tuning.meta_limit(self.options.max_disk_bytes)
     }
 
     /// Checks whether a read at `seq` can use `layers`. See the sequence number rules. Callers
@@ -1360,7 +1409,7 @@ impl RangeCache {
         let file = Arc::new(RangeFile::open(
             path,
             self.options.page_source,
-            self.disk_bytes.clone(),
+            self.files.clone(),
         )?);
         debug_assert_eq!(rows, file.rows());
 
@@ -1773,6 +1822,15 @@ impl DbInner {
             return Ok(());
         };
         cache.bind_writer(&self.write_notifier);
+        // Bounded range size (design 01 section 7.6): split points from the SST index, before
+        // the guard and the registration, as the writer only cuts the parts at them.
+        let target = cache.options.tuning.range_target_bytes;
+        let splits = if target > 0 {
+            self.range_split_points(&start, end.as_ref(), target)
+                .await?
+        } else {
+            Vec::new()
+        };
         // The retention guard comes first (design 01 section 6.3). The snapshot registers at the
         // last committed sequence number `S_L`, before the request. The writer registers the
         // ranges at its boundary `W >= S_L`. Flush and compaction keep every version above the
@@ -1784,7 +1842,7 @@ impl DbInner {
             Arc::clone(&cache.fp_registry),
             "range-cache-register-publish"
         );
-        let registered = cache.register(start, end, origin).await?;
+        let registered = cache.register(start, end, splits, origin).await?;
         debug_assert!(registered.seq >= guard.seq());
         fail_point!(
             Arc::clone(&cache.fp_registry),
@@ -1830,6 +1888,78 @@ impl DbInner {
         }
         drop(guard);
         result
+    }
+
+    /// Keys that cut `[start, end)` into parts of about `target` bytes, at block boundaries of
+    /// the largest sorted run, as the promoter forms its candidates. It reads only the indexes of
+    /// the SSTs of that run that overlap the range. Without a sorted run, or in a segmented
+    /// database, it returns no key: the range is registered whole.
+    async fn range_split_points(
+        &self,
+        start: &Bytes,
+        end: Option<&Bytes>,
+        target: u64,
+    ) -> Result<Vec<Bytes>, SlateDBError> {
+        let run = {
+            let view = self.state.read().view();
+            let core = view.state.core();
+            if core.segment_extractor_name.is_some() {
+                return Ok(Vec::new());
+            }
+            match core
+                .tree
+                .compacted
+                .iter()
+                .max_by_key(|sr| sr.estimate_size())
+            {
+                Some(run) => run.clone(),
+                None => return Ok(Vec::new()),
+            }
+        };
+        let views = run.sst_views();
+        let inside = |k: &[u8]| k > start.as_ref() && end.is_none_or(|end| k < end.as_ref());
+        let mut splits = Vec::new();
+        let mut bytes = 0u64;
+        for (i, view) in views.iter().enumerate() {
+            // The SST covers keys from its start to the next one's start.
+            let sst_start = view.compacted_effective_start_key();
+            let below_end = end.is_none_or(|end| sst_start.as_ref() < end.as_ref());
+            let above_start = views
+                .get(i + 1)
+                .is_none_or(|next| next.compacted_effective_start_key() > start);
+            if !below_end || !above_start {
+                continue;
+            }
+            let index = self
+                .table_store
+                .read_index(
+                    &view.sst,
+                    true,
+                    Some(Bytes::new()),
+                    &ReadTrace::none(),
+                    None,
+                )
+                .await?;
+            let metas = index.borrow().block_meta();
+            let n = metas.len();
+            let avg = view.sst.estimate_size() / (n.max(1) as u64);
+            for b in 0..n {
+                let first = metas.get(b).first_key().bytes();
+                if bytes >= target && inside(first) {
+                    splits.push(Bytes::copy_from_slice(first));
+                    bytes = 0;
+                }
+                let next = (b + 1 < n).then(|| metas.get(b + 1));
+                let in_range = next.is_none_or(|next| next.first_key().bytes() > start.as_ref())
+                    && end.is_none_or(|end| first < end.as_ref());
+                if in_range {
+                    bytes += next.map_or(avg, |next| {
+                        next.offset().saturating_sub(metas.get(b).offset())
+                    });
+                }
+            }
+        }
+        Ok(splits)
     }
 
     fn range_cache_or_err(&self) -> Result<&Arc<RangeCache>, SlateDBError> {

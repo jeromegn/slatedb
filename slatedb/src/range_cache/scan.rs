@@ -593,7 +593,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::ops::Bound::{self, Unbounded};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
 
     /// The sequence number of the base of the test layers. Runs, sealed buffers and the active
     /// buffer hold the versions above it, in that order, up to `MAX_SEQ`.
@@ -656,13 +656,21 @@ mod tests {
     struct Shape {
         cuts: Vec<u64>,
         runs: usize,
+        /// How run `i` is written, by the two bits at `2 * i`: 0 straight from its versions, 1
+        /// as a flush of two sealed buffers that split its interval, 2 as a minor merge of two
+        /// runs that split it, 3 as a flush-merge of a buffer with a run.
+        writes: u8,
     }
 
     fn shape() -> impl Strategy<Value = Shape> {
         proptest::collection::btree_set(BASE_SEQ + 1..MAX_SEQ, 0..6).prop_flat_map(|cuts| {
             let cuts: Vec<u64> = cuts.into_iter().collect();
             let most = cuts.len().min(crate::range_cache::MAX_RUNS);
-            (Just(cuts), 0..=most).prop_map(|(cuts, runs)| Shape { cuts, runs })
+            (Just(cuts), 0..=most, any::<u8>()).prop_map(|(cuts, runs, writes)| Shape {
+                cuts,
+                runs,
+                writes,
+            })
         })
     }
 
@@ -708,7 +716,7 @@ mod tests {
             .map(|(k, v)| (*k, *v))
             .collect();
         let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
-        let disk = Arc::new(AtomicU64::new(0));
+        let disk = crate::range_cache::file::FileBudget::detached();
         let mut writer = RangeFileWriter::create(dir, &format!("{name}-base"), 512).unwrap();
         let mut rows = crate::range_cache::stack_iterator(
             &all_of(&history, make),
@@ -739,17 +747,53 @@ mod tests {
             .chain(std::iter::once(MAX_SEQ))
             .collect();
         let intervals = bounds.len() - 1;
-        let mut runs = Vec::new();
-        for i in 0..shape.runs {
-            let (lo, hi) = (bounds[i], bounds[i + 1]);
-            let mut writer =
-                RangeFileWriter::create_run(dir, &format!("{name}-run{i}"), 512).unwrap();
+        let file_of = |file_name: String, lo: u64, hi: u64| {
+            let mut writer = RangeFileWriter::create_run(dir, &file_name, 512).unwrap();
             for row in versions(lo, hi) {
                 writer.push(&row).unwrap();
             }
             let path = writer.finish().unwrap();
             let file = RangeFile::open(path, page_source, disk.clone()).unwrap();
-            runs.push(Arc::new(Run::new(file, lo, hi).unwrap()));
+            Run::new(file, lo, hi).unwrap()
+        };
+        let buffer_of = |lo: u64, hi: u64| {
+            let delta = Delta::for_test(&DeltaMemory::detached(), lo);
+            let mut writer = delta.writer();
+            for row in versions(lo, hi) {
+                writer.append(&row);
+            }
+            drop(writer);
+            delta
+        };
+        let mut runs = Vec::new();
+        for i in 0..shape.runs {
+            let (lo, hi) = (bounds[i], bounds[i + 1]);
+            let mid = lo + (hi - lo) / 2;
+            let run = match (shape.writes >> (2 * i)) & 3 {
+                0 => file_of(format!("{name}-run{i}"), lo, hi),
+                how => {
+                    // Two inputs that split the interval at `mid`, written by the merge of
+                    // flushes, flush-merges and minor merges.
+                    let (low_buffer, high_buffer) = (buffer_of(lo, mid), buffer_of(mid, hi));
+                    let low_run = file_of(format!("{name}-run{i}-low"), lo, mid);
+                    let high_run = file_of(format!("{name}-run{i}-high"), mid, hi);
+                    let (buffers, inputs): (Vec<(&Delta, u64)>, Vec<&Run>) = match how {
+                        1 => (vec![(&high_buffer, hi), (&low_buffer, mid)], vec![]),
+                        2 => (vec![], vec![&high_run, &low_run]),
+                        _ => (vec![(&high_buffer, hi)], vec![&low_run]),
+                    };
+                    let mut writer =
+                        RangeFileWriter::create_run(dir, &format!("{name}-run{i}"), 512).unwrap();
+                    let written =
+                        crate::range_cache::merge::merge_versions(&mut writer, &buffers, &inputs)
+                            .unwrap();
+                    assert_eq!(written as usize, versions(lo, hi).len());
+                    let path = writer.finish().unwrap();
+                    let file = RangeFile::open(path, page_source, disk.clone()).unwrap();
+                    Run::new(file, lo, hi).unwrap()
+                }
+            };
+            runs.push(Arc::new(run));
         }
         runs.reverse();
         let buffer = |lo: u64, hi: u64| {

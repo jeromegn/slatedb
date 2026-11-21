@@ -56,13 +56,24 @@ pub const REBUILD_BYTES: &str = range_cache_stat_name!("rebuild_bytes");
 /// `range_seal_bytes`) or `pressure` (the maintenance task sealed it early because the memory of
 /// the buffers was high).
 pub const SEAL_COUNT: &str = range_cache_stat_name!("seal_count");
-/// Sealed buffers that the maintenance task flushed to runs.
+/// Flushes of sealed buffers to runs. One flush writes every sealed buffer that its range held
+/// when it started.
 pub const FLUSH_COUNT: &str = range_cache_stat_name!("flush_count");
-/// Bytes of run files that flushes wrote.
+/// Bytes of run files that flushes wrote, flush-merges excluded.
 pub const FLUSH_BYTES: &str = range_cache_stat_name!("flush_bytes");
-/// Times that the maintenance task found a sealed buffer that it could not flush, because its
-/// range held the most runs (4) and waited for a major merge.
-pub const FLUSH_WAIT_COUNT: &str = range_cache_stat_name!("flush_wait_count");
+/// Sealed buffers that flushes wrote. Divide by `flush_count` for the buffers per flush.
+pub const FLUSHED_BUFFER_COUNT: &str = range_cache_stat_name!("flushed_buffer_count");
+/// Flushes that wrote more than one sealed buffer.
+pub const MULTI_BUFFER_FLUSH_COUNT: &str = range_cache_stat_name!("multi_buffer_flush_count");
+/// Flushes of a range that held the most runs (4): the run they wrote also holds the versions of
+/// the range's two newest runs, which it replaced.
+pub const FLUSH_MERGE_COUNT: &str = range_cache_stat_name!("flush_merge_count");
+/// Bytes of run files that flush-merges wrote.
+pub const FLUSH_MERGE_BYTES: &str = range_cache_stat_name!("flush_merge_bytes");
+/// Minor merges: two runs of a range merged into one, every version kept.
+pub const MINOR_MERGE_COUNT: &str = range_cache_stat_name!("minor_merge_count");
+/// Bytes of run files that minor merges wrote.
+pub const MINOR_MERGE_BYTES: &str = range_cache_stat_name!("minor_merge_bytes");
 /// Flushed runs and merged bases that the writer rejected because the range changed meanwhile:
 /// it was removed, registered again, or its buffers or runs moved on.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
@@ -78,6 +89,10 @@ pub const FILE_BYTES: &str = range_cache_stat_name!("file_bytes");
 /// The estimated bytes of the active and sealed write buffers of cached ranges. The cache
 /// updates it when ranges change.
 pub const DELTA_BYTES: &str = range_cache_stat_name!("delta_bytes");
+/// The heap metadata of the range cache: the fence indexes and filters of all open files,
+/// including files that only a reader still holds, and the layer sets of cached ranges. The
+/// cache evicts ranges when the metadata of its cached ranges passes `max_meta_bytes`.
+pub const META_BYTES: &str = range_cache_stat_name!("meta_bytes");
 /// The memory that the write buffers hold, exactly: every chunk and filter of every buffer from
 /// its allocation until the last holder of the buffer (its range, a scan, a merge resolution or a
 /// flush) drops it. It changes when a buffer allocates a chunk or a filter, or drops. A buffer's
@@ -378,7 +393,12 @@ pub(crate) struct RangeCacheStats {
     pub(crate) seals_pressure: Arc<dyn CounterFn>,
     pub(crate) flushes: Arc<dyn CounterFn>,
     pub(crate) flush_bytes: Arc<dyn CounterFn>,
-    pub(crate) flush_waits: Arc<dyn CounterFn>,
+    pub(crate) flushed_buffers: Arc<dyn CounterFn>,
+    pub(crate) multi_buffer_flushes: Arc<dyn CounterFn>,
+    pub(crate) flush_merges: Arc<dyn CounterFn>,
+    pub(crate) flush_merge_bytes: Arc<dyn CounterFn>,
+    pub(crate) minor_merges: Arc<dyn CounterFn>,
+    pub(crate) minor_merge_bytes: Arc<dyn CounterFn>,
     pub(crate) installs_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
@@ -390,6 +410,7 @@ pub(crate) struct RangeCacheStats {
     pub(crate) ranges: Arc<dyn GaugeFn>,
     pub(crate) file_bytes: Arc<dyn GaugeFn>,
     pub(crate) delta_bytes: Arc<dyn GaugeFn>,
+    pub(crate) meta_bytes: Arc<dyn GaugeFn>,
 }
 
 impl RangeCacheStats {
@@ -407,7 +428,12 @@ impl RangeCacheStats {
             seals_pressure: labeled(SEAL_COUNT, "reason", "pressure"),
             flushes: recorder.counter(FLUSH_COUNT).register(),
             flush_bytes: recorder.counter(FLUSH_BYTES).register(),
-            flush_waits: recorder.counter(FLUSH_WAIT_COUNT).register(),
+            flushed_buffers: recorder.counter(FLUSHED_BUFFER_COUNT).register(),
+            multi_buffer_flushes: recorder.counter(MULTI_BUFFER_FLUSH_COUNT).register(),
+            flush_merges: recorder.counter(FLUSH_MERGE_COUNT).register(),
+            flush_merge_bytes: recorder.counter(FLUSH_MERGE_BYTES).register(),
+            minor_merges: recorder.counter(MINOR_MERGE_COUNT).register(),
+            minor_merge_bytes: recorder.counter(MINOR_MERGE_BYTES).register(),
             installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
@@ -419,6 +445,7 @@ impl RangeCacheStats {
             ranges: recorder.gauge(RANGE_COUNT).register(),
             file_bytes: recorder.gauge(FILE_BYTES).register(),
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
+            meta_bytes: recorder.gauge(META_BYTES).register(),
         }
     }
 
