@@ -201,7 +201,7 @@ fn read_bytes(source: &dyn PageSource, offset: u64, len: usize) -> io::Result<Co
 }
 
 /// Copies a key and a value into one allocation.
-fn copy_key_value(key: &[u8], value: &[u8]) -> (Bytes, Bytes) {
+pub(super) fn copy_key_value(key: &[u8], value: &[u8]) -> (Bytes, Bytes) {
     let mut buf = BytesMut::with_capacity(key.len() + value.len());
     buf.extend_from_slice(key);
     buf.extend_from_slice(value);
@@ -968,8 +968,10 @@ impl PageReader {
     }
 }
 
-/// A forward cursor over the rows of a [`RangeFile`] in a key range. It keeps the file open
-/// while it lives.
+/// A forward cursor over the rows of a [`RangeFile`] in a key range. It holds no reference to
+/// the file: each call that reads takes the file, and the caller keeps it open while the cursor
+/// lives. A scan passes the file of the layers that it pinned, so it changes no reference count
+/// that other reads of the file share.
 ///
 /// When the cursor enters a page, it copies the page, from the first row that it reads to the end,
 /// into one reference-counted buffer. It reads keys from that buffer, and returns rows as slices
@@ -977,7 +979,9 @@ impl PageReader {
 /// keeps that buffer (at most a page) in memory, as a value from an SST keeps its block. It never
 /// keeps the file or the mapping. Out-of-line keys and values are copied on their own.
 pub(crate) struct RangeFileCursor {
-    file: Arc<RangeFile>,
+    /// The address of the file, to check that each call passes the same one.
+    #[cfg(debug_assertions)]
+    file: usize,
     end: Bound<Bytes>,
     page: usize,
     index: usize,
@@ -998,21 +1002,22 @@ pub(crate) struct RangeFileCursor {
 }
 
 impl RangeFileCursor {
-    pub(crate) fn new(file: Arc<RangeFile>, range: &BytesRange) -> io::Result<Self> {
+    pub(crate) fn new(file: &RangeFile, range: &BytesRange) -> io::Result<Self> {
         let start = range.start_bound().map(|b| b.as_ref());
         Self::with_bounds(file, start, range.end_bound().cloned())
     }
 
     /// Returns a cursor over the rows of `file` from `start` to `end`.
     pub(crate) fn with_bounds(
-        file: Arc<RangeFile>,
+        file: &RangeFile,
         start: Bound<&[u8]>,
         end: Bound<Bytes>,
     ) -> io::Result<Self> {
         let mut reader = PageReader::new();
         let (page, index) = file.locate(&mut reader, start)?;
         let mut cursor = Self {
-            file,
+            #[cfg(debug_assertions)]
+            file: std::ptr::from_ref(file).addr(),
             end,
             page,
             index,
@@ -1024,21 +1029,32 @@ impl RangeFileCursor {
             current: None,
             out_of_line_key: None,
         };
-        cursor.normalize()?;
+        cursor.normalize(file)?;
         Ok(cursor)
+    }
+
+    fn check(&self, file: &RangeFile) {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.file,
+            std::ptr::from_ref(file).addr(),
+            "a range file cursor read through another file"
+        );
+        let _ = file;
     }
 
     /// Moves to the next row if the position is past the end of a page, decodes the row, and
     /// checks the end bound.
-    fn normalize(&mut self) -> io::Result<()> {
+    fn normalize(&mut self, file: &RangeFile) -> io::Result<()> {
+        self.check(file);
         self.current = None;
         self.out_of_line_key = None;
         loop {
-            if self.page >= self.file.page_count() {
+            if self.page >= file.page_count() {
                 return Ok(());
             }
             if self.loaded_page != Some(self.page) {
-                let page = self.reader.page(&self.file, self.page)?;
+                let page = self.reader.page(file, self.page)?;
                 let rows = RangeFile::row_count(page);
                 if PAGE_HEADER_LEN + (ROW_OFFSET_LEN + ROW_HINT_LEN) * rows > page.len() {
                     return Err(corrupt("bad page header"));
@@ -1073,7 +1089,7 @@ impl RangeFileCursor {
             };
             let raw = parse_row_at(&self.page_bytes, off)?;
             if let Ref::OutOfLine { offset, len } = raw.key {
-                self.out_of_line_key = Some(Bytes::copy_from_slice(&self.file.read(offset, len)?));
+                self.out_of_line_key = Some(Bytes::copy_from_slice(&file.read(offset, len)?));
             }
             let key: &[u8] = match (&raw.key, &self.out_of_line_key) {
                 (Ref::Inline(range), _) => &self.page_bytes[range.clone()],
@@ -1102,7 +1118,7 @@ impl RangeFileCursor {
 
     /// Returns the current row as slices of the page buffer, and moves to the next row. The
     /// caller must have seen a key.
-    pub(crate) fn take(&mut self) -> io::Result<RowEntry> {
+    pub(crate) fn take(&mut self, file: &RangeFile) -> io::Result<RowEntry> {
         let Some(raw) = self.current.take() else {
             return Err(corrupt("cursor has no current row"));
         };
@@ -1115,9 +1131,7 @@ impl RangeFileCursor {
         };
         let value = match &raw.value {
             Ref::Inline(range) => self.page_bytes.slice(range.clone()),
-            Ref::OutOfLine { offset, len } => {
-                Bytes::copy_from_slice(&self.file.read(*offset, *len)?)
-            }
+            Ref::OutOfLine { offset, len } => Bytes::copy_from_slice(&file.read(*offset, *len)?),
         };
         let row = RowEntry {
             key,
@@ -1131,30 +1145,30 @@ impl RangeFileCursor {
             expire_ts: None,
         };
         self.index += 1;
-        self.normalize()?;
+        self.normalize(file)?;
         Ok(row)
     }
 
     /// Moves to the next row.
-    pub(crate) fn skip(&mut self) -> io::Result<()> {
+    pub(crate) fn skip(&mut self, file: &RangeFile) -> io::Result<()> {
         if self.current.is_some() {
             self.index += 1;
-            self.normalize()?;
+            self.normalize(file)?;
         }
         Ok(())
     }
 
     /// Moves forward to the first row at or after `key`. It never moves backwards.
-    pub(crate) fn seek(&mut self, key: &[u8]) -> io::Result<()> {
+    pub(crate) fn seek(&mut self, file: &RangeFile, key: &[u8]) -> io::Result<()> {
         if self.key().is_none_or(|current| current >= key) {
             return Ok(());
         }
-        let (page, index) = self.file.locate(&mut self.reader, Bound::Included(key))?;
+        let (page, index) = file.locate(&mut self.reader, Bound::Included(key))?;
         if (page, index) > (self.page, self.index) {
             self.page = page;
             self.index = index;
         }
-        self.normalize()
+        self.normalize(file)
     }
 }
 
@@ -1175,10 +1189,12 @@ impl RangeFileIterator {
         }
     }
 
-    fn cursor(&mut self) -> Result<&mut RangeFileCursor, SlateDBError> {
-        self.cursor
-            .as_mut()
-            .ok_or(SlateDBError::IteratorNotInitialized)
+    /// The cursor, and the file that it reads.
+    fn cursor(&mut self) -> Result<(&mut RangeFileCursor, &RangeFile), SlateDBError> {
+        match self.cursor.as_mut() {
+            Some(cursor) => Ok((cursor, &self.file)),
+            None => Err(SlateDBError::IteratorNotInitialized),
+        }
     }
 }
 
@@ -1186,21 +1202,22 @@ impl RangeFileIterator {
 impl RowEntryIterator for RangeFileIterator {
     async fn init(&mut self) -> Result<(), SlateDBError> {
         if self.cursor.is_none() {
-            self.cursor = Some(RangeFileCursor::new(self.file.clone(), &self.range)?);
+            self.cursor = Some(RangeFileCursor::new(&self.file, &self.range)?);
         }
         Ok(())
     }
 
     async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        let cursor = self.cursor()?;
+        let (cursor, file) = self.cursor()?;
         if cursor.key().is_none() {
             return Ok(None);
         }
-        Ok(Some(cursor.take()?))
+        Ok(Some(cursor.take(file)?))
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
-        Ok(self.cursor()?.seek(next_key)?)
+        let (cursor, file) = self.cursor()?;
+        Ok(cursor.seek(file, next_key)?)
     }
 }
 

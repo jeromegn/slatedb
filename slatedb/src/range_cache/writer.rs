@@ -356,9 +356,10 @@ impl RangeCache {
     /// memtable and before it advances the last committed sequence number. All entries have
     /// the same sequence number `s`.
     ///
-    /// No lock, and no shared read-modify-write: one check of the queue, one index load, and
-    /// for a batch that touches cached ranges, the delta inserts and one store per touched range
-    /// and per batch.
+    /// No lock: one check of the queue, one index load, and for a batch that touches cached
+    /// ranges, the copies into the deltas and one store per touched range and per batch. The only
+    /// read-modify-writes are the claim of a delta's writer role, once per run of entries on a
+    /// line that readers do not load, and the count of delta memory when a chunk is allocated.
     pub(crate) fn apply_write(self: &Arc<Self>, entries: &[RowEntry], oracle: &dyn Oracle) {
         let Some(seq) = entries.first().map(|e| e.seq) else {
             return;
@@ -378,32 +379,45 @@ impl RangeCache {
     }
 
     fn apply_covered(self: &Arc<Self>, index: &RangeIndex, entries: &[RowEntry], seq: u64) {
-        let mut touched: Vec<Arc<CachedRange>> = Vec::new();
-        let mut expiring: Vec<Arc<CachedRange>> = Vec::new();
-        for entry in entries {
-            let Some(range) = covering(index, &entry.key) else {
+        // The ranges are references into the index that the caller holds, so the batch changes
+        // no reference count that readers share.
+        let mut touched: Vec<&Arc<CachedRange>> = Vec::new();
+        let mut expiring: Vec<&Arc<CachedRange>> = Vec::new();
+        let mut i = 0;
+        while i < entries.len() {
+            let Some(range) = covering(index, &entries[i].key) else {
+                i += 1;
                 continue;
             };
-            if entry.expire_ts.is_some() {
-                // The cache does not hold rows that expire. See RFC 0040, "TTL".
-                if !expiring.iter().any(|r| Arc::ptr_eq(r, range)) {
-                    expiring.push(range.clone());
-                }
-                continue;
-            }
+            // A batch's entries come in key order, so the entries of a range are adjacent. The
+            // writer appends each run of them with one claim of the delta.
             let layers = range.layers.load();
-            // A range registered at `W`, or rebuilt at `W`, holds every batch at or below `W`
-            // in its file, and receives only later batches.
-            debug_assert!(
-                entry.seq > layers.file_seq,
-                "a batch at {} reached a range whose file holds {}",
-                entry.seq,
-                layers.file_seq
-            );
-            layers.active.table.put(entry.clone());
-            if !touched.iter().any(|r| Arc::ptr_eq(r, range)) {
+            let mut delta = layers.active.writer();
+            let mut appended = false;
+            while let Some(entry) = entries.get(i).filter(|e| range.contains(&e.key)) {
+                i += 1;
+                if entry.expire_ts.is_some() {
+                    // The cache does not hold rows that expire. See RFC 0040, "TTL".
+                    if !expiring.iter().any(|r| Arc::ptr_eq(r, range)) {
+                        expiring.push(range);
+                    }
+                    continue;
+                }
+                // A range registered at `W`, or rebuilt at `W`, holds every batch at or below
+                // `W` in its file, and receives only later batches.
+                debug_assert!(
+                    entry.seq > layers.file_seq,
+                    "a batch at {} reached a range whose file holds {}",
+                    entry.seq,
+                    layers.file_seq
+                );
+                delta.append(entry);
+                appended = true;
+            }
+            drop(delta);
+            if appended && !touched.iter().any(|r| Arc::ptr_eq(r, range)) {
                 range.last_write_seq.0.store(seq, Ordering::Release);
-                touched.push(range.clone());
+                touched.push(range);
             }
         }
         for range in &expiring {
@@ -419,22 +433,26 @@ impl RangeCache {
 
     /// Starts a rebuild if the active delta of `range` is large enough.
     fn maybe_freeze(self: &Arc<Self>, range: &Arc<CachedRange>, seq: u64) {
-        let layers = range.layers.load_full();
-        let Some(file) = layers.file.clone() else {
+        // A guard and borrows: the check changes no reference count unless the delta freezes.
+        let layers = range.layers.load();
+        let Some(file) = &layers.file else {
             return;
         };
         if layers.frozen.is_some() {
             return;
         }
+        let file_len = file.file_len();
         let threshold = self
             .options
             .tuning
             .min_rebuild_delta_bytes
-            .max((file.file_len() / 4) as usize);
+            .max((file_len / 4) as usize);
         if layers.active.size() < threshold {
             return;
         }
-        if !self.rebuild_pays(range, file.file_len()) {
+        let (frozen, file, file_seq) = (layers.active.clone(), file.clone(), layers.file_seq);
+        drop(layers);
+        if !self.rebuild_pays(range, file_len) {
             // The delta holds this write, so it is complete up to `seq`.
             self.remove_at(range, seq, RemoveReason::NotWorthIt);
             return;
@@ -442,15 +460,14 @@ impl RangeCache {
         range
             .reads_at_build
             .store(range.heat.reads(), Ordering::Relaxed);
-        let frozen = layers.active.clone();
         // The word is on the delta, so every set of layers that holds this delta as its active
         // delta, older ones included, sees the seal.
-        frozen.sealed_at.store(seq, Ordering::SeqCst);
+        frozen.sealed_at().store(seq, Ordering::SeqCst);
         range.layers.store(Arc::new(Layers {
-            active: Arc::new(Delta::new()),
+            active: Arc::new(Delta::new(&self.delta_memory)),
             frozen: Some(frozen.clone()),
             file: Some(file.clone()),
-            file_seq: layers.file_seq,
+            file_seq,
             end: range.end.clone(),
         }));
         let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
@@ -553,7 +570,7 @@ impl RangeCache {
         let mut ranges = Vec::with_capacity(parts.len());
         for (part_start, part_end) in parts {
             let layers = Layers {
-                active: Arc::new(Delta::new()),
+                active: Arc::new(Delta::new(&self.delta_memory)),
                 frozen: None,
                 // A loading range serves no read.
                 file: None,
@@ -681,7 +698,7 @@ impl RangeCache {
             .layers
             .load()
             .active
-            .sealed_at
+            .sealed_at()
             .store(sealed_at, Ordering::SeqCst);
         let mut index = RangeIndex::clone(&self.index.load());
         index.remove(&range.start);
@@ -722,7 +739,7 @@ impl RangeCache {
                     .layers
                     .load()
                     .active
-                    .sealed_at
+                    .sealed_at()
                     .store(w, Ordering::SeqCst);
                 self.writer.give_back_slot(range.slot);
                 self.stats.removed(RemoveReason::Closed);
@@ -989,7 +1006,7 @@ mod tests {
         t.db.put(key(20), "new").await.unwrap();
         let seq = t.committed();
         let layers = range.layers.load();
-        assert_eq!(layers.active.table.metadata().entry_num, 1);
+        assert_eq!(layers.active.len(), 1);
         assert!(seq > layers.file_seq);
         assert_eq!(t.db.get(key(20)).await.unwrap(), Some(Bytes::from("new")));
         t.db.close().await.unwrap();
@@ -1030,7 +1047,7 @@ mod tests {
         let layers = range.layers.load_full();
         t.db.uncache_range(span(10, 20)).unwrap();
         t.db.wait_for_range_cache().await.unwrap();
-        let sealed_at = layers.active.sealed_at.load(Ordering::SeqCst);
+        let sealed_at = layers.active.sealed_at().load(Ordering::SeqCst);
         assert_eq!(sealed_at, t.committed());
         // A snapshot read that pinned these layers before the removal can use them.
         assert!(snapshot.seq() <= sealed_at);

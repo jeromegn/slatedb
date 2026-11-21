@@ -60,6 +60,11 @@ pub const FILE_BYTES: &str = range_cache_stat_name!("file_bytes");
 /// The estimated bytes of the active and frozen deltas of cached ranges. The cache updates it
 /// when ranges change and, with automatic promotion, at each evaluation.
 pub const DELTA_BYTES: &str = range_cache_stat_name!("delta_bytes");
+/// The memory that the deltas hold, exactly: every chunk of every delta from its allocation until
+/// the last holder of the delta (its range, a scan, a merge resolution or a rebuild) drops it. It
+/// changes when a delta allocates a chunk or drops. A delta's memory is larger than its share of
+/// `delta_bytes` by its index and its last chunk's free room.
+pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_bytes");
 
 // Automatic promotion. The cache registers these metrics only when automatic promotion is on.
 

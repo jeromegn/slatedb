@@ -70,7 +70,8 @@ idea works. Inside SlateDB, the cache can apply each write before the write beco
 
 - **Cached range**: a half-open key range `[start, end)` that the cache holds completely.
 - **Range cache file**: an immutable local file with a range's rows at sequence number `file_seq`.
-- **Delta**: an in-memory `KVTable` with the writes to a cached range since its file was written.
+- **Delta**: an in-memory sorted buffer with the writes to a cached range since its file was
+  written. Only the batch writer appends to it; reads search it without writing shared memory.
 - **Explicit range** or **automatic range**: one that `cache_range` or automatic promotion loaded.
 
 ### API
@@ -117,6 +118,21 @@ Each cached range has three layers, newest first, which the cache replaces toget
 rebuild; and the file with its `file_seq`, absent while the range loads. A delta's `sealed_at` is
 `u64::MAX` until the cache seals it at the last sequence number that it applied to the delta.
 
+A delta is an append-only skiplist of versions ordered by key, then newest first, whose nodes live
+in memory chunks that the delta owns: 4 KiB at first, doubling up to 64 KiB, and a chunk of its own
+for a node larger than 16 KiB. A node holds the key, the sequence number, the kind (value,
+tombstone or merge operand), the create time and the value, copied from the batch. Only the batch
+writer appends, after it claims the delta's writer role (one compare-and-swap per run of a batch's
+entries in the range; a second writer panics). It writes every byte of a node before it links it,
+level 0 first, with `Release` stores; readers follow links with `Acquire` loads. A linked node's
+bytes never change and no node is removed, so readers take no reference count, no epoch and no
+lock, and write nothing. The chunks are freed when the last holder of the delta drops it: the
+layers, a scan, a merge resolution or a rebuild. Each delta counts its chunks exactly, and the
+cache keeps their total for all deltas, from allocation to that drop. The size that the rebuild
+threshold and `delta_bytes` use is the estimate that the memtable uses (key, value, sequence
+number and create time), so rebuilds start where they did. A read skips an empty delta with one
+load of its first link.
+
 ### Write path
 
 `DbInner::write_batch` runs on the batch writer task. It puts a batch in the WAL buffer and the
@@ -126,8 +142,9 @@ cache, the writer runs these steps after the memtable insert and before that adv
 1. If the request queue is not empty, apply the queued requests (see
    [Writer requests](#writer-requests)).
 2. Load the index without a lock. If no entry falls in a cached range, go to step 6.
-3. Put each covered entry, tombstones and merge operands included, in its delta. Store the batch
-   sequence number as the range's last write.
+3. Copy each covered entry, tombstones and merge operands included, into its delta. A batch's
+   entries come in key order, so the entries of one range are adjacent, and the writer claims the
+   delta once for them. Store the batch sequence number as the range's last write.
 4. If an entry has an expire time, remove its range. Seal its delta one below the batch sequence
    number, because the delta does not hold this write.
 5. If an active delta is larger than its rebuild threshold, freeze it (see [Rebuild](#rebuild)).
@@ -146,15 +163,22 @@ A point read takes no lock, and awaits only for a merge operand. It loads the in
 its range, and then the last committed sequence number, called `seq`. If the delta was sealed below
 `seq`, it retries up to three times, then uses the normal read path. A read older than the file
 uses the normal read path at once. It returns the newest version
-at or below `seq` from the active delta, the frozen delta, then the file. A tombstone or no version
-is a definite miss. For a merge operand, the read runs the normal iterator stack over the pinned
-layers.
+at or below `seq` from the active delta, the frozen delta, then the file. It searches a delta in
+place by the borrowed key, and copies only a value out, with its key, in one allocation. A
+tombstone or no version is a definite miss. For a merge operand, the read runs the normal iterator
+stack over the pinned layers.
 
-A scan walks the pinned layers with a cursor on the file and on each delta. Each cursor skips
-versions above `seq`. Each step takes the smallest key, and the newest layer wins a tie. A
+A scan walks the pinned layers with a cursor on the file and on each delta. A delta cursor is a
+position in the delta that the scan reads through the layers it pinned, so it takes no reference
+of its own; it copies out only the rows that the scan returns. Each cursor skips versions above
+`seq`. Each step takes the smallest key, and the newest layer wins a tie. A
 tombstone skips the key. A key with a merge operand is read alone through the normal iterator
-stack. The file cursor copies each page that it enters into one buffer, and returns rows as slices
-of it. So a kept row holds up to one page (4 KiB by default), as a value from an SST holds its
+stack. The file cursor, too, reads the file of the pinned layers and takes no reference to it, so
+the only reference counts that a scan changes are that of each set of layers that it pins (one
+increment and one decrement per range) and, if the database has a merge operator, the merge
+operator's. The layers are aligned to a cache line, so that count
+does not share a line with the fields that every read loads. The file cursor copies each page that
+it enters into one buffer, and returns rows as slices of it. So a kept row holds up to one page (4 KiB by default), as a value from an SST holds its
 block. A scan over adjacent ranges pins all of them before it loads `seq`, because a rebuild could
 otherwise install a file newer than `seq`. The scan sits behind the public `DbIterator`, so its
 contract does not change. With `DbIterator::new_resolved` and `RowEntryIterator::next_sync`, it
@@ -399,7 +423,8 @@ p50 latency on one task, then operations per second on 1, 8 and 16 tasks.
   block cache looked much worse: its 16 MiB metadata share could not hold index and filter blocks.
 
 When the feature is off, its code does not exist. Without a configured cache, a read or a write
-checks one `Option`. With a cache, a write clones each entry and makes 3 atomic operations,
+checks one `Option`. With a cache, a write to a cached range copies each entry into its delta and
+makes one compare-and-swap per run of a batch's entries in a range,
 and a read of a key that is not cached makes one atomic load and one index lookup. The table gives
 the median of 8 runs on one task, with 100,000 keys in the memtables and an in-memory object store.
 The machine was busy during these runs, so differences of a few percent are noise. The last row
@@ -412,12 +437,31 @@ shows the cost of writes to cached keys; the table above gives the read numbers.
 | Cache configured, keys not cached | 9.22 µs | 428 ns | 1.39 µs | 55.7 µs |
 | All keys cached, writes go to deltas | 9.51 µs | 794 ns | - | - |
 
+The table above predates the delta buffer. Measured again with it, on the same machine and
+interleaved with the build before it (8 runs each): 708 ns per entry for all keys cached against
+712 ns before, and 446 ns against 442 ns with the cache configured and no key cached; the spread
+of the cached runs (590 to 810 ns) hides the difference. Putting the rows in the delta alone, on
+one thread with 16-byte keys and 200-byte values, costs 60 ns per entry against 82 ns for the
+skiplist that it replaces with keys in order, and 115 ns against 173 ns with random keys. A delta
+holds 260 bytes of memory for such a row, which the size estimate counts as 232; the skiplist held
+about 520. Reads of a range whose delta holds the range's own writes (uniform keys, nearly all
+read from the file and missing in the delta; mean time per read on one task, then reads per
+second on 16 tasks):
+
+| Delta | Get | 10-row scan | 100-row scan |
+| --- | --- | --- | --- |
+| Empty | 387 ns; 32.0M | 1.25 µs; 7.27M | 6.23 µs; 1.55M |
+| 1 MiB (4,520 rows) | 484 ns; 25.0M | 1.38 µs; 6.98M | 6.46 µs; 1.69M |
+| 16 MiB (72,316 rows) | 656 ns; 16.4M | 1.58 µs; 5.95M | 6.83 µs; 1.57M |
+
 ### Observability
 
 - Configuration: `DbBuilder::with_range_cache`. New components: rebuild and promoter tasks.
 - Metrics under `slatedb.range_cache.`: reads served, mixed scans and the gaps they open, retries
   and fallbacks to the normal path by reason, loads, rebuilds, bytes, removals by reason, and
-  gauges for ranges, file bytes and delta bytes. Automatic promotion adds its own counters. The
+  gauges for ranges, file bytes, delta bytes (estimated, as the memtable counts its rows) and delta
+  allocated bytes (`delta_allocated_bytes`: the chunks of every delta, exactly, until the last
+  holder of the delta drops it). Automatic promotion adds its own counters. The
   read-path counters, and `slatedb.db.request_count` for reads that the cache serves, are counted
   on each thread and added to the shared counters at the same folds as the ranges' reads, so a
   read writes no shared counter. They are exact only after a fold.

@@ -6,9 +6,10 @@
 //!   in a cached range, so a point read in it is a definite hit or a definite miss, and a scan
 //!   in it needs no other source.
 //! - A cached range has three layers, newest first: the *active delta*, at most one *frozen
-//!   delta*, and one *range cache file*. A delta is a [`KVTable`] that holds every version that
-//!   the writer applied to the range since the file was written. The file holds the rows of the
-//!   range at one sequence number.
+//!   delta*, and one *range cache file*. A delta holds every version that the writer applied to
+//!   the range since the file was written, in a sorted buffer that only the writer appends to
+//!   and that reads search without a shared write (see the `buffer` and `delta` modules). The
+//!   file holds the rows of the range at one sequence number.
 //! - The batch writer applies each write to the deltas after it puts the write in the memtable
 //!   and before it advances the last committed sequence number. Reads at the latest committed
 //!   state read the deltas with that sequence number as the bound, so a write becomes visible
@@ -51,6 +52,8 @@
 //! 10 ms (see the `hits` module). Eviction and automatic promotion use those folded values.
 
 mod auto;
+mod buffer;
+mod delta;
 mod file;
 mod hits;
 mod mixed;
@@ -84,16 +87,17 @@ use crate::db_iter::DbIterator;
 use crate::db_snapshot::DbSnapshot;
 use crate::error::SlateDBError;
 use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
-use crate::mem_table::KVTable;
 use crate::merge_operator::MergeOperatorType;
 use crate::oracle::Oracle;
 use crate::read_trace::ReadTrace;
 use crate::reader::ScanContext;
-use crate::types::{KeyValue, RowEntry, ValueDeletable};
+use crate::types::{KeyValue, ValueDeletable};
 
 pub use auto::AutoPromoteOptions;
 use auto::AutoSettings;
 pub(crate) use auto::{Promoter, PromoterMessage, RANGE_CACHE_PROMOTER_TASK_NAME};
+use buffer::Kind;
+use delta::{Delta, DeltaIterator, DeltaMemory};
 pub use file::RangeCachePageSource;
 use file::{RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION, TEMP_FILE_EXTENSION};
 use hits::{HitStats, RangeHits};
@@ -279,28 +283,13 @@ pub struct CachedRangeInfo {
     pub automatic: bool,
 }
 
-/// The versions that the writer applied to a range since its file was written.
-struct Delta {
-    table: KVTable,
-    /// The cache applies no write with a greater sequence number to this delta. It is
-    /// `u64::MAX` while the delta is active.
-    sealed_at: AtomicU64,
-}
-
-impl Delta {
-    fn new() -> Self {
-        Self {
-            table: KVTable::new(),
-            sealed_at: AtomicU64::new(u64::MAX),
-        }
-    }
-
-    fn size(&self) -> usize {
-        self.table.metadata().entries_size_in_bytes
-    }
-}
-
 /// The layers of a cached range. The cache replaces this value as a whole.
+///
+/// Every scan increments and decrements the reference count of the `Arc` that holds the layers
+/// (see [`RangeCache::pin_scan`]). The alignment keeps that count off the cache line of the fields
+/// that every read loads, so concurrent reads of the range do not miss on it. Apple silicon has
+/// 128-byte lines.
+#[repr(align(128))]
 struct Layers {
     active: Arc<Delta>,
     /// A delta that a rebuild merges into a new file.
@@ -577,6 +566,8 @@ pub(crate) struct RangeCache {
     /// The bytes of all open range cache files, including files that only a reader or a
     /// rebuild keeps open.
     disk_bytes: Arc<AtomicU64>,
+    /// The memory of all deltas, including deltas that only a reader or a rebuild holds.
+    delta_memory: Arc<DeltaMemory>,
     /// The number of the next range cache file. Loads and rebuilds take one each.
     next_file_id: AtomicU64,
     /// The bookkeeping of the reads that the cache serves. Its access clock advances by two on
@@ -664,6 +655,7 @@ impl RangeCache {
             index: ArcSwap::from_pointee(RangeIndex::new()),
             writer: WriterQueue::new(),
             disk_bytes: Arc::new(AtomicU64::new(0)),
+            delta_memory: DeltaMemory::new(recorder.gauge(stats::DELTA_ALLOCATED_BYTES).register()),
             next_file_id: AtomicU64::new(0),
             hits,
             stats: RangeCacheStats::new(recorder),
@@ -714,11 +706,7 @@ impl RangeCache {
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-rebuild");
         let all = BytesRange::unbounded();
         let sources: Vec<Box<dyn RowEntryIterator + 'static>> = vec![
-            Box::new(
-                frozen
-                    .table
-                    .range(all.clone(), IterationOrder::Ascending, ReadTrace::none()),
-            ),
+            Box::new(DeltaIterator::new(frozen.clone(), &all)),
             Box::new(RangeFileIterator::new(file, all.clone())),
         ];
         let mut iter = DbIterator::new(
@@ -835,6 +823,7 @@ impl RangeCache {
             .map(|r| r.delta_bytes(&r.layers.load()))
             .sum();
         self.stats.delta_bytes.set(delta_bytes as i64);
+        self.delta_memory.publish();
         self.stats
             .file_bytes
             .set(self.disk_bytes.load(Ordering::Relaxed) as i64);
@@ -846,7 +835,7 @@ impl RangeCache {
         if layers.file.is_none() || seq < layers.file_seq {
             return Err(Unfit::TooOld);
         }
-        if layers.active.sealed_at.load(Ordering::SeqCst) < seq {
+        if layers.active.sealed_at().load(Ordering::SeqCst) < seq {
             return Err(Unfit::Sealed);
         }
         Ok(())
@@ -896,26 +885,20 @@ impl RangeCache {
                 return CacheRead::Unusable;
             }
             return match lookup(&layers, key, seq) {
-                Ok(Some(entry)) => match entry.value {
-                    ValueDeletable::Value(_) => {
-                        self.count_read(cached, ReadCount::GetHit);
-                        CacheRead::Answer(Some(KeyValue::from(entry)))
-                    }
-                    ValueDeletable::Tombstone => {
-                        self.count_read(cached, ReadCount::GetAbsent);
-                        CacheRead::Answer(None)
-                    }
-                    ValueDeletable::Merge(_) => {
-                        self.count_read(cached, ReadCount::GetMerge);
-                        CacheRead::Resolve(Pinned {
-                            layers: arc_swap::Guard::into_inner(layers),
-                            seq,
-                        })
-                    }
-                },
-                Ok(None) => {
+                Ok(Found::Value(kv)) => {
+                    self.count_read(cached, ReadCount::GetHit);
+                    CacheRead::Answer(Some(kv))
+                }
+                Ok(Found::Absent) => {
                     self.count_read(cached, ReadCount::GetAbsent);
                     CacheRead::Answer(None)
+                }
+                Ok(Found::Merge) => {
+                    self.count_read(cached, ReadCount::GetMerge);
+                    CacheRead::Resolve(Pinned {
+                        layers: arc_swap::Guard::into_inner(layers),
+                        seq,
+                    })
                 }
                 Err(e) => {
                     warn!("range cache read failed [error={:?}]", e);
@@ -1310,26 +1293,45 @@ impl PinnedScan {
     }
 }
 
-/// Returns the newest version of `key` in `layers` at `seq`, or `None` if the key has no
-/// version.
-fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Option<RowEntry>> {
+/// What a point read found in the layers of a range at its sequence number.
+enum Found {
+    /// The newest version is a value.
+    Value(KeyValue),
+    /// The newest version is a tombstone, or the key has no version.
+    Absent,
+    /// The newest version is a merge operand.
+    Merge,
+}
+
+/// Returns the newest version of `key` in `layers` at `seq`. A delta is searched in place, by
+/// the borrowed key: only a value is copied out, with its key, in one allocation.
+fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
     let deltas = std::iter::once(&layers.active).chain(layers.frozen.as_ref());
-    // A delta lookup needs the key as `Bytes`. Most reads of a range that takes few writes
-    // find empty deltas, and skip the copy.
-    let mut owned: Option<Bytes> = None;
     for delta in deltas {
-        if delta.table.is_empty() {
+        // Most reads of a range that takes few writes find empty deltas: one load each.
+        if delta.is_empty() {
             continue;
         }
-        let key = owned.get_or_insert_with(|| Bytes::copy_from_slice(key));
-        if let Some(entry) = delta.table.newest_version(key, seq) {
-            return Ok(Some(entry));
+        if let Some(version) = delta.newest(key, seq) {
+            return Ok(match version.kind {
+                Kind::Value => Found::Value(KeyValue::from(delta::to_row(&version))),
+                Kind::Tombstone => Found::Absent,
+                Kind::Merge => Found::Merge,
+            });
         }
     }
-    match &layers.file {
-        Some(file) => file.get(key),
-        None => Ok(None),
-    }
+    let row = match &layers.file {
+        Some(file) => file.get(key)?,
+        None => None,
+    };
+    Ok(match row {
+        Some(row) => match row.value {
+            ValueDeletable::Value(_) => Found::Value(KeyValue::from(row)),
+            ValueDeletable::Merge(_) => Found::Merge,
+            ValueDeletable::Tombstone => Found::Absent,
+        },
+        None => Found::Absent,
+    })
 }
 
 /// Returns an iterator over `range` of `layers` at `seq`, through the iterator stack of the
@@ -1343,11 +1345,8 @@ async fn stack_iterator(
     let mut sources: Vec<Box<dyn RowEntryIterator + 'static>> = std::iter::once(&layers.active)
         .chain(layers.frozen.as_ref())
         .map(|delta| {
-            Box::new(
-                delta
-                    .table
-                    .range(range.clone(), IterationOrder::Ascending, ReadTrace::none()),
-            ) as Box<dyn RowEntryIterator + 'static>
+            Box::new(DeltaIterator::new(delta.clone(), &range))
+                as Box<dyn RowEntryIterator + 'static>
         })
         .collect();
     if let Some(file) = &layers.file {
@@ -1735,7 +1734,7 @@ mod tests {
                         b(start),
                         end.map(b),
                         Layers {
-                            active: Arc::new(Delta::new()),
+                            active: Arc::new(Delta::new(&DeltaMemory::detached())),
                             frozen: None,
                             file: None,
                             file_seq: 0,
@@ -2022,7 +2021,7 @@ mod tests {
                 .layers
                 .load()
                 .active
-                .sealed_at
+                .sealed_at()
                 .store(0, Ordering::SeqCst);
             assert_eq!(
                 t.db.get(key(60)).await.unwrap(),

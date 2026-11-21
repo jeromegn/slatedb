@@ -21,72 +21,99 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::{Delta, Layers};
+use super::buffer::{Cursor, Kind, Version};
+use super::delta::{past_end, to_row, Delta};
+use super::Layers;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
-use crate::iter::{IterationOrder, RowEntryIterator};
-use crate::mem_table::MemTableIterator;
+use crate::iter::RowEntryIterator;
 use crate::merge_operator::MergeOperatorType;
 use crate::range_cache::file::RangeFileCursor;
-use crate::read_trace::ReadTrace;
 use crate::types::{RowEntry, ValueDeletable};
 
-/// A cursor over the versions of a delta that are visible at one sequence number.
+/// The deltas of a set of layers, newest first: the active delta, then the frozen delta.
+const DELTAS: usize = 2;
+
+/// The delta `i` of `layers`, in the order of [`DELTAS`].
+fn delta_of(layers: &Layers, i: usize) -> Option<&Delta> {
+    match i {
+        0 => Some(&layers.active),
+        _ => layers.frozen.as_deref(),
+    }
+}
+
+/// A cursor over the versions of a delta that are visible at one sequence number. It is a
+/// position in the delta's buffer: the scan reads it through the layers that it holds, so the
+/// cursor takes no reference of its own and reads the buffer in place.
 struct DeltaCursor {
-    iter: MemTableIterator,
+    pos: Cursor,
     seq: u64,
-    /// The newest visible version of the next key.
-    peeked: Option<RowEntry>,
-    /// The key of the last version that `fill` peeked, so that it skips the older versions.
-    last_key: Option<Bytes>,
-    exhausted: bool,
+    /// `pos` is at the newest visible version of its key, which the scan has not used yet.
+    peeked: bool,
+    /// The cursor passed the end of the part.
+    done: bool,
 }
 
 impl DeltaCursor {
-    fn new(delta: &Delta, range: &BytesRange, seq: u64) -> Self {
+    fn new(delta: &Delta, start: Bound<&[u8]>, seq: u64) -> Self {
         Self {
-            iter: delta
-                .table
-                .range(range.clone(), IterationOrder::Ascending, ReadTrace::none()),
+            pos: delta.buffer().seek(start),
             seq,
-            peeked: None,
-            last_key: None,
-            exhausted: false,
+            peeked: false,
+            done: false,
         }
     }
 
-    /// Peeks the newest visible version of the next key. A delta holds the versions of a key
-    /// newest first, so the first version at or below `seq` is the newest visible one.
-    fn fill(&mut self) {
-        while self.peeked.is_none() && !self.exhausted {
-            match self.iter.next_sync() {
-                None => self.exhausted = true,
-                Some(entry) => {
-                    if entry.seq > self.seq || self.last_key.as_ref() == Some(&entry.key) {
-                        continue;
-                    }
-                    self.last_key = Some(entry.key.clone());
-                    self.peeked = Some(entry);
-                }
+    /// Moves to the newest visible version of the next key, unless the cursor is at one. A delta
+    /// holds the versions of a key newest first, so the first version at or below `seq` is the
+    /// newest visible one.
+    fn fill(&mut self, delta: &Delta, end: &Bound<Bytes>) {
+        let buffer = delta.buffer();
+        while !self.peeked && !self.done {
+            match buffer.version(&self.pos) {
+                None => self.done = true,
+                Some(version) if past_end(end, version.key) => self.done = true,
+                Some(version) if version.seq <= self.seq => self.peeked = true,
+                Some(_) => buffer.advance(&mut self.pos),
             }
         }
     }
 
-    fn key(&self) -> Option<&Bytes> {
-        self.peeked.as_ref().map(|entry| &entry.key)
+    /// The version that `fill` found.
+    fn version<'a>(&self, delta: &'a Delta) -> Option<Version<'a>> {
+        if self.peeked {
+            delta.buffer().version(&self.pos)
+        } else {
+            None
+        }
     }
 
-    async fn seek(&mut self, key: &[u8]) -> Result<(), SlateDBError> {
-        if let Some(entry) = &self.peeked {
-            if entry.key.as_ref() >= key {
-                return Ok(());
+    fn key<'a>(&self, delta: &'a Delta) -> Option<&'a [u8]> {
+        self.version(delta).map(|version| version.key)
+    }
+
+    /// Leaves the key of the version that `fill` found: moves past its older versions.
+    fn next_key(&mut self, delta: &Delta) {
+        let buffer = delta.buffer();
+        if let Some(key) = self.key(delta) {
+            buffer.advance(&mut self.pos);
+            while buffer.version(&self.pos).is_some_and(|v| v.key == key) {
+                buffer.advance(&mut self.pos);
             }
-            self.peeked = None;
         }
-        if !self.exhausted {
-            self.iter.seek(key).await?;
+        self.peeked = false;
+    }
+
+    /// Moves forward to the first key at or after `key`. It never moves backwards.
+    fn seek(&mut self, delta: &Delta, key: &[u8]) {
+        if self.done {
+            return;
         }
-        Ok(())
+        let buffer = delta.buffer();
+        if buffer.version(&self.pos).is_some_and(|v| v.key < key) {
+            self.pos = buffer.seek(Included(key));
+            self.peeked = false;
+        }
     }
 }
 
@@ -131,9 +158,10 @@ pub(crate) struct CachedScan {
     /// The end of the scan range.
     scan_end: Bound<Bytes>,
     seq: u64,
+    /// A cursor over the file of the current layers, which it reads through `layers`.
     file: Option<RangeFileCursor>,
-    /// Newest first: the active delta, then the frozen delta.
-    deltas: Vec<DeltaCursor>,
+    /// A cursor for each non-empty delta of the current layers, in the order of [`DELTAS`].
+    deltas: [Option<DeltaCursor>; DELTAS],
     merge_operator: Option<MergeOperatorType>,
     /// A merge-operand key that `next_sync` found and left for `next` to resolve.
     unresolved: Option<Bytes>,
@@ -163,7 +191,7 @@ impl CachedScan {
             scan_end,
             seq,
             file: None,
-            deltas: Vec::new(),
+            deltas: [None, None],
             merge_operator,
             unresolved: None,
             point: range.as_point().is_some(),
@@ -182,28 +210,20 @@ impl CachedScan {
     /// Starts reading the current layers from `start` to `end`.
     fn open(&mut self, start: Bound<&[u8]>, end: Bound<Bytes>) -> io::Result<()> {
         let layers = &self.layers;
+        // The cursor reads the file of the pinned layers, so it takes no reference to it.
         self.file = match &layers.file {
-            Some(file) => Some(RangeFileCursor::with_bounds(
-                file.clone(),
-                start,
-                end.clone(),
-            )?),
+            Some(file) => Some(RangeFileCursor::with_bounds(file, start, end.clone())?),
             None => None,
         };
-        let mut range = None;
         // A delta that is empty now holds no version at or below `seq`: the writer puts each
         // version in its delta before it commits it, and `seq` was loaded before this call
         // (see Appendix B of RFC 0040). So the scan skips it.
-        self.deltas = std::iter::once(&layers.active)
-            .chain(layers.frozen.as_ref())
-            .filter(|delta| !delta.table.is_empty())
-            .map(|delta| {
-                let range = range.get_or_insert_with(|| {
-                    BytesRange::new(start.map(Bytes::copy_from_slice), end.clone())
-                });
-                DeltaCursor::new(delta, range, self.seq)
-            })
-            .collect();
+        let seq = self.seq;
+        self.deltas = std::array::from_fn(|i| {
+            delta_of(layers, i)
+                .filter(|delta| !delta.is_empty())
+                .map(|delta| DeltaCursor::new(delta, start, seq))
+        });
         self.part_end = end;
         Ok(())
     }
@@ -234,45 +254,47 @@ impl CachedScan {
     /// Finds the next key and its newest visible version, without the normal iterator stack.
     fn step(&mut self) -> io::Result<Step> {
         loop {
-            for delta in &mut self.deltas {
-                delta.fill();
+            let layers = &*self.layers;
+            for (i, cursor) in self.deltas.iter_mut().enumerate() {
+                if let (Some(cursor), Some(delta)) = (cursor, delta_of(layers, i)) {
+                    cursor.fill(delta, &self.part_end);
+                }
             }
             // The newest delta with the smallest key. On a tie, the newer delta wins.
-            let mut best: Option<usize> = None;
-            for i in 0..self.deltas.len() {
-                if let Some(key) = self.deltas[i].key() {
-                    let smaller = match best {
-                        None => true,
-                        Some(b) => self.deltas[b].key().is_some_and(|best_key| key < best_key),
-                    };
-                    if smaller {
-                        best = Some(i);
+            let mut best: Option<(usize, &[u8])> = None;
+            for (i, cursor) in self.deltas.iter().enumerate() {
+                let key = match (cursor, delta_of(layers, i)) {
+                    (Some(cursor), Some(delta)) => cursor.key(delta),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    if best.is_none_or(|(_, best_key)| key < best_key) {
+                        best = Some((i, key));
                     }
                 }
             }
             let file_key = self.file.as_ref().and_then(|file| file.key());
             let source = match (file_key, best) {
-                (None, None) => {
-                    if self.next_part()? {
-                        continue;
-                    }
-                    return Ok(Step::End);
+                (None, None) => None,
+                (Some(_), None) => Some(Source::File),
+                (None, Some(_)) => Some(Source::Delta),
+                (Some(file_key), Some((_, delta_key))) => Some(match file_key.cmp(delta_key) {
+                    std::cmp::Ordering::Less => Source::File,
+                    std::cmp::Ordering::Equal => Source::Both,
+                    std::cmp::Ordering::Greater => Source::Delta,
+                }),
+            };
+            let best = best.map(|(i, _)| i);
+            let Some(source) = source else {
+                if self.next_part()? {
+                    continue;
                 }
-                (Some(_), None) => Source::File,
-                (None, Some(_)) => Source::Delta,
-                (Some(file_key), Some(b)) => {
-                    let delta_key = self.deltas[b].key().map_or(&[][..], |k| k.as_ref());
-                    match file_key.cmp(delta_key) {
-                        std::cmp::Ordering::Less => Source::File,
-                        std::cmp::Ordering::Equal => Source::Both,
-                        std::cmp::Ordering::Greater => Source::Delta,
-                    }
-                }
+                return Ok(Step::End);
             };
             if source == Source::File {
-                let row = match self.file.as_mut() {
-                    Some(file) => file.take()?,
-                    None => return Ok(Step::End),
+                let row = match (self.file.as_mut(), &self.layers.file) {
+                    (Some(cursor), Some(file)) => cursor.take(file)?,
+                    _ => return Ok(Step::End),
                 };
                 return Ok(match row.value {
                     ValueDeletable::Merge(_) => Step::Resolve(row.key),
@@ -280,26 +302,37 @@ impl CachedScan {
                 });
             }
             if source == Source::Both {
-                if let Some(file) = self.file.as_mut() {
-                    file.skip()?;
+                if let (Some(cursor), Some(file)) = (self.file.as_mut(), &self.layers.file) {
+                    cursor.skip(file)?;
                 }
             }
-            let Some(b) = best else {
-                return Ok(Step::End);
-            };
-            let Some(entry) = self.deltas[b].peeked.take() else {
+            let layers = &*self.layers;
+            let found = best.and_then(|i| {
+                let delta = delta_of(layers, i)?;
+                Some((i, delta, self.deltas[i].as_ref()?.version(delta)?))
+            });
+            let Some((b, delta, version)) = found else {
                 return Ok(Step::End);
             };
             // Older deltas that hold the same key lose.
-            for delta in &mut self.deltas {
-                if delta.key() == Some(&entry.key) {
-                    delta.peeked = None;
+            for (i, cursor) in self.deltas.iter_mut().enumerate().skip(b + 1) {
+                if let (Some(cursor), Some(older)) = (cursor, delta_of(layers, i)) {
+                    if cursor.key(older) == Some(version.key) {
+                        cursor.next_key(older);
+                    }
                 }
             }
-            match entry.value {
-                ValueDeletable::Value(_) => return Ok(Step::Row(entry)),
-                ValueDeletable::Tombstone => continue,
-                ValueDeletable::Merge(_) => return Ok(Step::Resolve(entry.key)),
+            // Copy out only what the scan returns.
+            let step = match version.kind {
+                Kind::Value => Some(Step::Row(to_row(&version))),
+                Kind::Tombstone => None,
+                Kind::Merge => Some(Step::Resolve(Bytes::copy_from_slice(version.key))),
+            };
+            if let Some(cursor) = self.deltas[b].as_mut() {
+                cursor.next_key(delta);
+            }
+            if let Some(step) = step {
+                return Ok(step);
             }
         }
     }
@@ -370,11 +403,14 @@ impl RowEntryIterator for CachedScan {
                 break;
             }
         }
-        if let Some(file) = self.file.as_mut() {
-            file.seek(next_key)?;
+        if let (Some(cursor), Some(file)) = (self.file.as_mut(), &self.layers.file) {
+            cursor.seek(file, next_key)?;
         }
-        for delta in &mut self.deltas {
-            delta.seek(next_key).await?;
+        let layers = &*self.layers;
+        for (i, cursor) in self.deltas.iter_mut().enumerate() {
+            if let (Some(cursor), Some(delta)) = (cursor, delta_of(layers, i)) {
+                cursor.seek(delta, next_key);
+            }
         }
         Ok(())
     }
@@ -399,7 +435,9 @@ impl RowEntryIterator for CachedScan {
 mod tests {
     use super::*;
     use crate::db_iter::DbIterator;
+    use crate::range_cache::delta::DeltaMemory;
     use crate::range_cache::file::{RangeCachePageSource, RangeFile, RangeFileWriter};
+    use crate::read_trace::ReadTrace;
     use crate::test_utils::StringConcatMergeOperator;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -481,10 +519,12 @@ mod tests {
         let path = writer.finish().unwrap();
         let file = RangeFile::open(path, page_source, Arc::new(AtomicU64::new(0))).unwrap();
         let delta = |versions: &[(u8, Kind, u64)]| {
-            let delta = Delta::new();
+            let delta = Delta::new(&DeltaMemory::detached());
+            let mut writer = delta.writer();
             for (k, kind, seq) in versions.iter().filter(|(k, _, _)| keys(*k)) {
-                delta.table.put(entry(*k, *kind, *seq));
+                writer.append(&entry(*k, *kind, *seq));
             }
+            drop(writer);
             Arc::new(delta)
         };
         Arc::new(Layers {
@@ -639,10 +679,12 @@ mod tests {
                 // One version per key and sequence number, as the writer applies them.
                 let history: BTreeMap<(u8, u64), Kind> =
                     history.into_iter().map(|(k, kind, seq)| ((k, seq), kind)).collect();
-                let all = Delta::new();
+                let all = Delta::new(&DeltaMemory::detached());
+                let mut writer = all.writer();
                 for ((k, seq), kind) in &history {
-                    all.table.put(history_entry(*k, *kind, *seq));
+                    writer.append(&history_entry(*k, *kind, *seq));
                 }
+                drop(writer);
                 let all = Arc::new(Layers {
                     active: Arc::new(all),
                     frozen: None,
@@ -667,12 +709,14 @@ mod tests {
                 let path = writer.finish().unwrap();
                 let file = RangeFile::open(path, page_source, Arc::new(AtomicU64::new(0))).unwrap();
                 let delta = |low: u64, high: u64| {
-                    let delta = Delta::new();
+                    let delta = Delta::new(&DeltaMemory::detached());
+                    let mut writer = delta.writer();
                     for ((k, seq), kind) in &history {
                         if *seq > low && *seq <= high {
-                            delta.table.put(history_entry(*k, *kind, *seq));
+                            writer.append(&history_entry(*k, *kind, *seq));
                         }
                     }
+                    drop(writer);
                     Arc::new(delta)
                 };
                 let (active, frozen) = if with_frozen {
@@ -721,18 +765,15 @@ mod tests {
                         .unwrap()
                         .map(crate::types::KeyValue::from);
                     let got = match crate::range_cache::lookup(&layers, &key(k), seq).unwrap() {
-                        Some(entry) => match entry.value {
-                            ValueDeletable::Value(_) => Some(crate::types::KeyValue::from(entry)),
-                            ValueDeletable::Tombstone => None,
-                            ValueDeletable::Merge(_) => crate::range_cache::Pinned {
-                                layers: layers.clone(),
-                                seq,
-                            }
-                            .get(&key(k), Some(merge.clone()))
-                            .await
-                            .unwrap(),
-                        },
-                        None => None,
+                        crate::range_cache::Found::Value(kv) => Some(kv),
+                        crate::range_cache::Found::Absent => None,
+                        crate::range_cache::Found::Merge => crate::range_cache::Pinned {
+                            layers: layers.clone(),
+                            seq,
+                        }
+                        .get(&key(k), Some(merge.clone()))
+                        .await
+                        .unwrap(),
                     };
                     assert_eq!(got, want, "key {k} at {seq}");
                 }
