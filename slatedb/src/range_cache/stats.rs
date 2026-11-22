@@ -37,6 +37,13 @@ pub const SCAN_GAP_COUNT: &str = range_cache_stat_name!("scan_gap_count");
 /// Attempts to plan a mixed scan at the latest state that a memtable freeze made the scan
 /// repeat. After a few, the scan uses the normal read path.
 pub const MIXED_SCAN_RETRY_COUNT: &str = range_cache_stat_name!("mixed_scan_retry_count");
+/// Ranges that scans in a snapshot or a transaction pinned lazily (design 04 section 3.7): the
+/// range that such a scan starts in, when the scan goes on past it, and each later range when the
+/// scan reaches it. Each one counts as a read of its range, not as a scan of the database: the
+/// scan counts when it ends, in `scan_count`, or in `mixed_scan_count` if it opened a gap. A part
+/// that no usable range held when the scan reached it is a gap (`scan_gap_count`, and
+/// `fallback_count{op=gap}` by why).
+pub const LAZY_PIN_COUNT: &str = range_cache_stat_name!("lazy_pin_count");
 /// Attempts of a read to use a ready cached range that failed the sequence number rules and that
 /// the read tried again. The `op` label is `get` or `scan` (a scan that cached ranges hold
 /// completely). The `reason` label is `too_old` (the read's sequence number is below the range
@@ -148,6 +155,12 @@ pub const SPLIT_RANGE_COUNT: &str = range_cache_stat_name!("split_range_count");
 /// changed its runs or view while it loaded (it then attached whole, for the maintenance task to
 /// split).
 pub const SPLIT_REJECTED_COUNT: &str = range_cache_stat_name!("split_rejected_count");
+/// Merges of two adjacent quiet ranges into one (design 04 section 3.6): no run, no sealed buffer
+/// and an empty active buffer in either, both bases below an eighth of `range_target_bytes`.
+pub const QUIET_MERGE_COUNT: &str = range_cache_stat_name!("quiet_merge_count");
+/// Quiet merges that the writer did not apply because a range changed after the maintenance task
+/// asked: it was removed, split or written to, or a job ran for it.
+pub const QUIET_MERGE_REJECTED_COUNT: &str = range_cache_stat_name!("quiet_merge_rejected_count");
 /// Ranges that the cache removed. The `reason` label is `evicted`, `explicit`,
 /// `expiring_write`, `error`, `closed`, `not_worth_it` (an automatic range whose reads did not
 /// pay for a rebuild when it reached its run limit) or `overflow` (a write did not fit under the memory cap of the write
@@ -368,10 +381,12 @@ pub(crate) enum ReadCount {
     FallbackGapLoading,
     FallbackGapTooOld,
     FallbackGapSealed,
+    /// A range that a scan at a registered sequence number pinned when it reached it.
+    LazyPin,
 }
 
 /// The number of [`ReadCount`] variants.
-pub(crate) const READ_COUNTS: usize = 40;
+pub(crate) const READ_COUNTS: usize = 41;
 
 impl ReadCount {
     /// Every variant, in the order of their discriminants.
@@ -416,6 +431,7 @@ impl ReadCount {
         ReadCount::FallbackGapLoading,
         ReadCount::FallbackGapTooOld,
         ReadCount::FallbackGapSealed,
+        ReadCount::LazyPin,
     ];
 
     /// The index of the counter in the arrays of the `hits` module.
@@ -423,9 +439,14 @@ impl ReadCount {
         self as usize
     }
 
-    /// True for a scan that a range served, which counts as a scan of the range, not a get.
+    /// True for a scan that a range served, which counts as a scan of the range, not a get: one
+    /// that started in the range, or one that reached it and pinned it then (design 04 section
+    /// 3.7's last paragraph).
     pub(crate) fn is_scan(self) -> bool {
-        matches!(self, ReadCount::Scan | ReadCount::MixedScan)
+        matches!(
+            self,
+            ReadCount::Scan | ReadCount::MixedScan | ReadCount::LazyPin
+        )
     }
 
     /// The fallback of `op` for `reason`, or `None` for a pair that cannot happen (a point read
@@ -544,6 +565,7 @@ impl ReadCount {
             ReadCount::FallbackGapLoading => fallback_labels("gap", "loading"),
             ReadCount::FallbackGapTooOld => fallback_labels("gap", "too_old"),
             ReadCount::FallbackGapSealed => fallback_labels("gap", "sealed"),
+            ReadCount::LazyPin => (LAZY_PIN_COUNT, &[]),
         }
     }
 }
@@ -692,6 +714,8 @@ pub(crate) struct RangeCacheStats {
     pub(crate) splits_attach: Arc<dyn CounterFn>,
     pub(crate) split_ranges: Arc<dyn CounterFn>,
     pub(crate) splits_rejected: Arc<dyn CounterFn>,
+    pub(crate) quiet_merges: Arc<dyn CounterFn>,
+    pub(crate) quiet_merges_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
     removed_expiring_write: Arc<dyn CounterFn>,
@@ -781,6 +805,8 @@ impl RangeCacheStats {
             splits_attach: labeled(SPLIT_COUNT, "when", "attach"),
             split_ranges: recorder.counter(SPLIT_RANGE_COUNT).register(),
             splits_rejected: recorder.counter(SPLIT_REJECTED_COUNT).register(),
+            quiet_merges: recorder.counter(QUIET_MERGE_COUNT).register(),
+            quiet_merges_rejected: recorder.counter(QUIET_MERGE_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
             removed_expiring_write: removed("expiring_write"),

@@ -39,8 +39,8 @@ use super::file::RangeFile;
 use super::split::{SplitChild, SplitPlan};
 use super::stats::RemoveReason;
 use super::{
-    covering, one_chunk, uncovered, CachedRange, Chunks, Delta, DeltaView, Layers, Origin,
-    RangeCache, RangeIndex, Run,
+    covering, one_chunk, uncovered, CachedRange, Chunk, ChunkList, Chunks, Delta, DeltaView,
+    Layers, Origin, RangeCache, RangeIndex, Run,
 };
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
@@ -108,6 +108,16 @@ pub(super) enum Request {
         plan: SplitPlan,
         reply: oneshot::Sender<bool>,
     },
+    /// Merge `left` and `right`, adjacent ranges, into one if both are still quiet (no run, no
+    /// sealed buffer, an empty active buffer) and hold the bases `chunks_was` (design 04 section
+    /// 3.6). `rate` is the sum of their read rates, read off the writer when the task asked.
+    QuietMerge {
+        left: Arc<CachedRange>,
+        right: Arc<CachedRange>,
+        chunks_was: [Chunks; 2],
+        rate: f64,
+        reply: Option<oneshot::Sender<bool>>,
+    },
     /// Seal `buffer` if it is still the active buffer of `range` and holds a version.
     Seal {
         range: Arc<CachedRange>,
@@ -143,6 +153,11 @@ impl Request {
             | Request::InstallMajor { reply, .. }
             | Request::Split { reply, .. } => {
                 let _ = reply.send(false);
+            }
+            Request::QuietMerge { reply, .. } => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(false);
+                }
             }
             Request::Seal { .. } => {}
             Request::Remove { reply, .. } => {
@@ -367,6 +382,48 @@ impl RangeCache {
             range: range.clone(),
             plan,
             reply,
+        });
+        answer.await.unwrap_or(false)
+    }
+
+    /// Asks the writer to merge `left` and `right`, adjacent quiet ranges whose bases are
+    /// `chunks_was` and whose read rates sum to `rate`, into one (see
+    /// [`RangeCache::quiet_merge_at`]), without waiting for its answer.
+    pub(super) fn ask_quiet_merge(
+        &self,
+        left: &Arc<CachedRange>,
+        right: &Arc<CachedRange>,
+        chunks_was: [Chunks; 2],
+        rate: f64,
+    ) {
+        self.submit(Request::QuietMerge {
+            left: left.clone(),
+            right: right.clone(),
+            chunks_was,
+            rate,
+            reply: None,
+        });
+    }
+
+    /// Merges `left` and `right` as the maintenance task asks, with the bases that they hold now,
+    /// and returns whether the writer did.
+    #[cfg(test)]
+    pub(super) async fn quiet_merge(
+        &self,
+        left: &Arc<CachedRange>,
+        right: &Arc<CachedRange>,
+    ) -> bool {
+        let chunks_was = [
+            left.layers.load().chunks.clone(),
+            right.layers.load().chunks.clone(),
+        ];
+        let (reply, answer) = oneshot::channel();
+        self.submit(Request::QuietMerge {
+            left: left.clone(),
+            right: right.clone(),
+            chunks_was,
+            rate: 0.0,
+            reply: Some(reply),
         });
         answer.await.unwrap_or(false)
     }
@@ -727,6 +784,18 @@ impl RangeCache {
                     self.install_major_at(&range, &chunks_was, &absorbed, base, base_seq, view);
                 let _ = reply.send(installed);
             }
+            Request::QuietMerge {
+                left,
+                right,
+                chunks_was,
+                rate,
+                reply,
+            } => {
+                let merged = self.quiet_merge_at(&left, &right, &chunks_was, rate, w);
+                if let Some(reply) = reply {
+                    let _ = reply.send(merged);
+                }
+            }
             Request::Seal { range, buffer } => {
                 if self.is_indexed(&range) {
                     let layers = range.layers.load();
@@ -789,14 +858,17 @@ impl RangeCache {
                 covered_to: w,
                 end: part_end.clone(),
             };
-            let range = Arc::new(CachedRange::new(
+            let mut range = CachedRange::new(
                 part_start.clone(),
                 part_end,
                 layers,
                 origin,
                 now,
                 self.writer.take_slot(),
-            ));
+            );
+            // `splits` are ascending: a part that starts at one starts where the cache cut.
+            range.cut_start = splits.binary_search(&part_start).is_ok();
+            let range = Arc::new(range);
             index.insert(part_start, range.clone());
             ranges.push(range);
         }
@@ -955,6 +1027,92 @@ impl RangeCache {
             self.maintenance.notify(child);
         }
         made
+    }
+
+    /// Merges `left` and `right` into one range at the writer boundary `w` (`QuietMerge`, design 04
+    /// section 3.6 and I14), and returns whether it did.
+    ///
+    /// Preconditions: both are indexed and adjacent (`left` ends where `right` starts); both have
+    /// a base, still `chunks_was`, and are quiet: no run, no sealed buffer, an empty active buffer,
+    /// and no flush, major merge or split in flight; both are automatic, or both explicit with a
+    /// key between them that the cache cut (see [`CachedRange::may_merge`]). Otherwise it rejects
+    /// the merge, and the task may ask again. The sizes are the task's to check: a quiet range's
+    /// base does not change.
+    ///
+    /// In a quiet range no version of a chunk's keys lies above the chunk's `base_seq`: with no run
+    /// there is none up to `covered_to` (I4c), with no sealed buffer the active buffer starts
+    /// there, and it holds none. So every chunk holds the state of its keys at `w`, and the merged
+    /// range takes both chunk lists labelled `w`, no run, a new empty active buffer at `w` and
+    /// `covered_to = w`. Two adjacent chunks of one file, as a split leaves them, become one chunk:
+    /// the file holds the state of both spans at `w`. The writer stores `sealed_at = w` on both
+    /// active buffers before the index store, as a split and a removal do: a reader that pinned
+    /// either range and loads a sequence number above `w` tries again and finds the merged range
+    /// (X36); one at or below `w` reads the old layers, complete for it. A reader below `w` finds
+    /// the merged range's chunks too new and uses the normal path; quiet ranges are seldom read at
+    /// old snapshots.
+    fn quiet_merge_at(
+        &self,
+        left: &Arc<CachedRange>,
+        right: &Arc<CachedRange>,
+        chunks_was: &[Chunks; 2],
+        rate: f64,
+        w: u64,
+    ) -> bool {
+        let (a, b) = (left.layers.load_full(), right.layers.load_full());
+        let quiet = |range: &CachedRange, layers: &Layers| {
+            !layers.chunks.loading()
+                && layers.runs.is_empty()
+                && layers.sealed.is_empty()
+                && layers.active.is_empty()
+                && !range.jobs.flushing()
+                && !range.jobs.merging()
+                && !range.jobs.splitting()
+        };
+        let fits = self.is_indexed(left)
+            && self.is_indexed(right)
+            && left.end.as_ref() == Some(&right.start)
+            && CachedRange::may_merge(left, right)
+            && quiet(left, &a)
+            && quiet(right, &b)
+            && a.chunks.same(&chunks_was[0])
+            && b.chunks.same(&chunks_was[1]);
+        if !fits {
+            left.jobs.quiet_merge_asked.store(false, Ordering::Relaxed);
+            right.jobs.quiet_merge_asked.store(false, Ordering::Relaxed);
+            self.stats.quiet_merges_rejected.increment(1);
+            return false;
+        }
+        // I14: both active buffers end at `w` before the index changes.
+        a.active.sealed_at().store(w, Ordering::SeqCst);
+        b.active.sealed_at().store(w, Ordering::SeqCst);
+        let layers = Layers {
+            active: self.new_buffer(w),
+            sealed: Vec::new(),
+            runs: Vec::new(),
+            view: None,
+            chunks: merged_chunks(&a.chunks, &right.start, &b.chunks, w),
+            covered_to: w,
+            end: right.end.clone(),
+        };
+        layers.check(&left.start, self.options.tuning.max_runs);
+        let merged = Arc::new(CachedRange::merged_from(
+            left,
+            right,
+            layers,
+            rate,
+            self.now_ms(),
+            self.writer.take_slot(),
+        ));
+        let mut index = RangeIndex::clone(&self.index.load());
+        index.remove(&right.start);
+        index.insert(left.start.clone(), merged.clone());
+        self.index.store(Arc::new(index));
+        self.writer.give_back_slot(left.slot);
+        self.writer.give_back_slot(right.slot);
+        self.stats.quiet_merges.increment(1);
+        self.update_gauges();
+        self.maintenance.notify(&merged);
+        true
     }
 
     /// Installs a flushed run (`InstallRun`, design 01 sections 6.2 and 7.3): one store that puts
@@ -1192,6 +1350,43 @@ impl RangeCache {
         // Pairs with the fence in `submit`.
         fence(Ordering::SeqCst);
         self.refuse_queued();
+    }
+}
+
+/// The base of the range that a quiet merge at `w` makes of a range with base `left` and the range
+/// with base `right` that starts at `right_start`: their chunks in key order, each labelled `w`
+/// (see [`RangeCache::quiet_merge_at`]). Adjacent chunks of one file become one chunk, so a merge
+/// of the children of a split, with no major merge since, gives back one chunk.
+fn merged_chunks(left: &Chunks, right_start: &Bytes, right: &Chunks, w: u64) -> Chunks {
+    let mut chunks: Vec<Chunk> = Vec::with_capacity(left.len() + right.len());
+    let mut starts: Vec<Bytes> = Vec::with_capacity(left.len() + right.len());
+    let all = left
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| (left.start(i), chunk))
+        .chain(right.iter().enumerate().map(|(i, chunk)| {
+            let start = if i == 0 {
+                Some(right_start)
+            } else {
+                right.start(i)
+            };
+            (start, chunk)
+        }));
+    for (start, chunk) in all {
+        if chunks
+            .last()
+            .is_some_and(|last| Arc::ptr_eq(&last.file, &chunk.file))
+        {
+            continue;
+        }
+        if let (Some(start), false) = (start, chunks.is_empty()) {
+            starts.push(start.clone());
+        }
+        chunks.push(Chunk::new(chunk.file.clone(), w));
+    }
+    match chunks.len() {
+        1 => Chunks::One(chunks.remove(0)),
+        _ => Chunks::Many(Arc::new(ChunkList::new(chunks, starts))),
     }
 }
 

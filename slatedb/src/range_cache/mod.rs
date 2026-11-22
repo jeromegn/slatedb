@@ -91,6 +91,7 @@ mod delta;
 mod file;
 mod filter;
 mod hits;
+mod lazy;
 mod maintain;
 mod merge;
 mod mixed;
@@ -111,7 +112,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -149,6 +150,7 @@ use file::{
 };
 use filter::{hash_key, Filter};
 use hits::{HitStats, RangeHits};
+use lazy::{GapReader, LazyHandle, LazyScan, NextPart};
 pub(crate) use maintain::{Maintainer, RANGE_CACHE_MAINTENANCE_TASK_NAME};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
@@ -255,7 +257,10 @@ pub struct RangeCacheTuning {
     /// cut at block boundaries of the largest sorted run, and a range whose base passes twice this
     /// size splits without a copy, as it attaches when its load is larger, or later when major
     /// merges grow it (design 04 sections 3.4 and 3.5). A major merge then rewrites at most about
-    /// twice this much. 0 turns both off.
+    /// twice this much. Two adjacent quiet ranges whose bases are both below an eighth of it merge
+    /// into one (design 04 section 3.6): no run, no sealed buffer and an empty active buffer in
+    /// either, and both automatic or both explicit with a key between them that the cache cut. 0
+    /// turns splits and quiet merges off.
     pub range_target_bytes: u64,
     /// The limit on the heap metadata of the cached ranges: the fence indexes and filters of
     /// their files and their layer sets. When they pass it, the cache evicts ranges as it does
@@ -364,6 +369,12 @@ impl RangeCacheTuning {
             seal_bytes: self.range_seal_bytes as u64,
             filter_from: u64::try_from(self.buffer_filter_bytes).unwrap_or(u64::MAX),
         }
+    }
+
+    /// The base below which quiet neighbours merge (see [`RangeCacheTuning::range_target_bytes`]):
+    /// 0 when nothing merges.
+    fn quiet_merge_below(&self) -> u64 {
+        self.range_target_bytes / 8
     }
 
     /// The limit on the heap metadata of the cached ranges.
@@ -537,10 +548,9 @@ pub(crate) enum Chunks {
     Loading,
     /// One chunk over the whole range.
     One(Chunk),
-    /// More than one chunk. No load or major merge writes it yet (design 04 stage 5), so only
-    /// tests build it, and a split keeps some of the chunks of a range that has it. Every read and
-    /// job handles it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// More than one chunk. No load or major merge writes it yet (design 04 stage 5): a quiet
+    /// merge of two ranges with different files makes it (design 04 section 3.6), and a split
+    /// keeps some of the chunks of a range that has it. Every read and job handles it.
     Many(Arc<ChunkList>),
 }
 
@@ -1031,6 +1041,22 @@ impl Heat {
         }
     }
 
+    /// The heat of the range that a quiet merge makes of the ranges with heats `a` and `b`: the
+    /// read rate `rate` (the sum of theirs), the later of their last accesses, and no reads yet.
+    /// No lock: the writer calls it.
+    fn merged(a: &Heat, b: &Heat, rate: f64, now_ms: i64) -> Self {
+        let hits = RangeHits::default();
+        hits.set_last_access(a.hits.last_access().max(b.hits.last_access()));
+        Self {
+            hits: Arc::new(hits),
+            rate: Mutex::new(HeatRate {
+                reads: 0,
+                at_ms: now_ms,
+                rate,
+            }),
+        }
+    }
+
     /// The decayed read rate as of the last time anyone computed it.
     fn last_rate(&self) -> f64 {
         self.rate.lock().rate
@@ -1066,6 +1092,10 @@ struct CachedRange {
     slot: u32,
     /// True if automatic promotion cached the range.
     auto: bool,
+    /// True if the range starts at a key that the cache chose: a split point of its registration
+    /// (see `DbInner::cache_range_with`), or a cut of a split. A quiet merge joins explicit ranges
+    /// only at such a key (see [`CachedRange::may_merge`]).
+    cut_start: bool,
     /// The reads of the range and its last access (the value of the cache's access clock at the
     /// last fold that counted a read of it), and its read rate.
     heat: Heat,
@@ -1111,6 +1141,7 @@ impl CachedRange {
             layers: ArcSwap::from_pointee(layers),
             slot,
             auto,
+            cut_start: false,
             heat: Heat::new(rate, now_ms),
             read_cost_ns,
             reads_carried: 0,
@@ -1135,12 +1166,14 @@ impl CachedRange {
         slot: u32,
     ) -> Self {
         let reads_carried = (parent.reads_since_build() as f64 * inherited.share).round() as u64;
+        let cut_start = start != parent.start || parent.cut_start;
         Self {
             start,
             end,
             layers: ArcSwap::from_pointee(layers),
             slot,
             auto: parent.auto,
+            cut_start,
             heat: parent
                 .heat
                 .split(inherited.rate * inherited.share, inherited.now_ms),
@@ -1152,6 +1185,45 @@ impl CachedRange {
             )),
             jobs: maintain::RangeJobs::inherit(&parent.jobs),
         }
+    }
+
+    /// The range that a quiet merge makes of `left` and `right`, adjacent ranges, with `layers`
+    /// (design 04 section 3.6): it keeps their origin, the larger of their read costs, the later of
+    /// their last writes and last accesses, a read rate of `rate` (the sum of theirs, read off the
+    /// writer), the reads that both bases served since they were written, and the larger of their
+    /// jobs' headrooms.
+    fn merged_from(
+        left: &CachedRange,
+        right: &CachedRange,
+        layers: Layers,
+        rate: f64,
+        now_ms: i64,
+        slot: u32,
+    ) -> Self {
+        let last_write = |r: &CachedRange| r.last_write_seq.0.load(Ordering::Acquire);
+        Self {
+            start: left.start.clone(),
+            end: right.end.clone(),
+            layers: ArcSwap::from_pointee(layers),
+            slot,
+            auto: left.auto,
+            cut_start: left.cut_start,
+            heat: Heat::merged(&left.heat, &right.heat, rate, now_ms),
+            read_cost_ns: left.read_cost_ns.max(right.read_cost_ns),
+            reads_carried: left.reads_since_build() + right.reads_since_build(),
+            reads_at_build: AtomicU64::new(0),
+            last_write_seq: Padded(AtomicU64::new(last_write(left).max(last_write(right)))),
+            jobs: maintain::RangeJobs::merged(&left.jobs, &right.jobs),
+        }
+    }
+
+    /// True if a quiet merge may join `left` and `right`, adjacent ranges, by whose they are: two
+    /// automatic ranges, whose bounds the promoter chose, or two explicit ranges with a key between
+    /// them that the cache cut (design 04 section 3.6 merges tracked ranges, which stage 6 makes;
+    /// until then, an application that cached two ranges keeps two ranges, and an `uncache_range`
+    /// of one never takes the other with it).
+    fn may_merge(left: &CachedRange, right: &CachedRange) -> bool {
+        left.auto == right.auto && (right.auto || right.cut_start)
     }
 
     /// The reads that the range's base served since it was written: since its load or its last
@@ -1445,6 +1517,12 @@ pub(crate) struct RangeCache {
     rand: Arc<DbRand>,
     handle: tokio::runtime::Handle,
     merge_operator: Option<MergeOperatorType>,
+    /// What the gaps of lazily pinned scans read through: the database binds it at its first such
+    /// scan (see the `lazy` module).
+    gaps: OnceLock<GapReader>,
+    /// The handles of the cache that lazily pinned scans hold, one per few threads (see
+    /// [`LazyHandle`]).
+    lazy_handles: Box<[Arc<LazyHandle>]>,
     /// Only fail points use it, and they compile to nothing without the `failpoints` feature.
     #[allow(dead_code)]
     fp_registry: Arc<FailPointRegistry>,
@@ -1527,7 +1605,8 @@ impl RangeCache {
             options.tuning.stats_fold_interval,
             clock.clone(),
         );
-        let cache = Arc::new(Self {
+        let cache = Arc::new_cyclic(|weak| Self {
+            lazy_handles: LazyHandle::all(weak, &hits),
             options,
             index: ArcSwap::from_pointee(RangeIndex::new()),
             writer: WriterQueue::new(),
@@ -1543,6 +1622,7 @@ impl RangeCache {
             rand,
             handle,
             merge_operator,
+            gaps: OnceLock::new(),
             fp_registry,
         });
         Ok((cache, rx))
@@ -1845,12 +1925,19 @@ impl RangeCache {
     /// (see [`read_seq`]), if ready cached ranges hold all of `range`. The ranges can be
     /// adjacent ranges, each starting where the one before ends. All of them must follow the
     /// sequence number rules at the same sequence number.
+    ///
+    /// A scan at a registered sequence number, a snapshot's or a transaction's (`at`), pins only
+    /// the range that holds its start, and each later one when it reaches it (design 04 section
+    /// 3.7, see the `lazy` module).
     pub(crate) fn pin_scan(
         &self,
         range: &BytesRange,
         oracle: &dyn Oracle,
         at: Option<u64>,
     ) -> ScanPin {
+        if at.is_some() {
+            return self.pin_first(range, oracle, at);
+        }
         match self.try_pin_scan(range, oracle, at) {
             Some(Ok(pinned)) => ScanPin::Pinned(pinned),
             Some(Err(())) => ScanPin::Unusable,
@@ -1930,6 +2017,112 @@ impl RangeCache {
         }
         // The last attempt returns: `count_unfit` never retries it.
         Some(Err(()))
+    }
+
+    /// Pins the range that holds the start of `range`, for a scan at `at`, a registered sequence
+    /// number, if it is ready and follows the sequence number rules for the keys of the scan that
+    /// it holds: [`ScanPin::Pinned`] if it holds the whole scan, as [`RangeCache::pin_scan`] pins
+    /// it, and [`ScanPin::Lazy`] if the scan goes on past its end, where it pins the next part
+    /// when it reaches it ([`RangeCache::pin_next`]). It counts as [`RangeCache::try_pin_scan`]
+    /// does, for the one range, except that a lazily pinned scan counts its first range as a lazy
+    /// pin, and itself when it ends.
+    fn pin_first(&self, range: &BytesRange, oracle: &dyn Oracle, at: Option<u64>) -> ScanPin {
+        if self.index.load().is_empty() {
+            return ScanPin::Uncovered;
+        }
+        let excluded_start;
+        let start: &[u8] = match RangeBounds::start_bound(range) {
+            Unbounded => &[],
+            Included(key) => key,
+            Excluded(_) => match half_open(range) {
+                Some((key, _)) => {
+                    excluded_start = key;
+                    &excluded_start
+                }
+                None => return ScanPin::Uncovered,
+            },
+        };
+        for attempt in 1..=PIN_ATTEMPTS {
+            let index = self.index.load();
+            let Some(first) = covering(&index, start) else {
+                return ScanPin::Uncovered;
+            };
+            let layers = first.layers.load_full();
+            if layers.chunks.loading() {
+                return ScanPin::Uncovered;
+            }
+            fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
+            let seq = read_seq(oracle, at);
+            let whole = first.contains_range(range);
+            let end = if whole {
+                RangeBounds::end_bound(range).map(|key| key.as_ref())
+            } else {
+                Unbounded
+            };
+            if let Err(reason) = Self::usable_for(&layers, Included(start), end, seq) {
+                if self.count_unfit(PinOp::Scan, reason, attempt) {
+                    continue;
+                }
+                self.count_fallback(FallbackOp::Scan, reason.into());
+                return ScanPin::Unusable;
+            }
+            return if whole {
+                self.count_read(first, ReadCount::Scan);
+                ScanPin::Pinned(PinnedScan {
+                    parts: vec![layers],
+                    seq,
+                })
+            } else {
+                // The range counts as read now; the scan counts as one, served whole or in part,
+                // when it ends (see the `lazy` module).
+                self.count_read(first, ReadCount::LazyPin);
+                ScanPin::Lazy(LazyFirst { layers, seq })
+            };
+        }
+        // The last attempt returns: `count_unfit` never retries it.
+        ScanPin::Unusable
+    }
+
+    /// The part of a scan at `seq`, a registered sequence number, that starts at `from`, in a scan
+    /// that ends at `scan_end` (design 04 section 3.7, X34, X37; see the `lazy` module for why it
+    /// is exact): the layers of the range of the current index that holds `from`, if it is ready
+    /// and follows the sequence number rules for the keys of the part, which it counts as a read
+    /// of the range; otherwise a gap up to the next range's start, or to the range's end, or to the
+    /// scan's end. A range whose active buffer was sealed below `seq` was replaced: it tries again
+    /// with a new index, up to [`PIN_ATTEMPTS`] times.
+    fn pin_next(&self, from: &Bytes, scan_end: &Bound<Bytes>, seq: u64) -> NextPart {
+        for attempt in 1..=PIN_ATTEMPTS {
+            let index = self.index.load();
+            let Some(range) = covering(&index, from) else {
+                let next = index
+                    .range::<[u8], _>((Excluded(from.as_ref()), Unbounded))
+                    .next()
+                    .map(|(start, _)| start.clone());
+                return NextPart::Gap(Fallback::Uncovered, scan::min_end(scan_end, &next));
+            };
+            let layers = range.layers.load_full();
+            let end = scan::min_end(scan_end, &range.end);
+            if layers.chunks.loading() {
+                return NextPart::Gap(Fallback::Loading, end);
+            }
+            // Checkers stretch the window between the pin and the check, in which seals, splits,
+            // merges and removals happen.
+            fail_point!(Arc::clone(&self.fp_registry), "range-cache-lazy-pin");
+            match Self::usable_for(&layers, Included(from), as_slices(&end), seq) {
+                Ok(()) => {
+                    self.count_read(range, ReadCount::LazyPin);
+                    return NextPart::Cached(layers);
+                }
+                Err(reason) => {
+                    if self.count_unfit(PinOp::ScanPart, reason, attempt) {
+                        continue;
+                    }
+                    return NextPart::Gap(reason.into(), end);
+                }
+            }
+        }
+        // The last attempt returns: `count_unfit` never retries it.
+        NextPart::Gap(Fallback::Sealed, scan_end.clone())
     }
 
     /// Plans a scan of `range` over cached ranges and gaps, if a cached range that follows the
@@ -2273,6 +2466,9 @@ impl Pinned {
 pub(crate) enum ScanPin {
     /// Pinned layers that serve the scan.
     Pinned(PinnedScan),
+    /// The pinned layers of the range that holds the start of a scan at a registered sequence
+    /// number, which pins the next parts when it reaches them (see the `lazy` module).
+    Lazy(LazyFirst),
     /// Ready ranges do not hold all of the scan range.
     Uncovered,
     /// Ready ranges hold the scan range, but failed the sequence number rules, which the pin
@@ -2287,6 +2483,13 @@ struct MixedPin {
     seq: u64,
     /// The first cached part's range, which counts as read if the scan goes ahead.
     first: Arc<CachedRange>,
+}
+
+/// The layers of the range that holds the start of a scan at a registered sequence number, pinned
+/// at that sequence number. See [`ScanPin::Lazy`].
+pub(crate) struct LazyFirst {
+    layers: Arc<Layers>,
+    seq: u64,
 }
 
 /// The layers of the adjacent cached ranges that hold a scan range, pinned at one sequence
@@ -2632,6 +2835,30 @@ impl DbInner {
                     .scan(range, self.reader.read_merge_operator.clone())
                     .await,
             ),
+            ScanPin::Lazy(first) => {
+                // After the first scan, a load: no shared write.
+                cache.gaps.get_or_init(|| GapReader {
+                    reader: self.reader.clone(),
+                    state: self.state.clone(),
+                    snapshots: self.snapshot_manager.clone(),
+                    transactions: self.txn_manager.clone(),
+                });
+                let scan = LazyScan::new(
+                    first.layers,
+                    first.seq,
+                    &range,
+                    self.reader.read_merge_operator.clone(),
+                    LazyHandle::of(&cache.lazy_handles),
+                    options.clone(),
+                    prefix.cloned(),
+                );
+                ScanRoute::Served(match scan {
+                    Ok(scan) => {
+                        DbIterator::new_resolved(range, Box::new(scan), ReadTrace::none()).await
+                    }
+                    Err(e) => Err(e.into()),
+                })
+            }
             ScanPin::Uncovered => {
                 // Why the scan uses the normal read path, if no attempt plans a mixed scan.
                 let mut reason = Fallback::Frozen;

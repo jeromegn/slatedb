@@ -135,6 +135,8 @@ const MAX_SPLITS: usize = 2;
 /// The ticks between two updates of the gauges of base and run files, which walk every file:
 /// about a second.
 const FILE_GAUGE_TICKS: u64 = 50;
+/// The most quiet merges that one walk asks for.
+const MAX_QUIET_MERGES: usize = 4;
 /// The most early seals that one pass asks for.
 const PRESSURE_SEALS: usize = 4;
 /// The most newest runs that a flush merges into its run when the range holds `max_runs` (design
@@ -214,6 +216,9 @@ pub(super) struct RangeJobs {
     merging: AtomicBool,
     /// True while a split of the range runs. No flush or major merge starts meanwhile.
     splitting: AtomicBool,
+    /// True from when the task asks the writer to merge the range with a neighbour until the writer
+    /// rejects it (a merged range leaves the index). Only the task sets it.
+    pub(super) quiet_merge_asked: AtomicBool,
     /// True while a message about the range is on its way to the task.
     notified: AtomicBool,
     /// True while the range waits in the task's flush queue, or in its merge queue. Only the task
@@ -250,6 +255,18 @@ impl RangeJobs {
         let jobs = Self::default();
         jobs.headroom
             .store(parent.headroom.load(Ordering::Relaxed), Ordering::Relaxed);
+        jobs
+    }
+
+    /// The jobs of the range that a quiet merge makes of ranges with `a` and `b`: none in flight,
+    /// no counts, and the larger headroom.
+    pub(super) fn merged(a: &RangeJobs, b: &RangeJobs) -> Self {
+        let jobs = Self::default();
+        let headroom = a
+            .headroom
+            .load(Ordering::Relaxed)
+            .max(b.headroom.load(Ordering::Relaxed));
+        jobs.headroom.store(headroom, Ordering::Relaxed);
         jobs
     }
 
@@ -431,6 +448,26 @@ pub(super) fn major_due(
 /// (design 04 section 7.2).
 pub(super) fn at_run_limit(range: &CachedRange, layers: &Layers, trigger: Trigger) -> bool {
     trigger == Trigger::Runs || layers.run_share(&range.start) >= layers.base_share(&range.start).0
+}
+
+/// The base of `range` if the range is quiet and its base is below `small` bytes (its share of
+/// its files, see `Layers::base_share`), for a quiet merge (see `Maintainer::merge_quiet`): no
+/// run, no sealed buffer, an empty active buffer, no job in flight and no merge asked for.
+pub(super) fn quiet_base(range: &CachedRange, small: u64) -> Option<Chunks> {
+    let jobs = &range.jobs;
+    if jobs.flushing()
+        || jobs.merging()
+        || jobs.splitting()
+        || jobs.quiet_merge_asked.load(Ordering::Relaxed)
+    {
+        return None;
+    }
+    let layers = range.layers.load();
+    let quiet = !layers.chunks.loading()
+        && layers.runs.is_empty()
+        && layers.sealed.is_empty()
+        && layers.active.is_empty();
+    (quiet && layers.base_share(&range.start).0 < small).then(|| layers.chunks.clone())
 }
 
 /// The cuts of the split that `layers`, the layers of `range`, call for (design 04 section 3.5):
@@ -638,7 +675,7 @@ impl RangeCache {
     /// Merges `chunks`, the base of `range`, with `absorbed`, its oldest runs (newest first), into
     /// a new base at the newest absorbed run's `hi`, and installs it with the range's view
     /// without them.
-    async fn major_merge(
+    pub(super) async fn major_merge(
         self: &Arc<Self>,
         range: &Arc<CachedRange>,
         chunks: Chunks,
@@ -954,6 +991,7 @@ impl Maintainer {
                 for range in index.values() {
                     self.look(range);
                 }
+                self.merge_quiet(&index);
                 // The file and metadata gauges change with every install; the writer updates
                 // them only when the index changes.
                 self.cache.update_gauges();
@@ -1012,6 +1050,45 @@ impl Maintainer {
             .store(jobs.flushes.load(Ordering::Relaxed), Ordering::Relaxed);
         jobs.merge_queued.store(true, Ordering::Relaxed);
         self.merge_queue.push_back(Arc::downgrade(range));
+    }
+
+    /// Asks the writer to merge adjacent quiet ranges whose bases are both below an eighth of
+    /// `range_target_bytes` (design 04 section 3.6), at most [`MAX_QUIET_MERGES`] pairs per walk,
+    /// each range in one pair. A quiet range has no run, no sealed buffer, an empty active buffer
+    /// and no job in flight; the two must be automatic, or explicit with a key between them that
+    /// the cache cut (see [`CachedRange::may_merge`]). The writer checks it all again at its
+    /// boundary.
+    ///
+    /// Merges and splits do not undo each other: a merged range is below a quarter of the target,
+    /// and a split starts above twice the target; a split's ranges are above the target (in two by
+    /// bytes, from above twice it) or about it (at attach), far above an eighth. A quiet range's
+    /// base does not change, so its size holds until it is written to, and then it is not quiet.
+    fn merge_quiet(&self, index: &RangeIndex) {
+        let small = self.cache.options.tuning.quiet_merge_below();
+        if small == 0 {
+            return;
+        }
+        let mut asked = 0;
+        let mut left: Option<(&Arc<CachedRange>, Chunks)> = None;
+        for range in index.values() {
+            let quiet = quiet_base(range, small);
+            if let (Some((l, l_chunks)), Some(chunks)) = (&left, &quiet) {
+                if l.end.as_ref() == Some(&range.start) && CachedRange::may_merge(l, range) {
+                    l.jobs.quiet_merge_asked.store(true, Ordering::Relaxed);
+                    range.jobs.quiet_merge_asked.store(true, Ordering::Relaxed);
+                    let rate = l.heat.last_rate() + range.heat.last_rate();
+                    self.cache
+                        .ask_quiet_merge(l, range, [l_chunks.clone(), chunks.clone()], rate);
+                    asked += 1;
+                    if asked >= MAX_QUIET_MERGES {
+                        return;
+                    }
+                    left = None;
+                    continue;
+                }
+            }
+            left = quiet.map(|chunks| (range, chunks));
+        }
     }
 
     /// The flush that `range` calls for, with its inputs: every sealed buffer, and when the range
