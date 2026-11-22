@@ -22,6 +22,96 @@ pub enum IsolationLevel {
     SerializableSnapshot,
 }
 
+/// A mask with every conflict domain of a key: a read or a write without a mask of its own.
+pub(crate) const ALL_CONFLICT_DOMAINS: u64 = u64::MAX;
+
+/// What a transaction's write of a key changed, for conflict detection: the conflict domains
+/// inside the key, as the bits of `mask`. A read of the key conflicts with the write only if
+/// its own mask shares a bit with it. SlateDB does not interpret the bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WriteMark {
+    pub(crate) mask: u64,
+}
+
+impl WriteMark {
+    /// The mark of a write that may have changed anything in its key.
+    pub(crate) const ALL: WriteMark = WriteMark {
+        mask: ALL_CONFLICT_DOMAINS,
+    };
+
+    /// True if the write changed one of the domains of `read_mask`, the domains that a read
+    /// of the key used.
+    fn meets(self, read_mask: u64) -> bool {
+        self.mask & read_mask != 0
+    }
+}
+
+/// The keys that a transaction wrote, each with its [`WriteMark`]. Collecting plain keys gives
+/// each one [`WriteMark::ALL`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WriteKeys(HashMap<Bytes, WriteMark>);
+
+impl WriteKeys {
+    /// Adds `key` with `mark`, joined with the mark it has if it is there already.
+    pub(crate) fn insert(&mut self, key: Bytes, mark: WriteMark) {
+        self.0
+            .entry(key)
+            .and_modify(|had| had.mask |= mark.mask)
+            .or_insert(mark);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The keys.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Bytes> {
+        self.0.keys()
+    }
+
+    /// True if a key is in both, whatever the marks: a write-write conflict compares whole
+    /// values. Probes the larger set once per key of the smaller, as `HashSet::is_disjoint`.
+    fn meets_keys(&self, other: &WriteKeys) -> bool {
+        let (small, large) = if self.0.len() <= other.0.len() {
+            (&self.0, &other.0)
+        } else {
+            (&other.0, &self.0)
+        };
+        small.keys().any(|key| large.contains_key(key))
+    }
+
+    /// True if a read of `reads` (key to the mask of the domains that it used) used a domain
+    /// that a write of these keys changed. One probe and one AND per key of the smaller one.
+    fn meets_reads(&self, reads: &HashMap<Bytes, u64>) -> bool {
+        if reads.len() <= self.0.len() {
+            reads
+                .iter()
+                .any(|(key, mask)| self.0.get(key).is_some_and(|mark| mark.meets(*mask)))
+        } else {
+            self.0
+                .iter()
+                .any(|(key, mark)| reads.get(key).is_some_and(|mask| mark.meets(*mask)))
+        }
+    }
+}
+
+impl FromIterator<Bytes> for WriteKeys {
+    fn from_iter<I: IntoIterator<Item = Bytes>>(keys: I) -> Self {
+        Self(keys.into_iter().map(|key| (key, WriteMark::ALL)).collect())
+    }
+}
+
+impl FromIterator<(Bytes, WriteMark)> for WriteKeys {
+    fn from_iter<I: IntoIterator<Item = (Bytes, WriteMark)>>(marks: I) -> Self {
+        let mut keys = Self::default();
+        for (key, mark) in marks {
+            keys.insert(key, mark);
+        }
+        keys
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct TransactionState {
     /// The sequence number when the transaction started. This is used to establish
@@ -31,21 +121,35 @@ pub(crate) struct TransactionState {
     /// a transaction is committed and is used to check conflicts with recent committed
     /// transactions.
     committed_seq: Option<u64>,
-    /// The write keys of the transaction for write-write conflict detection.
+    /// The write keys of the transaction for write-write conflict detection, each with the
+    /// mark that read-write conflict detection compares with the reads of other transactions.
     /// Used in both Snapshot Isolation and Serializable Snapshot Isolation.
-    write_keys: HashSet<Bytes>,
-    /// The read keys of the transaction for read-write conflict detection.
+    write_keys: WriteKeys,
+    /// The read keys of the transaction for read-write conflict detection, with every
+    /// conflict domain. Only tests of the manager alone track reads here: transactions keep
+    /// theirs, with their masks, in their own `ReadSet`.
     /// Only used in Serializable Snapshot Isolation mode.
     read_keys: HashSet<Bytes>,
-    /// The read ranges of the transaction for phantom read detection.
+    /// The read ranges of the transaction for phantom read detection, with every conflict
+    /// domain; as `read_keys`, for tests of the manager alone.
     /// Only used in Serializable Snapshot Isolation mode to detect range-based conflicts.
     read_ranges: Vec<BytesRange>,
 }
 
 impl TransactionState {
-    /// Add write keys to this transaction's write set for conflict detection.
+    /// Add write keys to this transaction's write set for conflict detection, with every
+    /// conflict domain.
+    #[cfg(test)]
     fn track_write_keys(&mut self, keys: impl IntoIterator<Item = Bytes>) {
-        self.write_keys.extend(keys);
+        self.track_write_marks(keys.into_iter().map(|key| (key, WriteMark::ALL)));
+    }
+
+    /// Add write keys with their marks to this transaction's write set for conflict detection.
+    /// A key that is there already gets the union of the masks.
+    fn track_write_marks(&mut self, marks: impl IntoIterator<Item = (Bytes, WriteMark)>) {
+        for (key, mark) in marks {
+            self.write_keys.insert(key, mark);
+        }
     }
 
     /// Add read keys to this transaction's read set for SSI conflict detection.
@@ -126,7 +230,7 @@ impl TransactionManager {
             TransactionState {
                 started_seq: seq,
                 committed_seq: None,
-                write_keys: HashSet::new(),
+                write_keys: WriteKeys::default(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -141,7 +245,7 @@ impl TransactionManager {
         let txn_state = TransactionState {
             started_seq: seq,
             committed_seq: None,
-            write_keys: HashSet::new(),
+            write_keys: WriteKeys::default(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         };
@@ -185,12 +289,21 @@ impl TransactionManager {
         self.inner.write().retained.remove(txn_id);
     }
 
-    /// Track write keys for a transaction. This is used for conflict detection.
-    /// Keys should be tracked before calling commit-related methods.
+    /// Track write keys for a transaction, with every conflict domain. See
+    /// [`Self::track_write_marks`].
+    #[cfg(test)]
     pub(crate) fn track_write_keys(&self, txn_id: &Uuid, write_keys: &HashSet<Bytes>) {
+        let marks = write_keys.iter().map(|key| (key.clone(), WriteMark::ALL));
+        self.track_write_marks(txn_id, marks.collect());
+    }
+
+    /// Track write keys for a transaction, each with the mark of what its write changed. This
+    /// is used for conflict detection. Keys should be tracked before calling commit-related
+    /// methods.
+    pub(crate) fn track_write_marks(&self, txn_id: &Uuid, write_keys: WriteKeys) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
-            txn_state.track_write_keys(write_keys.iter().cloned());
+            txn_state.track_write_marks(write_keys.0);
         }
     }
 
@@ -248,19 +361,27 @@ impl TransactionManager {
         // for SSI, we need to check read-write conflicts. if a transaction does not
         // track the read keys or ranges at all, this transaction is considered as
         // same as a SI transaction. The reads come from the transaction's own read
-        // set. Reads tracked in the manager (tests of the manager alone) count too.
+        // set. Reads tracked in the manager (tests of the manager alone) count too,
+        // with every conflict domain.
         if txn_state.read_keys.is_empty() && txn_state.read_ranges.is_empty() {
-            return inner.has_read_write_conflict(
+            return inner.has_masked_read_write_conflict(
                 &reads.keys,
-                reads.ranges.clone(),
+                &reads.ranges,
                 txn_state.started_seq,
             );
         }
-        let mut read_keys = txn_state.read_keys.clone();
-        read_keys.extend(reads.keys.iter().cloned());
-        let mut read_ranges = txn_state.read_ranges.clone();
-        read_ranges.extend(reads.ranges.iter().cloned());
-        inner.has_read_write_conflict(&read_keys, read_ranges, txn_state.started_seq)
+        let mut read_keys = reads.keys.clone();
+        for key in &txn_state.read_keys {
+            read_keys.insert(key.clone(), ALL_CONFLICT_DOMAINS);
+        }
+        let mut read_ranges = reads.ranges.clone();
+        read_ranges.extend(
+            txn_state
+                .read_ranges
+                .iter()
+                .map(|range| (range.clone(), ALL_CONFLICT_DOMAINS)),
+        );
+        inner.has_masked_read_write_conflict(&read_keys, &read_ranges, txn_state.started_seq)
     }
 
     /// [`Self::track_recent_committed_txn_with`], ending the transaction's retention too.
@@ -311,10 +432,11 @@ impl TransactionManager {
         // remove the transaction from active_txns, and add it to recent_committed_txns
         let mut inner = self.inner.write();
 
+        // A batch outside a transaction may write anything in its keys.
         inner.track_recent_committed_state(TransactionState {
             started_seq: committed_seq,
             committed_seq: Some(committed_seq),
-            write_keys: keys.clone(),
+            write_keys: keys.iter().cloned().collect(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         });
@@ -380,7 +502,7 @@ impl TransactionManagerInner {
         }
     }
 
-    fn has_write_write_conflict(&self, write_keys: &HashSet<Bytes>, started_seq: u64) -> bool {
+    fn has_write_write_conflict(&self, write_keys: &WriteKeys, started_seq: u64) -> bool {
         // If the current transaction has no write operations, there's no write-write conflict
         if write_keys.is_empty() {
             return false;
@@ -393,9 +515,9 @@ impl TransactionManagerInner {
             );
 
             // if another transaction committed after the current transaction started,
-            // and they have overlapping write keys, then there's a conflict.
-            if other_committed_seq > started_seq
-                && !write_keys.is_disjoint(&committed_txn.write_keys)
+            // and they have overlapping write keys, then there's a conflict. The keys
+            // conflict whatever their marks: a write replaces the whole value.
+            if other_committed_seq > started_seq && write_keys.meets_keys(&committed_txn.write_keys)
             {
                 return true;
             }
@@ -404,14 +526,37 @@ impl TransactionManagerInner {
         false
     }
 
-    /// Check for read-write conflicts between current transaction and recently committed transactions.
-    /// This is used for Serializable Snapshot Isolation (SSI) to detect conflicts where:
-    /// 1. Current transaction read keys that were later written by committed transactions
-    /// 2. Current transaction read ranges that overlap with committed transaction writes (phantom reads)
+    /// [`Self::has_masked_read_write_conflict`] for reads of every conflict domain, for tests
+    /// of the manager alone.
+    #[cfg(test)]
     fn has_read_write_conflict(
         &self,
         read_keys: &HashSet<Bytes>,
         read_ranges: Vec<BytesRange>,
+        started_seq: u64,
+    ) -> bool {
+        let read_keys: HashMap<Bytes, u64> = read_keys
+            .iter()
+            .map(|key| (key.clone(), ALL_CONFLICT_DOMAINS))
+            .collect();
+        let read_ranges: Vec<(BytesRange, u64)> = read_ranges
+            .into_iter()
+            .map(|range| (range, ALL_CONFLICT_DOMAINS))
+            .collect();
+        self.has_masked_read_write_conflict(&read_keys, &read_ranges, started_seq)
+    }
+
+    /// Check for read-write conflicts between current transaction and recently committed transactions.
+    /// This is used for Serializable Snapshot Isolation (SSI) to detect conflicts where:
+    /// 1. Current transaction read keys that were later written by committed transactions
+    /// 2. Current transaction read ranges that overlap with committed transaction writes (phantom reads)
+    ///
+    /// Each read key and each read range carries the mask of the conflict domains that the
+    /// read used: a committed write conflicts with it only if its mark shares a bit with it.
+    fn has_masked_read_write_conflict(
+        &self,
+        read_keys: &HashMap<Bytes, u64>,
+        read_ranges: &[(BytesRange, u64)],
         started_seq: u64,
     ) -> bool {
         if read_keys.is_empty() && read_ranges.is_empty() {
@@ -428,19 +573,17 @@ impl TransactionManagerInner {
             // and they have read-write conflicts, then there's a conflict.
             if other_committed_seq > started_seq {
                 // Check if any of the current transaction's read keys were written by
-                // the committed transaction.
-                if !read_keys.is_disjoint(&committed_txn.write_keys) {
+                // the committed transaction in a domain that the read used.
+                if committed_txn.write_keys.meets_reads(read_keys) {
                     return true;
                 }
 
                 // Check if any of the current transaction's read ranges overlap with
-                // committed transaction write keys.
-                for read_range in &read_ranges {
-                    if committed_txn
-                        .write_keys
-                        .iter()
-                        .any(|write_key| read_range.contains(write_key))
-                    {
+                // committed transaction write keys, in a domain that the scan used.
+                for (read_range, read_mask) in read_ranges {
+                    if committed_txn.write_keys.0.iter().any(|(write_key, mark)| {
+                        mark.meets(*read_mask) && read_range.contains(write_key)
+                    }) {
                         return true;
                     }
                 }
@@ -664,7 +807,7 @@ mod tests {
         }
 
         // Convert current transaction write keys
-        let conflict_keys: HashSet<Bytes> = case
+        let conflict_keys: WriteKeys = case
             .current_write_keys
             .into_iter()
             .map(Bytes::from)
@@ -980,7 +1123,7 @@ mod tests {
             inner.recent_committed_txns.push_back(TransactionState {
                 started_seq: 50,
                 committed_seq: None, // This should not happen in practice but let's test
-                write_keys: HashSet::new(),
+                write_keys: WriteKeys::default(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });
@@ -1464,7 +1607,8 @@ mod tests {
                         }
 
                         // Direct read-write conflict on keys
-                        let direct_conflict = !txn.read_keys.is_disjoint(&committed.write_keys);
+                        let direct_conflict =
+                            committed.write_keys.iter().any(|key| txn.read_keys.contains(key));
 
                         // Phantom conflict via range containment
                         let mut phantom_conflict = false;
@@ -1496,6 +1640,271 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// One case of [`test_conflict_masks`]: a transaction whose reads (keys and ranges, each
+    /// with a mask) and own writes are checked against one committed writer.
+    struct MaskCase {
+        name: &'static str,
+        reads: Vec<(&'static str, u64)>,
+        ranges: Vec<(&'static str, &'static str, u64)>,
+        own_writes: Vec<(&'static str, u64)>,
+        /// The committed writer's writes, each with its mask (`ALL_CONFLICT_DOMAINS`: none set).
+        writes: Vec<(&'static str, u64)>,
+        /// The writer is a write batch outside a transaction: its masks are ignored.
+        batch: bool,
+        conflict: bool,
+    }
+
+    /// Conflict masks within a key: a read-write conflict needs the same key (or a key in a
+    /// scanned range) and masks that share a bit; a write-write conflict needs only the key.
+    #[test]
+    fn test_conflict_masks() {
+        const ALL: u64 = ALL_CONFLICT_DOMAINS;
+        let case = |name, reads, ranges, own_writes, writes, batch, conflict| MaskCase {
+            name,
+            reads,
+            ranges,
+            own_writes,
+            writes,
+            batch,
+            conflict,
+        };
+        let cases = vec![
+            case(
+                "disjoint masks",
+                vec![("k", 0b01)],
+                vec![],
+                vec![],
+                vec![("k", 0b10)],
+                false,
+                false,
+            ),
+            case(
+                "overlapping masks",
+                vec![("k", 0b011)],
+                vec![],
+                vec![],
+                vec![("k", 0b110)],
+                false,
+                true,
+            ),
+            case(
+                "default read, masked write",
+                vec![("k", ALL)],
+                vec![],
+                vec![],
+                vec![("k", 0b10)],
+                false,
+                true,
+            ),
+            case(
+                "masked read, default write",
+                vec![("k", 0b01)],
+                vec![],
+                vec![],
+                vec![("k", ALL)],
+                false,
+                true,
+            ),
+            case(
+                "default read and write",
+                vec![("k", ALL)],
+                vec![],
+                vec![],
+                vec![("k", ALL)],
+                false,
+                true,
+            ),
+            case(
+                "more keys read than written, disjoint masks",
+                vec![("j", 0b01), ("k", 0b01), ("l", 0b01)],
+                vec![],
+                vec![],
+                vec![("k", 0b10)],
+                false,
+                false,
+            ),
+            case(
+                "more keys read than written, overlapping masks",
+                vec![("j", 0b01), ("k", 0b01), ("l", 0b01)],
+                vec![],
+                vec![],
+                vec![("k", 0b11)],
+                false,
+                true,
+            ),
+            case(
+                "more keys written than read, disjoint masks",
+                vec![("k", 0b01)],
+                vec![],
+                vec![],
+                vec![("j", 0b01), ("k", 0b10), ("l", 0b01)],
+                false,
+                false,
+            ),
+            case(
+                "other key, same mask",
+                vec![("k", 0b01)],
+                vec![],
+                vec![],
+                vec![("j", 0b01)],
+                false,
+                false,
+            ),
+            case(
+                "range, disjoint masks",
+                vec![],
+                vec![("a", "m", 0b01)],
+                vec![],
+                vec![("k", 0b10)],
+                false,
+                false,
+            ),
+            case(
+                "range, overlapping masks",
+                vec![],
+                vec![("a", "m", 0b01)],
+                vec![],
+                vec![("k", 0b11)],
+                false,
+                true,
+            ),
+            case(
+                "default range, masked write",
+                vec![],
+                vec![("a", "m", ALL)],
+                vec![],
+                vec![("k", 0b10)],
+                false,
+                true,
+            ),
+            case(
+                "masked range, key outside",
+                vec![],
+                vec![("a", "j", 0b01)],
+                vec![],
+                vec![("k", 0b01)],
+                false,
+                false,
+            ),
+            case(
+                "key read twice",
+                vec![("k", 0b001), ("k", 0b100)],
+                vec![],
+                vec![],
+                vec![("k", 0b100)],
+                false,
+                true,
+            ),
+            case(
+                "key read twice, other domain",
+                vec![("k", 0b001), ("k", 0b100)],
+                vec![],
+                vec![],
+                vec![("k", 0b010)],
+                false,
+                false,
+            ),
+            case(
+                "key written twice",
+                vec![("k", 0b10)],
+                vec![],
+                vec![],
+                vec![("k", 0b01), ("k", 0b10)],
+                false,
+                true,
+            ),
+            case(
+                "key written twice, other domain",
+                vec![("k", 0b100)],
+                vec![],
+                vec![],
+                vec![("k", 0b01), ("k", 0b10)],
+                false,
+                false,
+            ),
+            case(
+                "batch against a masked read",
+                vec![("k", 0b01)],
+                vec![],
+                vec![],
+                vec![("k", 0b10)],
+                true,
+                true,
+            ),
+            case(
+                "batch against a masked range",
+                vec![],
+                vec![("a", "m", 0b01)],
+                vec![],
+                vec![("k", 0b10)],
+                true,
+                true,
+            ),
+            case(
+                "write-write, disjoint masks",
+                vec![],
+                vec![],
+                vec![("k", 0b01)],
+                vec![("k", 0b10)],
+                false,
+                true,
+            ),
+            case(
+                "write-write, other key",
+                vec![],
+                vec![],
+                vec![("j", 0b01)],
+                vec![("k", 0b01)],
+                false,
+                false,
+            ),
+        ];
+        for case in cases {
+            let txn_manager = create_transaction_manager();
+            let (txn_id, started_seq) = txn_manager.new_transaction();
+            txn_manager.track_write_marks(
+                &txn_id,
+                case.own_writes
+                    .iter()
+                    .map(|(key, mask)| (Bytes::from(*key), WriteMark { mask: *mask }))
+                    .collect(),
+            );
+            let committed_seq = started_seq + 10;
+            if case.batch {
+                let keys: HashSet<Bytes> = case
+                    .writes
+                    .iter()
+                    .map(|(key, _)| Bytes::from(*key))
+                    .collect();
+                txn_manager.track_recent_committed_write_batch(&keys, committed_seq);
+            } else {
+                let (writer, _) = txn_manager.new_transaction();
+                txn_manager.track_write_marks(
+                    &writer,
+                    case.writes
+                        .iter()
+                        .map(|(key, mask)| (Bytes::from(*key), WriteMark { mask: *mask }))
+                        .collect(),
+                );
+                txn_manager.track_recent_committed_txn(&writer, committed_seq);
+            }
+            let mut reads = ReadSet::default();
+            for (key, mask) in &case.reads {
+                reads.mark(Bytes::from(*key), *mask);
+            }
+            for (start, end, mask) in &case.ranges {
+                let range = BytesRange::from_slice(start.as_bytes()..end.as_bytes());
+                reads.ranges.push((range, *mask));
+            }
+            assert_eq!(
+                txn_manager.check_has_conflict_with_reads(&txn_id, &reads),
+                case.conflict,
+                "case '{}'",
+                case.name
+            );
         }
     }
 }

@@ -183,6 +183,7 @@ impl From<ReadOptions> for slatedb::config::ReadOptions {
                 .expect("u32 should fit in usize on supported platforms"),
             filter_context: value.filter_context.map(Into::into),
             tracing_options: value.tracing_options.map(Into::into),
+            conflict_mask: None,
         }
     }
 }
@@ -466,6 +467,7 @@ impl TryFrom<ScanOptions> for slatedb::config::ScanOptions {
             order: value.order.unwrap_or_default().into(),
             filter_context: value.filter_context.map(Into::into),
             tracing_options: value.tracing_options.map(Into::into),
+            conflict_mask: None,
         })
     }
 }

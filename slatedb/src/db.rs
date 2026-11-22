@@ -3639,6 +3639,7 @@ mod tests {
                                         max_concurrent_sources: 1,
                                         filter_context: None,
                                         tracing_options: None,
+                                        conflict_mask: None,
                                     }
                                 )
                                 .await
