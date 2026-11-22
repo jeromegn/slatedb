@@ -48,6 +48,8 @@ struct WriteTracking {
     /// The conflict domains that the transaction's writes of a key change, by key, from
     /// `set_write_mask`. A written key that is not here changes every domain.
     masks: HashMap<Bytes, u64>,
+    /// The sequence numbers from `validate_write_since`, by key.
+    since: HashMap<Bytes, u64>,
 }
 
 /// A database transaction that provides atomic read-write operations with
@@ -697,6 +699,37 @@ impl DbTransaction {
         Ok(())
     }
 
+    /// Validate the write of a key only against commits made after sequence number `seq`.
+    ///
+    /// By default the write-write check of a written key conflicts with every commit of the
+    /// key made after the transaction started. After this call it conflicts only with the
+    /// commits of the key made after both the start and `seq`. The caller promises that the
+    /// value it writes for the key was computed from the version of the key committed at
+    /// `seq` (its `KeyValue::seq`), and that this version was the newest committed one when
+    /// the caller read it, after the transaction began, as [`crate::Db::get_key_value`] with
+    /// default read options reads it. A commit of the key that this read did not see is newer than `seq` and still
+    /// conflicts. A `seq` below the transaction's start changes nothing. A key given more than
+    /// once keeps the smallest `seq`. Read-write checks, the checks of other keys, and keys
+    /// that the transaction does not write are unaffected; a key passed to
+    /// [`DbTransaction::unmark_write`] leaves every check anyway.
+    ///
+    /// ## Arguments
+    /// - `key`: the key that the transaction writes
+    /// - `seq`: the sequence number of the version that the written value was computed from
+    pub fn validate_write_since<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        seq: u64,
+    ) -> Result<(), crate::Error> {
+        let mut tracking = self.write_tracking.write();
+        let had = tracking
+            .since
+            .entry(Bytes::copy_from_slice(key.as_ref()))
+            .or_insert(seq);
+        *had = (*had).min(seq);
+        Ok(())
+    }
+
     /// Mark written keys as untracked for conflict detection.
     ///
     /// Keys marked with this method are still written atomically with the rest of the
@@ -882,9 +915,9 @@ impl DbTransaction {
 
         // Track only write keys that were not explicitly unmarked, each with the conflict
         // domains that its write changes: every domain unless a mask was set.
-        let tracked_write_keys: WriteKeys = {
+        let (tracked_write_keys, since): (WriteKeys, _) = {
             let tracking = self.write_tracking.read();
-            write_batch
+            let keys = write_batch
                 .keys()
                 .into_iter()
                 .filter(|key| !tracking.untracked.contains(key))
@@ -895,10 +928,11 @@ impl DbTransaction {
                         .map_or(WriteMark::ALL, |&mask| WriteMark { mask });
                     (key, mark)
                 })
-                .collect()
+                .collect();
+            (keys, tracking.since.clone())
         };
         self.txn_manager
-            .track_write_marks(&self.txn_id, tracked_write_keys);
+            .track_writes(&self.txn_id, tracked_write_keys, since);
 
         // Submit the WriteBatch to the database for processing. The batch is sent to a
         // dedicated background task (in batch_write.rs) that processes all WriteBatches
@@ -2789,5 +2823,120 @@ mod tests {
         writer.set_write_mask(b"row", 0b01).unwrap();
         writer.commit().await.unwrap();
         reader.commit().await.unwrap();
+    }
+
+    fn counter(value: &[u8]) -> u64 {
+        u64::from_le_bytes(value.try_into().unwrap())
+    }
+
+    /// Adds `amount` to the counter "row" in `txn`, from its newest committed value read with
+    /// `Db::get_key_value`, validated since the version read. Returns that version's sequence
+    /// number.
+    async fn add_from_newest(db: &crate::Db, txn: &DbTransaction, amount: u64) -> u64 {
+        let newest = db.get_key_value(b"row").await.unwrap().unwrap();
+        let value = counter(&newest.value) + amount;
+        txn.put(b"row", value.to_le_bytes()).unwrap();
+        txn.validate_write_since(b"row", newest.seq).unwrap();
+        newest.seq
+    }
+
+    /// Two transactions that started together each add to a counter from its newest committed
+    /// value, validated since that version: both commit and the counter holds both additions.
+    /// A commit of the counter between one's read and its commit makes that one conflict.
+    /// Without the validation the second conflicts, as before.
+    #[rstest]
+    #[case::snapshot(IsolationLevel::Snapshot)]
+    #[case::serializable(IsolationLevel::SerializableSnapshot)]
+    #[tokio::test]
+    async fn test_validate_write_since(#[case] isolation: IsolationLevel) {
+        let db = open_mask_db(&format!("since_{isolation:?}")).await;
+        db.put(b"row", 100u64.to_le_bytes()).await.unwrap();
+        let first = db.begin(isolation).unwrap();
+        let second = db.begin(isolation).unwrap();
+        // Each also reads the key in its snapshot, as a caller that checks the row exists.
+        assert!(first.get(b"row").await.unwrap().is_some());
+        assert!(second.get(b"row").await.unwrap().is_some());
+        let since = add_from_newest(&db, &first, 1).await;
+        assert!(
+            since <= first.seqnum(),
+            "the version read predates the start"
+        );
+        first.commit().await.unwrap();
+        let since = add_from_newest(&db, &second, 2).await;
+        assert!(
+            since > second.seqnum(),
+            "the second read the first's commit"
+        );
+        // A serializable read of the key in every domain still conflicts with the first's
+        // write: read-write checks are unchanged. Only snapshot isolation commits here.
+        let result = second.commit().await;
+        if isolation == IsolationLevel::Snapshot {
+            result.unwrap();
+            let stored = db.get(b"row").await.unwrap().unwrap();
+            assert_eq!(counter(&stored), 103);
+        } else {
+            assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::Transaction);
+        }
+
+        // The same with reads that do not cover the counter's domain: both commit.
+        let first = db.begin(isolation).unwrap();
+        let second = db.begin(isolation).unwrap();
+        let options = ReadOptions::default().with_conflict_mask(Some(0b01));
+        assert!(first
+            .get_with_options(b"row", &options)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(second
+            .get_with_options(b"row", &options)
+            .await
+            .unwrap()
+            .is_some());
+        add_from_newest(&db, &second, 20).await;
+        second.set_write_mask(b"row", 0b10).unwrap();
+        second.commit().await.unwrap();
+        add_from_newest(&db, &first, 10).await;
+        first.set_write_mask(b"row", 0b10).unwrap();
+        first.commit().await.unwrap();
+        let before = if isolation == IsolationLevel::Snapshot {
+            103
+        } else {
+            101
+        };
+        let stored = db.get(b"row").await.unwrap().unwrap();
+        assert_eq!(counter(&stored), before + 30);
+
+        // A commit of the counter between the read of its newest value and the commit.
+        let txn = db.begin(isolation).unwrap();
+        add_from_newest(&db, &txn, 1).await;
+        db.put(b"row", 7u64.to_le_bytes()).await.unwrap();
+        assert_eq!(
+            txn.commit().await.unwrap_err().kind(),
+            crate::ErrorKind::Transaction
+        );
+        // And by a transaction that started after this one.
+        let txn = db.begin(isolation).unwrap();
+        add_from_newest(&db, &txn, 1).await;
+        let squeezed = db.begin(isolation).unwrap();
+        squeezed.put(b"row", 8u64.to_le_bytes()).unwrap();
+        squeezed.commit().await.unwrap();
+        assert_eq!(
+            txn.commit().await.unwrap_err().kind(),
+            crate::ErrorKind::Transaction
+        );
+
+        // Without the validation, the second of two writers conflicts, as before.
+        let first = db.begin(isolation).unwrap();
+        let second = db.begin(isolation).unwrap();
+        first.put(b"row", 1u64.to_le_bytes()).unwrap();
+        first.commit().await.unwrap();
+        let newest = db.get_key_value(b"row").await.unwrap().unwrap();
+        second
+            .put(b"row", (counter(&newest.value) + 1).to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            second.commit().await.unwrap_err().kind(),
+            crate::ErrorKind::Transaction
+        );
     }
 }
