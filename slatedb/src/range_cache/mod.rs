@@ -96,6 +96,8 @@ mod merge;
 mod mixed;
 mod scan;
 mod split;
+#[cfg(test)]
+mod split_bench;
 mod spread;
 pub mod stats;
 mod view;
