@@ -20,7 +20,8 @@
 //!
 //! Nothing is written or read for the slices, and they need not start at a row. The cost is one
 //! fence search and one add per absorbed version on the merge's blocking thread; reads pay nothing.
-//! With one chunk per range, the slices cut the whole base file.
+//! The slices cut a chunk's whole file, or, for a chunk that shares its file with a range that it
+//! was split from (design 04 section 3.2), the pages of the file that hold the chunk's keys.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,18 +78,32 @@ pub(super) struct SliceTally {
     base: Arc<RangeFile>,
     /// The last key of the base file, `None` if it holds no row.
     last: Option<Bytes>,
+    /// The file offset where the chunk's share of the file starts, and its data bytes: the whole
+    /// file, or for a chunk that shares its file after a split (design 04 section 3.2), the pages
+    /// that hold its keys. The slices cut that share.
+    from: u64,
+    bytes: u64,
     slices: Box<[AtomicU64]>,
     outside: AtomicU64,
 }
 
 impl SliceTally {
-    /// A tally for `base`. It reads the base file's last page, for its last key.
-    pub(super) fn new(base: Arc<RangeFile>) -> io::Result<Arc<Self>> {
+    /// A tally for `base`, a chunk's file, within the chunk's keys from `start` to `end` (`None`:
+    /// unbounded). It reads the base file's last page, for its last key.
+    pub(super) fn new(
+        base: Arc<RangeFile>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> io::Result<Arc<Self>> {
         let last = base.last_key()?;
-        let slices = base.data_len().div_ceil(SLICE_BYTES[0]) as usize;
+        let (from, to) = base.span_data(start, end);
+        let bytes = to - from;
+        let slices = bytes.div_ceil(SLICE_BYTES[0]) as usize;
         Ok(Arc::new(Self {
             base,
             last,
+            from,
+            bytes,
             slices: (0..slices).map(|_| AtomicU64::new(0)).collect(),
             outside: AtomicU64::new(0),
         }))
@@ -97,10 +112,12 @@ impl SliceTally {
     /// Adds `bytes` of a version of `key` to the slice that holds `key`, or to the outside bytes.
     fn add(&self, key: &[u8], bytes: u64) {
         let slice = match &self.last {
-            Some(last) if key <= last.as_ref() => self
-                .base
-                .page_offset_of(key)
-                .and_then(|offset| self.slices.get((offset / SLICE_BYTES[0]) as usize)),
+            Some(last) if key <= last.as_ref() => {
+                self.base.page_offset_of(key).and_then(|offset| {
+                    let at = offset.checked_sub(self.from)?;
+                    self.slices.get((at / SLICE_BYTES[0]) as usize)
+                })
+            }
             _ => None,
         };
         slice
@@ -115,11 +132,7 @@ impl SliceTally {
             .iter()
             .map(|s| s.load(Ordering::Relaxed))
             .collect();
-        spread_of(
-            self.base.data_len(),
-            &slices,
-            self.outside.load(Ordering::Relaxed),
-        )
+        spread_of(self.bytes, &slices, self.outside.load(Ordering::Relaxed))
     }
 }
 
@@ -291,7 +304,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let tally = SliceTally::new(base.clone()).unwrap();
+        let tally = SliceTally::new(base.clone(), None, None).unwrap();
         let mut source = Measured::new(
             RangeFileIterator::new(run, BytesRange::unbounded()),
             tally.clone(),

@@ -136,15 +136,34 @@ pub const FLUSH_MERGE_RUN_COUNT: &str = range_cache_stat_name!("flush_merge_run_
 /// Flushed runs and merged bases that the writer rejected because the range changed meanwhile:
 /// it was removed, registered again, or its buffers or runs moved on.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
+/// Splits of a range into ranges that share its files, runs and buffers (design 04 section 3.2).
+/// The `when` label is `maintenance` (the maintenance task split a range whose base passed twice
+/// `range_target_bytes`) or `attach` (a load larger than that, split as it attached).
+pub const SPLIT_COUNT: &str = range_cache_stat_name!("split_count");
+/// The ranges that splits made: two for each split by the maintenance task, about one for each
+/// `range_target_bytes` of a load split as it attached.
+pub const SPLIT_RANGE_COUNT: &str = range_cache_stat_name!("split_range_count");
+/// Splits that the writer did not apply because the range changed after the split was planned:
+/// it was removed, or a job changed its base, runs or view, or for a split at attach, a flush
+/// changed its runs or view while it loaded (it then attached whole, for the maintenance task to
+/// split).
+pub const SPLIT_REJECTED_COUNT: &str = range_cache_stat_name!("split_rejected_count");
 /// Ranges that the cache removed. The `reason` label is `evicted`, `explicit`,
 /// `expiring_write`, `error`, `closed`, `not_worth_it` (an automatic range whose reads did not
-/// pay for a rebuild) or `overflow` (a write did not fit under the memory cap of the write
+/// pay for a rebuild when it reached its run limit) or `overflow` (a write did not fit under the memory cap of the write
 /// buffers, or the range had one of the largest buffers when another one did not).
 pub const REMOVE_COUNT: &str = range_cache_stat_name!("remove_count");
 /// The number of cached ranges, loading ranges included.
 pub const RANGE_COUNT: &str = range_cache_stat_name!("range_count");
 /// The bytes of open range cache files.
 pub const FILE_BYTES: &str = range_cache_stat_name!("file_bytes");
+/// The bytes of the base files of cached ranges, each file once: after a split, a base file that
+/// the children share counts once, whole, while any child holds it, so this less the sum of the
+/// ranges' bases (`CachedRangeInfo::file_bytes`, their shares) is what shared files hold beyond
+/// the children's parts. The maintenance task sets it about once a second.
+pub const BASE_FILE_BYTES: &str = range_cache_stat_name!("base_file_bytes");
+/// The bytes of the run files of cached ranges, each file once, as `base_file_bytes`.
+pub const RUN_FILE_BYTES: &str = range_cache_stat_name!("run_file_bytes");
 /// The estimated bytes of the active and sealed write buffers of cached ranges. The cache
 /// updates it when ranges change.
 pub const DELTA_BYTES: &str = range_cache_stat_name!("delta_bytes");
@@ -161,9 +180,9 @@ pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_
 
 // The delta views of the ranges' runs (see the `view` module).
 
-/// Delta views that flushes and major merges built. The `job` label is `flush` (flushes and
-/// flush-merges) or `major`. A build that the writer rejected because the view moved on and that
-/// its job built again counts twice.
+/// Delta views that flushes, major merges and splits built. The `job` label is `flush` (flushes
+/// and flush-merges), `major` or `split` (one build for all the children of a split). A build that
+/// the writer rejected because the view moved on and that its job built again counts twice.
 pub const VIEW_BUILD_COUNT: &str = range_cache_stat_name!("view_build_count");
 /// Wall time of the view builds in nanoseconds, by `job`. A build runs on one blocking thread and
 /// does no I/O wait when the files are in the page cache, so this is about its CPU time.
@@ -669,6 +688,10 @@ pub(crate) struct RangeCacheStats {
     pub(crate) flush_merge_bytes: Arc<dyn CounterFn>,
     pub(crate) flush_merge_runs: Arc<dyn CounterFn>,
     pub(crate) installs_rejected: Arc<dyn CounterFn>,
+    pub(crate) splits_maintenance: Arc<dyn CounterFn>,
+    pub(crate) splits_attach: Arc<dyn CounterFn>,
+    pub(crate) split_ranges: Arc<dyn CounterFn>,
+    pub(crate) splits_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
     removed_expiring_write: Arc<dyn CounterFn>,
@@ -678,10 +701,12 @@ pub(crate) struct RangeCacheStats {
     removed_overflow: Arc<dyn CounterFn>,
     pub(crate) ranges: Arc<dyn GaugeFn>,
     pub(crate) file_bytes: Arc<dyn GaugeFn>,
+    pub(crate) base_file_bytes: Arc<dyn GaugeFn>,
+    pub(crate) run_file_bytes: Arc<dyn GaugeFn>,
     pub(crate) delta_bytes: Arc<dyn GaugeFn>,
     pub(crate) meta_bytes: Arc<dyn GaugeFn>,
-    /// View builds by job: flush, then major.
-    pub(crate) view: [ViewStats; 2],
+    /// View builds by job: flush, major, then split.
+    pub(crate) view: [ViewStats; 3],
     pub(crate) view_bytes: Arc<dyn GaugeFn>,
 }
 
@@ -752,6 +777,10 @@ impl RangeCacheStats {
             flush_merge_bytes: recorder.counter(FLUSH_MERGE_BYTES).register(),
             flush_merge_runs: recorder.counter(FLUSH_MERGE_RUN_COUNT).register(),
             installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
+            splits_maintenance: labeled(SPLIT_COUNT, "when", "maintenance"),
+            splits_attach: labeled(SPLIT_COUNT, "when", "attach"),
+            split_ranges: recorder.counter(SPLIT_RANGE_COUNT).register(),
+            splits_rejected: recorder.counter(SPLIT_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
             removed_expiring_write: removed("expiring_write"),
@@ -761,11 +790,14 @@ impl RangeCacheStats {
             removed_overflow: removed("overflow"),
             ranges: recorder.gauge(RANGE_COUNT).register(),
             file_bytes: recorder.gauge(FILE_BYTES).register(),
+            base_file_bytes: recorder.gauge(BASE_FILE_BYTES).register(),
+            run_file_bytes: recorder.gauge(RUN_FILE_BYTES).register(),
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
             meta_bytes: recorder.gauge(META_BYTES).register(),
             view: [
                 ViewStats::new(recorder, "flush"),
                 ViewStats::new(recorder, "major"),
+                ViewStats::new(recorder, "split"),
             ],
             view_bytes: recorder.gauge(VIEW_BYTES).register(),
         }

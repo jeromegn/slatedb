@@ -2,10 +2,10 @@
 //!
 //! The published state is the index, the layers of each range, the `sealed_at` word of each
 //! buffer, and the watermarks `applied` and `CachedRange::last_write_seq`. Other tasks prepare a
-//! change (a loaded base, a flushed run, a merged base, a removal) and send it as a [`Request`]
-//! through a lock-free queue. The writer applies requests between batches, at a *writer
-//! boundary* `W`: a moment when no batch is between its memtable insert and its commit. At a
-//! boundary, `W` is the last committed sequence number, every batch at or below `W` is
+//! change (a loaded base, a flushed run, a merged base, a split, a removal) and send it as a
+//! [`Request`] through a lock-free queue. The writer applies requests between batches, at a
+//! *writer boundary* `W`: a moment when no batch is between its memtable insert and its commit.
+//! At a boundary, `W` is the last committed sequence number, every batch at or below `W` is
 //! committed, and every later batch starts after it.
 //!
 //! - Before the writer applies a batch, it drains the queue if the queue is not empty. That is
@@ -36,6 +36,7 @@ use tokio::sync::oneshot;
 
 use super::auto::Removal;
 use super::file::RangeFile;
+use super::split::{SplitChild, SplitPlan};
 use super::stats::RemoveReason;
 use super::{
     covering, one_chunk, uncovered, CachedRange, Chunks, Delta, DeltaView, Layers, Origin,
@@ -66,12 +67,15 @@ pub(super) enum Request {
         reply: oneshot::Sender<Result<Registered, SlateDBError>>,
     },
     /// Publish the base of a loading range, one chunk over the range that holds the state at
-    /// `base_seq`.
+    /// `base_seq`, and with `split`, cut the range into the split's children in the same store
+    /// (design 04 section 3.4). The reply holds the ranges that hold the base: the range, its
+    /// children, or none if the range was removed meanwhile.
     AttachBase {
         range: Arc<CachedRange>,
         base: Arc<RangeFile>,
         base_seq: u64,
-        reply: oneshot::Sender<bool>,
+        split: Option<SplitPlan>,
+        reply: oneshot::Sender<Vec<Arc<CachedRange>>>,
     },
     /// Install `run`, which a flush wrote from `buffers`, the oldest sealed buffers of `range`
     /// (newest first), and from `replaces`, its newest runs (newest first, empty for a plain
@@ -95,6 +99,13 @@ pub(super) enum Request {
         base_seq: u64,
         /// The view without the absorbed runs, and the view it was built on.
         view: ViewSwap,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Replace `range` by the children of `plan`, which share its files, runs and buffers (design
+    /// 04 section 3.2), if it still holds the base, runs and view that the plan was built on.
+    Split {
+        range: Arc<CachedRange>,
+        plan: SplitPlan,
         reply: oneshot::Sender<bool>,
     },
     /// Seal `buffer` if it is still the active buffer of `range` and holds a version.
@@ -125,9 +136,12 @@ impl Request {
             Request::Register { reply, .. } => {
                 let _ = reply.send(Err(SlateDBError::Closed));
             }
-            Request::AttachBase { reply, .. }
-            | Request::InstallRun { reply, .. }
-            | Request::InstallMajor { reply, .. } => {
+            Request::AttachBase { reply, .. } => {
+                let _ = reply.send(Vec::new());
+            }
+            Request::InstallRun { reply, .. }
+            | Request::InstallMajor { reply, .. }
+            | Request::Split { reply, .. } => {
                 let _ = reply.send(false);
             }
             Request::Seal { .. } => {}
@@ -324,19 +338,34 @@ impl RangeCache {
         answer.await.unwrap_or(Err(SlateDBError::Closed))
     }
 
-    /// Publishes the base of a loading range. Returns false if the range is no longer indexed
-    /// or no longer loading at `base_seq`: then the file is deleted when it drops.
+    /// Publishes the base of a loading range, split as `split` says if the range has not moved
+    /// on. Returns the ranges that hold it, or none if the range is no longer indexed or no longer
+    /// loading at `base_seq`: then the file is deleted when it drops.
     pub(super) async fn attach_base(
         &self,
         range: &Arc<CachedRange>,
         base: Arc<RangeFile>,
         base_seq: u64,
-    ) -> bool {
+        split: Option<SplitPlan>,
+    ) -> Vec<Arc<CachedRange>> {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::AttachBase {
             range: range.clone(),
             base,
             base_seq,
+            split,
+            reply,
+        });
+        answer.await.unwrap_or_default()
+    }
+
+    /// Splits `range` as `plan` says. Returns false if the range moved on (see
+    /// [`RangeCache::split_request_at`]).
+    pub(super) async fn install_split(&self, range: &Arc<CachedRange>, plan: SplitPlan) -> bool {
+        let (reply, answer) = oneshot::channel();
+        self.submit(Request::Split {
+            range: range.clone(),
+            plan,
             reply,
         });
         answer.await.unwrap_or(false)
@@ -419,11 +448,11 @@ impl RangeCache {
         let _ = answer.await;
     }
 
-    /// Removes ranges until the range files fit the budget, never `skip`, and waits until the
-    /// writer did. The order is computed here, off the writer: see
+    /// Removes ranges until the range files fit the budget, never one of `skip`, and waits until
+    /// the writer did. The order is computed here, off the writer: see
     /// [`RangeCache::eviction_order`]. The writer checks the budget again before each removal,
     /// so concurrent callers do not remove more than needed.
-    pub(super) async fn evict(&self, skip: Option<&Arc<CachedRange>>) {
+    pub(super) async fn evict(&self, skip: &[Arc<CachedRange>]) {
         let victims = self.eviction_order(skip);
         if victims.is_empty() {
             return;
@@ -667,9 +696,13 @@ impl RangeCache {
                 range,
                 base,
                 base_seq,
+                split,
                 reply,
             } => {
-                let _ = reply.send(self.attach_at(&range, base, base_seq));
+                let _ = reply.send(self.attach_at(&range, base, base_seq, split, w));
+            }
+            Request::Split { range, plan, reply } => {
+                let _ = reply.send(self.split_request_at(&range, plan, w));
             }
             Request::InstallRun {
                 range,
@@ -777,20 +810,49 @@ impl RangeCache {
     /// Publishes the base of a loading range (`AttachBase`), as one chunk over the range. It keeps
     /// the buffers, which hold the batches after `base_seq`, and the runs that flushes installed
     /// meanwhile, which start at `base_seq`, so no reader of an earlier set of layers loses a
-    /// signal.
-    fn attach_at(&self, range: &Arc<CachedRange>, base: Arc<RangeFile>, base_seq: u64) -> bool {
+    /// signal. Returns the ranges that hold the base: the range, or with `split`, the children
+    /// that replace it at `w` (design 04 section 3.4) when the split was built on the range's runs
+    /// and view and no flush or major merge runs for it; otherwise the range attaches whole, and
+    /// the maintenance task splits it later. None if the range was removed or the base is not for
+    /// its registration.
+    fn attach_at(
+        &self,
+        range: &Arc<CachedRange>,
+        base: Arc<RangeFile>,
+        base_seq: u64,
+        split: Option<SplitPlan>,
+        w: u64,
+    ) -> Vec<Arc<CachedRange>> {
         if !self.is_indexed(range) {
             // Removed, or removed and registered again: the file is deleted on drop.
-            return false;
+            return Vec::new();
         }
         let layers = range.layers.load_full();
         if !layers.chunks.loading() || layers.floor() != base_seq {
-            return false;
+            return Vec::new();
         }
         self.stats.loads.increment(1);
         self.stats.load_bytes.increment(base.file_len());
         let now = self.hits.access_clock().fetch_add(2, Ordering::Relaxed) + 2;
         range.heat.hits.set_last_access(now - 1);
+        if let Some(plan) = split {
+            let fits = plan.children.len() > 1
+                && plan.children.iter().all(|c| {
+                    c.chunks
+                        .iter()
+                        .all(|chunk| Arc::ptr_eq(&chunk.file, &base) && chunk.base_seq == base_seq)
+                })
+                && same_arcs(&layers.runs, &plan.runs_was)
+                && same_view(&layers.view, &plan.view_was)
+                && !range.jobs.flushing()
+                && !range.jobs.merging();
+            if fits {
+                let children = self.split_at(range, &layers, plan.children, plan.rate, w);
+                self.stats.splits_attach.increment(1);
+                return children;
+            }
+            self.stats.splits_rejected.increment(1);
+        }
         self.store_layers(
             range,
             Layers {
@@ -804,7 +866,95 @@ impl RangeCache {
             },
         );
         self.maintenance.notify(range);
+        vec![range.clone()]
+    }
+
+    /// Applies a split that the maintenance task planned (`Split`, design 04 section 3.2).
+    ///
+    /// Preconditions: the range is indexed and loaded; it still holds the base, the runs and the
+    /// view that the plan was built on (seals since then are allowed); no flush or major merge
+    /// runs for it (X28); the plan has at least two children. Otherwise the split is rejected,
+    /// and the children's views go when the plan drops.
+    fn split_request_at(&self, range: &Arc<CachedRange>, plan: SplitPlan, w: u64) -> bool {
+        let layers = range.layers.load_full();
+        let fits = self.is_indexed(range)
+            && !layers.chunks.loading()
+            && layers.chunks.same(&plan.chunks_was)
+            && same_arcs(&layers.runs, &plan.runs_was)
+            && same_view(&layers.view, &plan.view_was)
+            && plan.children.len() > 1
+            && !range.jobs.flushing()
+            && !range.jobs.merging();
+        if !fits {
+            self.stats.splits_rejected.increment(1);
+            return false;
+        }
+        self.split_at(range, &layers, plan.children, plan.rate, w);
+        self.stats.splits_maintenance.increment(1);
         true
+    }
+
+    /// Replaces `range`, whose layers are `layers`, by `children` at the writer boundary `w`
+    /// (design 04 section 3.2 and I13), and returns them in key order: the parent's active buffer
+    /// ends at `w`, the children's layer sets share its sources (see
+    /// [`super::split::children_layers`]), and one index store puts the children in place of the
+    /// range. Each child takes a share of the range's read rate, and of the reads of its base, by
+    /// the bytes of its base.
+    fn split_at(
+        &self,
+        range: &Arc<CachedRange>,
+        layers: &Layers,
+        children: Vec<SplitChild>,
+        rate: f64,
+        w: u64,
+    ) -> Vec<Arc<CachedRange>> {
+        let shares: Vec<u64> = children
+            .iter()
+            .map(|c| super::split::base_share(&c.chunks, &c.start, c.end.as_ref()).0)
+            .collect();
+        let total: u64 = shares.iter().sum();
+        let count = children.len();
+        let now_ms = self.now_ms();
+        let built = super::split::children_layers(
+            layers,
+            children,
+            w,
+            self.options.tuning.max_runs,
+            |lo| self.new_buffer(lo),
+        );
+        let mut index = RangeIndex::clone(&self.index.load());
+        index.remove(&range.start);
+        let mut made = Vec::with_capacity(count);
+        for ((start, end, child_layers), bytes) in built.into_iter().zip(shares) {
+            let share = if total == 0 {
+                1.0 / count as f64
+            } else {
+                bytes as f64 / total as f64
+            };
+            let inherited = super::Inherited {
+                share,
+                rate,
+                now_ms,
+            };
+            let child = Arc::new(CachedRange::split_from(
+                range,
+                start.clone(),
+                end,
+                child_layers,
+                inherited,
+                self.writer.take_slot(),
+            ));
+            index.insert(start, child.clone());
+            made.push(child);
+        }
+        self.index.store(Arc::new(index));
+        self.writer.give_back_slot(range.slot);
+        self.stats.split_ranges.increment(count as u64);
+        self.update_gauges();
+        for child in &made {
+            self.maintenance.notify(child);
+        }
+        made
     }
 
     /// Installs a flushed run (`InstallRun`, design 01 sections 6.2 and 7.3): one store that puts
