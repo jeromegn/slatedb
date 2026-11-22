@@ -301,6 +301,14 @@ pub struct ReadOptions {
     pub filter_context: Option<FilterContext>,
     /// Optional caller-provided tracing settings.
     pub tracing_options: Option<TracingOptions>,
+    /// The conflict domains of the key that this read used, as bits of a mask, for the
+    /// read-write conflict check of a serializable transaction: the read conflicts with a
+    /// later committed write of the key only if their masks share a bit (see
+    /// [`crate::DbTransaction::set_write_mask`]). SlateDB does not interpret the bits.
+    /// `None`, the default, means all bits: any write of the key conflicts. `Some(0)` leaves
+    /// the read untracked. It only matters for a `get` in a transaction with
+    /// [`crate::IsolationLevel::SerializableSnapshot`]; other reads ignore it.
+    pub conflict_mask: Option<u64>,
 }
 
 impl Default for ReadOptions {
@@ -312,6 +320,7 @@ impl Default for ReadOptions {
             max_concurrent_sources: 1,
             filter_context: None,
             tracing_options: None,
+            conflict_mask: None,
         }
     }
 }
@@ -359,6 +368,13 @@ impl ReadOptions {
             ..self
         }
     }
+
+    pub fn with_conflict_mask(self, conflict_mask: Option<u64>) -> Self {
+        Self {
+            conflict_mask,
+            ..self
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
@@ -394,6 +410,14 @@ pub struct ScanOptions {
     pub filter_context: Option<FilterContext>,
     /// Optional caller-provided tracing settings.
     pub tracing_options: Option<TracingOptions>,
+    /// The conflict domains of the keys that this scan used, as bits of a mask, for the
+    /// read-write conflict check of a serializable transaction: a later committed write of a
+    /// key inside the scanned range conflicts with the scan only if their masks share a bit
+    /// (see [`crate::DbTransaction::set_write_mask`]). SlateDB does not interpret the bits.
+    /// `None`, the default, means all bits: any write in the range conflicts. `Some(0)` leaves
+    /// the scan untracked. It only matters for a scan in a transaction with
+    /// [`crate::IsolationLevel::SerializableSnapshot`]; other scans ignore it.
+    pub conflict_mask: Option<u64>,
 }
 
 impl Default for ScanOptions {
@@ -408,6 +432,7 @@ impl Default for ScanOptions {
             order: IterationOrder::Ascending,
             filter_context: None,
             tracing_options: None,
+            conflict_mask: None,
         }
     }
 }
@@ -463,6 +488,13 @@ impl ScanOptions {
     pub fn with_tracing_options(self, tracing_options: Option<TracingOptions>) -> Self {
         Self {
             tracing_options,
+            ..self
+        }
+    }
+
+    pub fn with_conflict_mask(self, conflict_mask: Option<u64>) -> Self {
+        Self {
+            conflict_mask,
             ..self
         }
     }

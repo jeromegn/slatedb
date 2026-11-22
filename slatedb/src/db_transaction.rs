@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -13,17 +13,40 @@ use crate::db_iter::{DbIterator, DbIteratorRangeTracker};
 use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
 use crate::reader::ScanContext;
-use crate::transaction_manager::{IsolationLevel, TransactionManager};
+use crate::transaction_manager::{
+    IsolationLevel, TransactionManager, WriteKeys, WriteMark, ALL_CONFLICT_DOMAINS,
+};
 use crate::types::KeyValue;
 use crate::{DbReadOps, DbTransactionOps};
 
 /// The reads of a transaction that its commit checks for read-write conflicts: keys
 /// that a Serializable transaction read or that `mark_read` marked, and the ranges
-/// of its scans, taken at commit.
+/// of its scans, taken at commit. Each key and each range carries the mask of the
+/// conflict domains that its reads used (see [`DbTransaction::mark_read_masked`]).
 #[derive(Default)]
 pub(crate) struct ReadSet {
-    pub(crate) keys: HashSet<Bytes>,
-    pub(crate) ranges: Vec<BytesRange>,
+    pub(crate) keys: HashMap<Bytes, u64>,
+    pub(crate) ranges: Vec<(BytesRange, u64)>,
+}
+
+impl ReadSet {
+    /// Records a read of `key` that used the conflict domains of `mask`, joined with the
+    /// domains of the key's earlier reads. A mask of 0 records nothing.
+    pub(crate) fn mark(&mut self, key: Bytes, mask: u64) {
+        if mask != 0 {
+            *self.keys.entry(key).or_insert(0) |= mask;
+        }
+    }
+}
+
+/// How the commit tracks a transaction's writes for conflict detection.
+#[derive(Default)]
+struct WriteTracking {
+    /// Keys that should be excluded from write conflict detection when committing.
+    untracked: HashSet<Bytes>,
+    /// The conflict domains that the transaction's writes of a key change, by key, from
+    /// `set_write_mask`. A written key that is not here changes every domain.
+    masks: HashMap<Bytes, u64>,
 }
 
 /// A database transaction that provides atomic read-write operations with
@@ -80,14 +103,16 @@ pub struct DbTransaction {
     db_inner: Arc<DbInner>,
     /// Isolation level for this transaction
     isolation_level: IsolationLevel,
-    /// Range trackers for scanned ranges (used for SSI conflict detection)
-    range_trackers: Mutex<Vec<DbIteratorRangeTracker>>,
+    /// Range trackers for scanned ranges (used for SSI conflict detection), each with the
+    /// mask of the conflict domains that its scan used
+    range_trackers: Mutex<Vec<(DbIteratorRangeTracker, u64)>>,
     /// The reads that the commit checks for read-write conflicts. Only this
     /// transaction's commit reads them, so they stay here and not in the shared
     /// transaction manager.
     read_set: Mutex<ReadSet>,
-    /// Keys that should be excluded from write conflict detection when committing.
-    untracked_write_keys: RwLock<HashSet<Bytes>>,
+    /// Keys that should be excluded from write conflict detection when committing, and the
+    /// conflict domains that the writes of the others change.
+    write_tracking: RwLock<WriteTracking>,
 }
 
 impl DbTransaction {
@@ -108,7 +133,7 @@ impl DbTransaction {
             isolation_level,
             range_trackers: Mutex::new(Vec::new()),
             read_set: Mutex::new(ReadSet::default()),
-            untracked_write_keys: RwLock::new(HashSet::new()),
+            write_tracking: RwLock::new(WriteTracking::default()),
         }
     }
 
@@ -166,10 +191,14 @@ impl DbTransaction {
     ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.check_closed()?;
 
-        // Track read key for SSI conflict detection if needed
+        // Track read key for SSI conflict detection if needed, with the conflict domains of
+        // the read options
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
-            let key_bytes = Bytes::copy_from_slice(key.as_ref());
-            self.read_set.lock().keys.insert(key_bytes);
+            let mask = options.conflict_mask.unwrap_or(ALL_CONFLICT_DOMAINS);
+            if mask != 0 {
+                let key_bytes = Bytes::copy_from_slice(key.as_ref());
+                self.read_set.lock().mark(key_bytes, mask);
+            }
         }
 
         let db_state = self.db_inner.state.read().view();
@@ -315,8 +344,11 @@ impl DbTransaction {
         // scans, scans whose tombstones were skipped). See
         // `DbIteratorRangeTracker` for the rationale.
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
-            let tracker = DbIteratorRangeTracker::new(range.clone());
-            self.range_trackers.lock().push(tracker);
+            let mask = options.conflict_mask.unwrap_or(ALL_CONFLICT_DOMAINS);
+            if mask != 0 {
+                let tracker = DbIteratorRangeTracker::new(range.clone());
+                self.range_trackers.lock().push((tracker, mask));
+            }
         }
 
         self.db_inner.check_closed()?;
@@ -465,8 +497,95 @@ impl DbTransaction {
         // even in SI mode. The only difference between SI and SSI is whether
         // the read keys are tracked in the read set or not.
 
-        let read_keys = keys.into_iter().map(|k| Bytes::copy_from_slice(k.as_ref()));
-        self.read_set.lock().keys.extend(read_keys);
+        self.mark_read_masked(keys, ALL_CONFLICT_DOMAINS)
+    }
+
+    /// Mark keys as read in some of their conflict domains only.
+    ///
+    /// This method behaves the same as [`DbTransaction::mark_read`], but the read of each key
+    /// used only the conflict domains whose bits are set in `mask`: a write of the key by
+    /// another transaction conflicts with it only if that write changed one of those domains
+    /// (see [`DbTransaction::set_write_mask`]). A write with no mask changes every domain, so
+    /// it conflicts with any marked read. SlateDB does not interpret the bits. A key marked
+    /// more than once is read in the union of the masks. A mask of 0 marks nothing.
+    ///
+    /// ## Arguments
+    /// - `keys`: an iterator of keys to mark as read
+    /// - `mask`: the conflict domains that the reads of the keys used
+    ///
+    /// ## Examples
+    /// ```rust
+    /// # async fn example() -> Result<(), slatedb::Error> {
+    /// # use std::sync::Arc;
+    /// # use slatedb::object_store::memory::InMemory;
+    /// use slatedb::{Db, IsolationLevel};
+    ///
+    /// # let object_store = Arc::new(InMemory::new());
+    /// # let db = Db::open("test_path", object_store).await?;
+    /// let txn = db.begin(IsolationLevel::Snapshot)?;
+    /// // The read used the domains of bits 0 and 2 of "row1".
+    /// txn.mark_read_masked([b"row1"], 0b101)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn mark_read_masked<K, I>(&self, keys: I, mask: u64) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        // Always track reads when explicitly marked, regardless of isolation level, as
+        // `mark_read` does.
+        let mut read_set = self.read_set.lock();
+        for key in keys {
+            read_set.mark(Bytes::copy_from_slice(key.as_ref()), mask);
+        }
+        Ok(())
+    }
+
+    /// Set the conflict domains that this transaction's write of a key changes.
+    ///
+    /// By default a write of a key changes every conflict domain of the key, so any read of the
+    /// key by a concurrent transaction conflicts with it. With a mask, a read of the key by
+    /// another transaction conflicts with this write only if the read used one of the domains
+    /// whose bits are set in `mask` (see [`DbTransaction::mark_read_masked`] and
+    /// [`crate::config::ReadOptions::conflict_mask`]). The caller promises that the mask covers
+    /// everything that the transaction's write changes relative to the newest committed value
+    /// of the key. SlateDB does not interpret the bits.
+    ///
+    /// The mask applies to the transaction's writes of the key whenever it is set, before or
+    /// after the writes. Masks set more than once for a key join: the write changes the union.
+    /// A mask has no effect on a key that the transaction does not write, and none on the
+    /// write-write conflict check, which compares keys whatever their masks, as the write still
+    /// replaces the whole value. A key passed to [`DbTransaction::unmark_write`] leaves every
+    /// check, with or without a mask.
+    ///
+    /// ## Arguments
+    /// - `key`: the key that the transaction writes
+    /// - `mask`: the conflict domains that the write changes
+    ///
+    /// ## Examples
+    /// ```rust
+    /// # async fn example() -> Result<(), slatedb::Error> {
+    /// # use std::sync::Arc;
+    /// # use slatedb::object_store::memory::InMemory;
+    /// use slatedb::{Db, IsolationLevel};
+    ///
+    /// # let object_store = Arc::new(InMemory::new());
+    /// # let db = Db::open("test_path", object_store).await?;
+    /// let txn = db.begin(IsolationLevel::SerializableSnapshot)?;
+    /// txn.put(b"row1", b"new value")?;
+    /// // The new value differs from the committed one only in the domain of bit 1.
+    /// txn.set_write_mask(b"row1", 0b10)?;
+    /// txn.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_write_mask<K: AsRef<[u8]>>(&self, key: K, mask: u64) -> Result<(), crate::Error> {
+        let mut tracking = self.write_tracking.write();
+        *tracking
+            .masks
+            .entry(Bytes::copy_from_slice(key.as_ref()))
+            .or_insert(0) |= mask;
         Ok(())
     }
 
@@ -512,8 +631,9 @@ impl DbTransaction {
         K: AsRef<[u8]>,
         I: IntoIterator<Item = K>,
     {
-        let mut untracked_keys = self.untracked_write_keys.write();
-        untracked_keys.extend(keys.into_iter().map(|k| Bytes::copy_from_slice(k.as_ref())));
+        let mut tracking = self.write_tracking.write();
+        let untracked_keys = keys.into_iter().map(|k| Bytes::copy_from_slice(k.as_ref()));
+        tracking.untracked.extend(untracked_keys);
         Ok(())
     }
 
@@ -631,11 +751,11 @@ impl DbTransaction {
         // The ranges are taken now: a scan that goes on after this call does not
         // add to them.
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
-            let ranges: Vec<BytesRange> = self
+            let ranges: Vec<(BytesRange, u64)> = self
                 .range_trackers
                 .lock()
                 .iter()
-                .map(|tracker| tracker.get_range())
+                .map(|(tracker, mask)| (tracker.get_range(), *mask))
                 .collect();
             self.read_set.lock().ranges.extend(ranges);
         }
@@ -652,17 +772,25 @@ impl DbTransaction {
             return Ok(None);
         }
 
-        // Track only write keys that were not explicitly unmarked.
-        let tracked_write_keys = {
-            let untracked_write_keys = self.untracked_write_keys.read();
+        // Track only write keys that were not explicitly unmarked, each with the conflict
+        // domains that its write changes: every domain unless a mask was set.
+        let tracked_write_keys: WriteKeys = {
+            let tracking = self.write_tracking.read();
             write_batch
                 .keys()
                 .into_iter()
-                .filter(|key| !untracked_write_keys.contains(key))
+                .filter(|key| !tracking.untracked.contains(key))
+                .map(|key| {
+                    let mark = tracking
+                        .masks
+                        .get(&key)
+                        .map_or(WriteMark::ALL, |&mask| WriteMark { mask });
+                    (key, mark)
+                })
                 .collect()
         };
         self.txn_manager
-            .track_write_keys(&self.txn_id, &tracked_write_keys);
+            .track_write_marks(&self.txn_id, tracked_write_keys);
 
         // Submit the WriteBatch to the database for processing. The batch is sent to a
         // dedicated background task (in batch_write.rs) that processes all WriteBatches
@@ -785,6 +913,18 @@ impl DbTransactionOps for DbTransaction {
         I: IntoIterator<Item = K>,
     {
         DbTransaction::unmark_write(self, keys)
+    }
+
+    fn mark_read_masked<K, I>(&self, keys: I, mask: u64) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        DbTransaction::mark_read_masked(self, keys, mask)
+    }
+
+    fn set_write_mask<K: AsRef<[u8]>>(&self, key: K, mask: u64) -> Result<(), crate::Error> {
+        DbTransaction::set_write_mask(self, key, mask)
     }
 
     fn seqnum(&self) -> u64 {
@@ -2350,5 +2490,129 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+    async fn open_mask_db(name: &str) -> crate::Db {
+        let db = crate::Db::open(
+            format!("/tmp/test_conflict_masks_{name}"),
+            Arc::new(InMemory::new()),
+        )
+        .await
+        .unwrap();
+        db.put(b"row", b"v0").await.unwrap();
+        db.put(b"other", b"v0").await.unwrap();
+        db
+    }
+
+    /// Two serializable transactions on one key: the first reads it in the domains of
+    /// `read_mask` and writes another key; the second writes it in the domains of `write_mask`
+    /// and commits first. The first commits only if the masks are disjoint. A write-write
+    /// conflict on the key aborts whatever the masks.
+    #[rstest]
+    #[case::disjoint(Some(0b01), Some(0b10), true)]
+    #[case::overlapping(Some(0b011), Some(0b110), false)]
+    #[case::default_read(None, Some(0b10), false)]
+    #[case::default_write(Some(0b01), None, false)]
+    #[case::untracked_read(Some(0), None, true)]
+    #[tokio::test]
+    async fn test_conflict_masks_read_write(
+        #[case] read_mask: Option<u64>,
+        #[case] write_mask: Option<u64>,
+        #[case] commits: bool,
+    ) {
+        let db = open_mask_db(&format!("rw_{read_mask:?}_{write_mask:?}")).await;
+        let reader = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        let writer = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        let options = ReadOptions::default().with_conflict_mask(read_mask);
+        assert!(reader
+            .get_with_options(b"row", &options)
+            .await
+            .unwrap()
+            .is_some());
+        reader.put(b"other", b"from the reader").unwrap();
+        writer.put(b"row", b"from the writer").unwrap();
+        if let Some(mask) = write_mask {
+            writer.set_write_mask(b"row", mask).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let result = reader.commit().await;
+        assert_eq!(result.is_ok(), commits, "{result:?}");
+        if !commits {
+            assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::Transaction);
+        }
+    }
+
+    /// A write-write conflict on a key aborts whatever the masks: the write replaces the value.
+    #[tokio::test]
+    async fn test_conflict_masks_write_write() {
+        let db = open_mask_db("ww").await;
+        let first = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        let second = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        first.put(b"row", b"first").unwrap();
+        first.set_write_mask(b"row", 0b01).unwrap();
+        second.put(b"row", b"second").unwrap();
+        second.set_write_mask(b"row", 0b10).unwrap();
+        second.commit().await.unwrap();
+        let err = first.commit().await.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Transaction);
+    }
+
+    /// A scan's range carries the mask of its scan options; `mark_read_masked` and masks set
+    /// twice join; `unmark_write` takes a key out of every check, with a mask set or not; and
+    /// a snapshot-isolation `get` stays untracked whatever its mask.
+    #[tokio::test]
+    async fn test_conflict_masks_ranges_marks_and_unmarked_writes() {
+        // (scan mask, the writer's masks for "row", unmark the writer's write, commits)
+        for (scan_mask, write_masks, unmark, commits) in [
+            (Some(0b01), vec![0b10], false, true),
+            (Some(0b01), vec![0b10, 0b01], false, false),
+            (None, vec![0b10], false, false),
+            (Some(0b01), vec![0b01], true, true),
+        ] {
+            let db = open_mask_db(&format!("range_{scan_mask:?}_{write_masks:?}_{unmark}")).await;
+            let reader = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+            let writer = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+            let options = ScanOptions::default().with_conflict_mask(scan_mask);
+            let mut iter = reader.scan_with_options(.., &options).await.unwrap();
+            while iter.next().await.unwrap().is_some() {}
+            reader.put(b"elsewhere", b"from the reader").unwrap();
+            writer.put(b"row", b"from the writer").unwrap();
+            for mask in &write_masks {
+                writer.set_write_mask(b"row", *mask).unwrap();
+            }
+            if unmark {
+                writer.unmark_write([b"row"]).unwrap();
+            }
+            writer.commit().await.unwrap();
+            let result = reader.commit().await;
+            assert_eq!(
+                result.is_ok(),
+                commits,
+                "scan mask {scan_mask:?}, write masks {write_masks:?}, unmark {unmark}: {result:?}"
+            );
+        }
+
+        // A key marked twice is read in the union of the masks.
+        let db = open_mask_db("marked_twice").await;
+        let reader = db.begin(IsolationLevel::Snapshot).unwrap();
+        let writer = db.begin(IsolationLevel::Snapshot).unwrap();
+        reader.mark_read_masked([b"row"], 0b001).unwrap();
+        reader.mark_read_masked([b"row"], 0b100).unwrap();
+        reader.put(b"elsewhere", b"from the reader").unwrap();
+        writer.put(b"row", b"from the writer").unwrap();
+        writer.set_write_mask(b"row", 0b100).unwrap();
+        writer.commit().await.unwrap();
+        assert!(reader.commit().await.is_err());
+
+        // Snapshot isolation does not track a get, whatever its mask.
+        let db = open_mask_db("snapshot_isolation").await;
+        let reader = db.begin(IsolationLevel::Snapshot).unwrap();
+        let writer = db.begin(IsolationLevel::Snapshot).unwrap();
+        let options = ReadOptions::default().with_conflict_mask(Some(0b01));
+        reader.get_with_options(b"row", &options).await.unwrap();
+        reader.put(b"elsewhere", b"from the reader").unwrap();
+        writer.put(b"row", b"from the writer").unwrap();
+        writer.set_write_mask(b"row", 0b01).unwrap();
+        writer.commit().await.unwrap();
+        reader.commit().await.unwrap();
     }
 }
