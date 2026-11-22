@@ -502,6 +502,32 @@ pub trait DbTransactionOps: DbReadOps {
         K: AsRef<[u8]>,
         I: IntoIterator<Item = K>;
 
+    /// Mark keys as read in the conflict domains of `mask` only.
+    ///
+    /// A write of a marked key by another transaction conflicts only if it
+    /// changed one of those domains. A mask of 0 marks nothing. The default
+    /// marks the keys in every domain, which detects at least the same
+    /// conflicts.
+    fn mark_read_masked<K, I>(&self, keys: I, mask: u64) -> Result<(), crate::Error>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        if mask == 0 {
+            return Ok(());
+        }
+        self.mark_read(keys)
+    }
+
+    /// Set the conflict domains that the transaction's write of `key`
+    /// changes; the caller promises that `mask` covers everything the write
+    /// changes relative to the newest committed value. The default keeps
+    /// every domain, which detects at least the same conflicts.
+    fn set_write_mask<K: AsRef<[u8]>>(&self, key: K, mask: u64) -> Result<(), crate::Error> {
+        let _ = (key, mask);
+        Ok(())
+    }
+
     /// Get the sequence number this transaction was started at.
     fn seqnum(&self) -> u64;
 
