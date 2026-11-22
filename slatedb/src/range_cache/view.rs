@@ -3,11 +3,13 @@
 //! to keep scans fast (the idea of REMIX, Zhong et al., FAST '21). Every range that holds runs has
 //! a view, and a scan reads the runs only through it.
 //!
-//! A view is immutable. It lists every version of every run of the range in the order of a run
-//! (key ascending, then sequence number descending) as a *locator*: the run's slot and the row's
-//! offset in the run's file. Runs hold disjoint intervals of sequence numbers, so the versions of
-//! all runs have one total order, and the versions of one key are adjacent, newest first. A run's
-//! rows appear in the view in the order of its file.
+//! A view is immutable. It lists the versions of the runs of the range that no chunk of the
+//! range's base has absorbed (design 04 I12; with one chunk per range, as every range has now,
+//! that is every version of every run) in the order of a run (key ascending, then sequence number
+//! descending) as a *locator*: the run's slot and the row's offset in the run's file. Runs hold
+//! disjoint intervals of sequence numbers, so the versions of all runs have one total order, and
+//! the versions of one key are adjacent, newest first. A run's rows appear in the view in the
+//! order of its file.
 //!
 //! Each entry has, in four arrays of the heap:
 //!
@@ -411,6 +413,19 @@ impl DeltaView {
         memory: &Arc<ViewMemory>,
         cost: &mut BuildCost,
     ) -> io::Result<Self> {
+        Self::from_runs_where(runs, memory, cost, |_, _| true)
+    }
+
+    /// Builds the view of the rows of `runs` (newest first) for which `keep(run, key)` holds, from
+    /// their files alone: for tests that build a view without the versions that a chunk absorbed
+    /// (design 04 I12).
+    #[cfg(test)]
+    pub(crate) fn from_runs_where(
+        runs: &[Arc<Run>],
+        memory: &Arc<ViewMemory>,
+        cost: &mut BuildCost,
+        keep: impl Fn(&Run, &[u8]) -> bool,
+    ) -> io::Result<Self> {
         if runs.len() > VIEW_SLOTS {
             return Err(corrupt("too many runs"));
         }
@@ -420,7 +435,9 @@ impl DeltaView {
         for (slot, run) in runs.iter().enumerate() {
             check_size(run)?;
             run.file.for_each_row(|offset, key, seq| {
-                rows.push((key.to_vec(), seq, slot as u8, offset as u32));
+                if keep(run, key) {
+                    rows.push((key.to_vec(), seq, slot as u8, offset as u32));
+                }
                 Ok(())
             })?;
             cost.bytes_read += run.file.data_bytes();

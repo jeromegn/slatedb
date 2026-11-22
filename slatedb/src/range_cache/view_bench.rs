@@ -6,7 +6,7 @@
 //! their view. Then, on 1 and 16 threads, it times 10-row scans from a random base key
 //! (`CachedScan`, the cache's own scan, at the latest sequence number, with only a row limit as
 //! the harness's `db.scan(start..)`) and point reads of random base keys (hits, through `lookup`,
-//! which probes the runs' filters).
+//! which probes the runs' filters; with the dense delta, the hit is in a run).
 //!
 //! Two deltas:
 //!
@@ -233,12 +233,11 @@ fn layers(base: &Arc<RangeFile>, runs: &[Arc<Run>], view: Arc<DeltaView>) -> Ran
         sealed: Vec::new(),
         runs: runs.to_vec(),
         view: Some(view),
-        base: Some(base.clone()),
-        base_seq: BASE_SEQ,
+        chunks: super::one_chunk(base.clone(), BASE_SEQ),
         covered_to,
         end: None,
     };
-    layers.check(runs.len().max(4));
+    layers.check(&[], runs.len().max(4));
     Range {
         layers: Arc::new(layers),
         seq: covered_to,
@@ -466,12 +465,8 @@ fn view_bench() {
                 );
                 let range = layers(&base, &run_files, Arc::new(view));
                 verify(&range, &table, n);
-                let ops: &[Op] = if delta == "dense" {
-                    &[Op::Scan10]
-                } else {
-                    &[Op::Scan10, Op::Get]
-                };
-                for &op in ops {
+                // Point hits of a dense delta find their key's newest version in a run.
+                for &op in &[Op::Scan10, Op::Get] {
                     for &t in &tasks {
                         let (rate, ns) = measure(&range, &table, n, op, t);
                         println!(

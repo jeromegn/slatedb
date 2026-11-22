@@ -9,8 +9,9 @@
 //!
 //! The scan opens each part when it first reaches it. A gap costs a normal-path iterator, which
 //! can read from object storage, so a scan that ends early, or seeks past a gap, never opens it.
-//! When the scan opens a gap that no cached range holds, it samples the read for automatic
-//! promotion, as a normal-path scan is sampled.
+//! When the scan opens a gap that no ready cached range holds, it samples the read for automatic
+//! promotion, as a normal-path scan is sampled. It counts each gap that it opens once, by why the
+//! part is a gap (`fallback_count{op=gap}`).
 
 use std::collections::VecDeque;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
@@ -20,7 +21,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::scan::CachedScan;
-use super::stats::ReadCount;
+use super::stats::{Fallback, FallbackOp, ReadCount};
 use super::{scan_start, Layers, RangeCache};
 use crate::bytes_range::BytesRange;
 use crate::config::ScanOptions;
@@ -36,9 +37,18 @@ use crate::types::RowEntry;
 pub(crate) enum PartKind {
     /// The pinned layers of a cached range that follow the sequence number rules.
     Cached(Arc<Layers>),
-    /// The normal read path. `sample` is false for a part that a cached range holds but cannot
-    /// serve at the scan's sequence number: promotion has nothing to gain there.
-    Gap { sample: bool },
+    /// The normal read path, because no range holds the part (`uncovered`), its range loads
+    /// (`loading`), or its range holds it but cannot serve it at the scan's sequence number
+    /// (`too_old`, `sealed`).
+    Gap(Fallback),
+}
+
+impl PartKind {
+    /// True for a gap that automatic promotion samples: promotion has nothing to gain for a part
+    /// that a cached range holds.
+    fn samples(reason: Fallback) -> bool {
+        matches!(reason, Fallback::Uncovered | Fallback::Loading)
+    }
 }
 
 /// A part of a mixed scan: a non-empty key range inside the scan range.
@@ -157,15 +167,20 @@ impl MixedScan {
         let Some(part) = self.parts.pop_front() else {
             return Ok(false);
         };
-        let PartKind::Gap { sample } = part.kind else {
+        let PartKind::Gap(reason) = part.kind else {
             return Ok(true);
         };
         let Some(range) = BytesRange::try_new(part.start.clone(), part.end.clone()) else {
             return Ok(true);
         };
         let gaps = &self.gaps;
-        let sampled = if sample { gaps.cache.sample() } else { None };
+        let sampled = if PartKind::samples(reason) {
+            gaps.cache.sample()
+        } else {
+            None
+        };
         gaps.cache.hits.count(ReadCount::ScanGap);
+        gaps.cache.count_fallback(FallbackOp::Gap, reason);
         let iter = gaps
             .reader
             .scan_with_options(

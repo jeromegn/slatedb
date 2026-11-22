@@ -1,10 +1,18 @@
 //! Metrics of the range cache.
 //!
 //! The counters of the read path (`get_count`, `scan_count`, `mixed_scan_count`,
-//! `scan_gap_count`, `mixed_scan_retry_count`, `pin_retry_count` and `unusable_count`) are
-//! counted on each thread first and added to the shared counters every few thousand reads or
-//! about every 10 ms, so a read writes no counter that other threads write. They are exact only
-//! after such a fold. See [`crate::RangeCacheTuning::stats_fold_events`].
+//! `scan_gap_count`, `mixed_scan_retry_count`, `pin_retry_count`, `unusable_count` and
+//! `fallback_count`) are counted on each thread first and added to the shared counters every few
+//! thousand reads or about every 10 ms, so a read writes no counter that other threads write.
+//! They are exact only after such a fold. See [`crate::RangeCacheTuning::stats_fold_events`].
+//!
+//! Every point read and every scan that reaches the range cache's read entry points of a database
+//! with a range cache counts once: in `get_count` or `fallback_count{op=get}` for a point read, and
+//! in `scan_count`, `mixed_scan_count` or `fallback_count{op=scan}` for a scan. Reads that a
+//! transaction answers from its own writes, or sends to the normal read path before it asks the
+//! cache (a scan that overlaps its write batch, a point read of a key whose last write in the batch
+//! is a merge operand, a point read with options that the cache does not serve), never reach those
+//! entry points and are not counted here.
 
 use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
 use std::sync::Arc;
@@ -40,6 +48,25 @@ pub const PIN_RETRY_COUNT: &str = range_cache_stat_name!("pin_retry_count");
 /// `pin_retry_count`. The `op` label is `get` and `scan` (after the last attempt), or
 /// `scan_part` (a part of a mixed scan that the normal read path then reads as a gap).
 pub const UNUSABLE_COUNT: &str = range_cache_stat_name!("unusable_count");
+/// Reads that the range cache did not serve and that used the normal read path, each counted once,
+/// by why (design 04 section 8.1). The `op` label is `get` (a point read), `scan` (a scan that no
+/// cached range served in any part) or `gap` (a part of a mixed scan that the normal read path
+/// read, counted when the scan opened it, so the `gap` counts sum to `scan_gap_count`). The
+/// `reason` label is:
+///
+/// - `uncovered`: no range holds the key, or no cached range meets the scan, or the gap.
+/// - `loading`: the range that holds the key, every cached range that the scan meets, or the
+///   gap's range, is loading.
+/// - `too_old` and `sealed`: the range failed the sequence number rules, as in `unusable_count`.
+///   A scan whose cached ranges all failed them counts the reason of the first failure, `too_old`
+///   if any range was too old.
+/// - `error` (`get` only): a read of the range's files failed, and the cache removed the range.
+/// - `frozen` (`scan` only): a memtable freeze made each attempt to plan a mixed scan at the latest
+///   state repeat (`mixed_scan_retry_count`).
+/// - `descending` (`scan` only), `remote` (durability `Remote`), `dirty`, `filter` (a filter
+///   context) and `traced` (tracing options): read options that the cache does not serve, the
+///   first of them in this order.
+pub const FALLBACK_COUNT: &str = range_cache_stat_name!("fallback_count");
 /// Ranges that the cache loaded.
 pub const LOAD_COUNT: &str = range_cache_stat_name!("load_count");
 /// Bytes of range cache files that loads wrote.
@@ -59,6 +86,31 @@ pub const REBUILD_FLUSH_COUNT: &str = range_cache_stat_name!("rebuild_flush_coun
 /// Bytes of base files that major merges wrote. With `flush_bytes`, divide by the bytes of the
 /// writes to cached ranges to get the local write amplification.
 pub const REBUILD_BYTES: &str = range_cache_stat_name!("rebuild_bytes");
+
+// Where the delta of a range lands in its base, measured at each major merge that installs (design
+// 04 sections 4.3 and 4.5). The merge cuts the data of each base file that it rewrites into virtual
+// slices of 1 MiB and of 8 MiB by file offset, and assigns each version of the runs that it absorbs
+// to the slice of the page whose keys hold the version's key. Divided by `major_merge_base_bytes`
+// over a run, `major_merge_touched_bytes` and `major_merge_half_bytes` are two measures of `h`, the
+// share of the base where the delta lands.
+
+/// Bytes of the data pages (and out-of-line values) of the bases that major merges rewrote: the
+/// bytes that the slices cut.
+pub const MAJOR_MERGE_BASE_BYTES: &str = range_cache_stat_name!("major_merge_base_bytes");
+/// Key and value bytes of the versions that major merges absorbed. The `span` label is `inside`
+/// (from the first to the last key of the base file) or `outside` (below its first key or above
+/// its last, as appends are: such a version lands in no slice).
+pub const MAJOR_MERGE_DELTA_BYTES: &str = range_cache_stat_name!("major_merge_delta_bytes");
+/// Bytes of the slices that hold at least one absorbed version. The `slice` label is `1mib` or
+/// `8mib`.
+pub const MAJOR_MERGE_TOUCHED_BYTES: &str = range_cache_stat_name!("major_merge_touched_bytes");
+/// Bytes of the fewest densest slices (absorbed bytes per slice byte) whose absorbed bytes, with
+/// the absorbed bytes outside the base's keys, reach half of all absorbed bytes: what a partial
+/// major merge that rewrites the densest chunks until it absorbs half of the delta would rewrite
+/// with chunks of the slice's size, the delta outside the base's keys being written as new chunks.
+/// By `slice`.
+pub const MAJOR_MERGE_HALF_BYTES: &str = range_cache_stat_name!("major_merge_half_bytes");
+
 /// Seals of active write buffers. The `reason` label is `full` (the buffer reached
 /// `range_seal_bytes`) or `pressure` (the maintenance task sealed it early because the memory of
 /// the buffers was high).
@@ -188,11 +240,58 @@ impl RemoveReason {
 /// Why a ready cached range failed the sequence number rules for a read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unfit {
-    /// The read's sequence number is below the sequence number of the range's base.
+    /// The read's sequence number is below the `base_seq` of a chunk of the range's base that the
+    /// read needs.
     TooOld,
     /// The read's sequence number is above the sequence number at which the active buffer was
     /// sealed.
     Sealed,
+}
+
+/// Why a read, or a part of a mixed scan, used the normal read path. See [`FALLBACK_COUNT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    Uncovered,
+    Loading,
+    TooOld,
+    Sealed,
+    Error,
+    Frozen,
+    Descending,
+    Remote,
+    Dirty,
+    Filter,
+    Traced,
+}
+
+impl From<Unfit> for Fallback {
+    fn from(reason: Unfit) -> Self {
+        match reason {
+            Unfit::TooOld => Fallback::TooOld,
+            Unfit::Sealed => Fallback::Sealed,
+        }
+    }
+}
+
+impl Fallback {
+    /// Of two reasons why no cached range served a scan, the one that the scan counts: a range
+    /// too old, then one sealed, then one loading, then none at all.
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Fallback::TooOld => 0,
+            Fallback::Sealed => 1,
+            Fallback::Loading => 2,
+            _ => 3,
+        }
+    }
+}
+
+/// What a fallback is a fallback of. See [`FALLBACK_COUNT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FallbackOp {
+    Get,
+    Scan,
+    Gap,
 }
 
 /// The kind of read that pins cached ranges.
@@ -227,10 +326,33 @@ pub(crate) enum ReadCount {
     UnusableScanSealed,
     UnusablePartTooOld,
     UnusablePartSealed,
+    FallbackGetUncovered,
+    FallbackGetLoading,
+    FallbackGetTooOld,
+    FallbackGetSealed,
+    FallbackGetError,
+    FallbackGetRemote,
+    FallbackGetDirty,
+    FallbackGetFilter,
+    FallbackGetTraced,
+    FallbackScanUncovered,
+    FallbackScanLoading,
+    FallbackScanTooOld,
+    FallbackScanSealed,
+    FallbackScanFrozen,
+    FallbackScanDescending,
+    FallbackScanRemote,
+    FallbackScanDirty,
+    FallbackScanFilter,
+    FallbackScanTraced,
+    FallbackGapUncovered,
+    FallbackGapLoading,
+    FallbackGapTooOld,
+    FallbackGapSealed,
 }
 
 /// The number of [`ReadCount`] variants.
-pub(crate) const READ_COUNTS: usize = 17;
+pub(crate) const READ_COUNTS: usize = 40;
 
 impl ReadCount {
     /// Every variant, in the order of their discriminants.
@@ -252,11 +374,72 @@ impl ReadCount {
         ReadCount::UnusableScanSealed,
         ReadCount::UnusablePartTooOld,
         ReadCount::UnusablePartSealed,
+        ReadCount::FallbackGetUncovered,
+        ReadCount::FallbackGetLoading,
+        ReadCount::FallbackGetTooOld,
+        ReadCount::FallbackGetSealed,
+        ReadCount::FallbackGetError,
+        ReadCount::FallbackGetRemote,
+        ReadCount::FallbackGetDirty,
+        ReadCount::FallbackGetFilter,
+        ReadCount::FallbackGetTraced,
+        ReadCount::FallbackScanUncovered,
+        ReadCount::FallbackScanLoading,
+        ReadCount::FallbackScanTooOld,
+        ReadCount::FallbackScanSealed,
+        ReadCount::FallbackScanFrozen,
+        ReadCount::FallbackScanDescending,
+        ReadCount::FallbackScanRemote,
+        ReadCount::FallbackScanDirty,
+        ReadCount::FallbackScanFilter,
+        ReadCount::FallbackScanTraced,
+        ReadCount::FallbackGapUncovered,
+        ReadCount::FallbackGapLoading,
+        ReadCount::FallbackGapTooOld,
+        ReadCount::FallbackGapSealed,
     ];
 
     /// The index of the counter in the arrays of the `hits` module.
     pub(crate) fn index(self) -> usize {
         self as usize
+    }
+
+    /// True for a scan that a range served, which counts as a scan of the range, not a get.
+    pub(crate) fn is_scan(self) -> bool {
+        matches!(self, ReadCount::Scan | ReadCount::MixedScan)
+    }
+
+    /// The fallback of `op` for `reason`, or `None` for a pair that cannot happen (a point read
+    /// that is `descending`, a gap with read options, ...).
+    pub(crate) fn fallback(op: FallbackOp, reason: Fallback) -> Option<Self> {
+        use Fallback as F;
+        use FallbackOp as O;
+        Some(match (op, reason) {
+            (O::Get, F::Uncovered) => ReadCount::FallbackGetUncovered,
+            (O::Get, F::Loading) => ReadCount::FallbackGetLoading,
+            (O::Get, F::TooOld) => ReadCount::FallbackGetTooOld,
+            (O::Get, F::Sealed) => ReadCount::FallbackGetSealed,
+            (O::Get, F::Error) => ReadCount::FallbackGetError,
+            (O::Get, F::Remote) => ReadCount::FallbackGetRemote,
+            (O::Get, F::Dirty) => ReadCount::FallbackGetDirty,
+            (O::Get, F::Filter) => ReadCount::FallbackGetFilter,
+            (O::Get, F::Traced) => ReadCount::FallbackGetTraced,
+            (O::Scan, F::Uncovered) => ReadCount::FallbackScanUncovered,
+            (O::Scan, F::Loading) => ReadCount::FallbackScanLoading,
+            (O::Scan, F::TooOld) => ReadCount::FallbackScanTooOld,
+            (O::Scan, F::Sealed) => ReadCount::FallbackScanSealed,
+            (O::Scan, F::Frozen) => ReadCount::FallbackScanFrozen,
+            (O::Scan, F::Descending) => ReadCount::FallbackScanDescending,
+            (O::Scan, F::Remote) => ReadCount::FallbackScanRemote,
+            (O::Scan, F::Dirty) => ReadCount::FallbackScanDirty,
+            (O::Scan, F::Filter) => ReadCount::FallbackScanFilter,
+            (O::Scan, F::Traced) => ReadCount::FallbackScanTraced,
+            (O::Gap, F::Uncovered) => ReadCount::FallbackGapUncovered,
+            (O::Gap, F::Loading) => ReadCount::FallbackGapLoading,
+            (O::Gap, F::TooOld) => ReadCount::FallbackGapTooOld,
+            (O::Gap, F::Sealed) => ReadCount::FallbackGapSealed,
+            _ => return None,
+        })
     }
 
     /// A failed attempt of `op` that the read tries again. A part of a mixed scan is never
@@ -319,8 +502,55 @@ impl ReadCount {
             ReadCount::UnusablePartSealed => {
                 (UNUSABLE_COUNT, &[("op", "scan_part"), ("reason", "sealed")])
             }
+            ReadCount::FallbackGetUncovered => fallback_labels("get", "uncovered"),
+            ReadCount::FallbackGetLoading => fallback_labels("get", "loading"),
+            ReadCount::FallbackGetTooOld => fallback_labels("get", "too_old"),
+            ReadCount::FallbackGetSealed => fallback_labels("get", "sealed"),
+            ReadCount::FallbackGetError => fallback_labels("get", "error"),
+            ReadCount::FallbackGetRemote => fallback_labels("get", "remote"),
+            ReadCount::FallbackGetDirty => fallback_labels("get", "dirty"),
+            ReadCount::FallbackGetFilter => fallback_labels("get", "filter"),
+            ReadCount::FallbackGetTraced => fallback_labels("get", "traced"),
+            ReadCount::FallbackScanUncovered => fallback_labels("scan", "uncovered"),
+            ReadCount::FallbackScanLoading => fallback_labels("scan", "loading"),
+            ReadCount::FallbackScanTooOld => fallback_labels("scan", "too_old"),
+            ReadCount::FallbackScanSealed => fallback_labels("scan", "sealed"),
+            ReadCount::FallbackScanFrozen => fallback_labels("scan", "frozen"),
+            ReadCount::FallbackScanDescending => fallback_labels("scan", "descending"),
+            ReadCount::FallbackScanRemote => fallback_labels("scan", "remote"),
+            ReadCount::FallbackScanDirty => fallback_labels("scan", "dirty"),
+            ReadCount::FallbackScanFilter => fallback_labels("scan", "filter"),
+            ReadCount::FallbackScanTraced => fallback_labels("scan", "traced"),
+            ReadCount::FallbackGapUncovered => fallback_labels("gap", "uncovered"),
+            ReadCount::FallbackGapLoading => fallback_labels("gap", "loading"),
+            ReadCount::FallbackGapTooOld => fallback_labels("gap", "too_old"),
+            ReadCount::FallbackGapSealed => fallback_labels("gap", "sealed"),
         }
     }
+}
+
+/// The name and labels of `fallback_count` for `op` and `reason`, one of the pairs listed here.
+fn fallback_labels(
+    op: &'static str,
+    reason: &'static str,
+) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    macro_rules! labels {
+        ($($op:literal, $reason:literal;)*) => {
+            match (op, reason) {
+                $(($op, $reason) => &[("op", $op), ("reason", $reason)],)*
+                _ => &[],
+            }
+        };
+    }
+    let labels: &'static [(&'static str, &'static str)] = labels! {
+        "get", "uncovered"; "get", "loading"; "get", "too_old"; "get", "sealed"; "get", "error";
+        "get", "remote"; "get", "dirty"; "get", "filter"; "get", "traced";
+        "scan", "uncovered"; "scan", "loading"; "scan", "too_old"; "scan", "sealed";
+        "scan", "frozen"; "scan", "descending"; "scan", "remote"; "scan", "dirty";
+        "scan", "filter"; "scan", "traced";
+        "gap", "uncovered"; "gap", "loading"; "gap", "too_old"; "gap", "sealed";
+    };
+    (FALLBACK_COUNT, labels)
 }
 
 /// Registers the counters of the read path, indexed by [`ReadCount::index`].
@@ -422,6 +652,13 @@ pub(crate) struct RangeCacheStats {
     pub(crate) rebuild_bytes: Arc<dyn CounterFn>,
     pub(crate) rebuilds_by_runs: Arc<dyn CounterFn>,
     pub(crate) rebuild_flushes: Arc<dyn CounterFn>,
+    /// Where the delta of the major merges landed: see [`RangeCacheStats::spread`].
+    major_merge_base_bytes: Arc<dyn CounterFn>,
+    major_merge_delta_inside: Arc<dyn CounterFn>,
+    major_merge_delta_outside: Arc<dyn CounterFn>,
+    /// By slice size: 1 MiB, then 8 MiB.
+    major_merge_touched: [Arc<dyn CounterFn>; 2],
+    major_merge_half: [Arc<dyn CounterFn>; 2],
     pub(crate) seals_full: Arc<dyn CounterFn>,
     pub(crate) seals_pressure: Arc<dyn CounterFn>,
     pub(crate) flushes: Arc<dyn CounterFn>,
@@ -494,6 +731,17 @@ impl RangeCacheStats {
             rebuild_bytes: recorder.counter(REBUILD_BYTES).register(),
             rebuilds_by_runs: recorder.counter(REBUILD_BY_RUNS_COUNT).register(),
             rebuild_flushes: recorder.counter(REBUILD_FLUSH_COUNT).register(),
+            major_merge_base_bytes: recorder.counter(MAJOR_MERGE_BASE_BYTES).register(),
+            major_merge_delta_inside: labeled(MAJOR_MERGE_DELTA_BYTES, "span", "inside"),
+            major_merge_delta_outside: labeled(MAJOR_MERGE_DELTA_BYTES, "span", "outside"),
+            major_merge_touched: [
+                labeled(MAJOR_MERGE_TOUCHED_BYTES, "slice", "1mib"),
+                labeled(MAJOR_MERGE_TOUCHED_BYTES, "slice", "8mib"),
+            ],
+            major_merge_half: [
+                labeled(MAJOR_MERGE_HALF_BYTES, "slice", "1mib"),
+                labeled(MAJOR_MERGE_HALF_BYTES, "slice", "8mib"),
+            ],
             seals_full: labeled(SEAL_COUNT, "reason", "full"),
             seals_pressure: labeled(SEAL_COUNT, "reason", "pressure"),
             flushes: recorder.counter(FLUSH_COUNT).register(),
@@ -520,6 +768,18 @@ impl RangeCacheStats {
                 ViewStats::new(recorder, "major"),
             ],
             view_bytes: recorder.gauge(VIEW_BYTES).register(),
+        }
+    }
+
+    /// Counts where the delta of a major merge that installed landed in its base.
+    pub(crate) fn spread(&self, spread: &super::spread::Spread) {
+        self.major_merge_base_bytes.increment(spread.base_bytes);
+        self.major_merge_delta_inside.increment(spread.inside_bytes);
+        self.major_merge_delta_outside
+            .increment(spread.outside_bytes);
+        for (i, slices) in spread.slices.iter().enumerate() {
+            self.major_merge_touched[i].increment(slices.touched_bytes);
+            self.major_merge_half[i].increment(slices.half_bytes);
         }
     }
 
@@ -577,5 +837,49 @@ mod tests {
                 &[("op", "scan_part"), ("reason", "sealed")][..]
             )
         );
+    }
+
+    #[test]
+    fn should_map_each_possible_fallback_to_its_own_counter() {
+        use Fallback as F;
+        let reasons = [
+            (F::Uncovered, "uncovered"),
+            (F::Loading, "loading"),
+            (F::TooOld, "too_old"),
+            (F::Sealed, "sealed"),
+            (F::Error, "error"),
+            (F::Frozen, "frozen"),
+            (F::Descending, "descending"),
+            (F::Remote, "remote"),
+            (F::Dirty, "dirty"),
+            (F::Filter, "filter"),
+            (F::Traced, "traced"),
+        ];
+        let ops = [
+            (FallbackOp::Get, "get"),
+            (FallbackOp::Scan, "scan"),
+            (FallbackOp::Gap, "gap"),
+        ];
+        let mut counters = BTreeSet::new();
+        for (op, op_label) in ops {
+            for (reason, reason_label) in reasons {
+                let possible = match op {
+                    FallbackOp::Get => !matches!(reason, F::Frozen | F::Descending),
+                    FallbackOp::Scan => reason != F::Error,
+                    FallbackOp::Gap => {
+                        matches!(reason, F::Uncovered | F::Loading | F::TooOld | F::Sealed)
+                    }
+                };
+                let Some(count) = ReadCount::fallback(op, reason) else {
+                    assert!(!possible, "{op_label} {reason_label}");
+                    continue;
+                };
+                assert!(possible, "{op_label} {reason_label}");
+                let labels = [("op", op_label), ("reason", reason_label)];
+                assert_eq!(count.metric(), (FALLBACK_COUNT, &labels[..]));
+                assert!(counters.insert(count.index()));
+            }
+        }
+        assert_eq!(counters.len(), 23);
     }
 }

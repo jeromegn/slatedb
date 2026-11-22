@@ -1088,6 +1088,19 @@ impl RangeFile {
         self.max_seq
     }
 
+    /// The bytes of the data pages and out-of-line values: the file up to its fence region.
+    pub(super) fn data_len(&self) -> u64 {
+        self.data_end
+    }
+
+    /// The file offset of the page whose keys hold `key`: the last page whose first key is at or
+    /// below `key`. `None` if `key` is below the first key of the file. One search of the fence
+    /// index on the heap, no read.
+    pub(super) fn page_offset_of(&self, key: &[u8]) -> Option<u64> {
+        let pages = self.pages_le(key);
+        pages.checked_sub(1).map(|page| self.page_offsets[page])
+    }
+
     fn page_count(&self) -> usize {
         self.page_offsets.len()
     }
