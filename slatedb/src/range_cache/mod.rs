@@ -2877,8 +2877,10 @@ impl DbInner {
                     // the active memtable, which `V` shares, unless a freeze happened. So if no
                     // freeze happened, `V` holds every version at or below `S`. Else try again.
                     //
-                    // A snapshot or a transaction is registered at `S`, so flush and compaction
-                    // keep its versions, and any view captured after `S` was loaded holds them.
+                    // A snapshot or a transaction is registered at `S`, and the iterator of its
+                    // scan keeps it registered until it drops, so flush and compaction keep its
+                    // versions, and any view captured after `S` was loaded holds them, also one
+                    // that a lazily pinned scan captures for a later gap (see the `lazy` module).
                     let latest_view = at.is_none().then(|| self.state.read().view());
                     let pin = match cache.pin_mixed(&range, self.oracle.as_ref(), at) {
                         Ok(pin) => pin,

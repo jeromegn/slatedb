@@ -47,14 +47,19 @@
 //!
 //! **Gaps.** A gap reads through the normal path from a state view `V` captured when the scan opens
 //! it, with `max_seq = S`. That is exact while `S` stays registered: flush and compaction keep the
-//! versions that a registered snapshot sees (the rule in `DbInner::range_cache_scan`). SlateDB's
-//! API lets a caller drop the snapshot or the transaction while its scan reads on, and after that
-//! a memtable flush or a compaction may drop a version that `S` sees: a flush takes its retention
-//! boundary from the registrations live at its upload (`DbInner::compute_flush_retention_seq`),
-//! and a compaction from the manifest's `recent_snapshot_min_seq`. The scan cannot keep the
-//! registration itself without a lock per scan, so after it captures `V` it checks that one of
-//! two things holds ([`GapReader::holds`]), and otherwise the gap fails with an error rather than
-//! answer from a state that may lack a version:
+//! versions that a registered snapshot sees (the rule in `DbInner::range_cache_scan`). A memtable
+//! flush takes its retention boundary from the registrations live at its upload
+//! (`DbInner::compute_flush_retention_seq`), and a compaction from the manifest's
+//! `recent_snapshot_min_seq`. The iterator of a scan in a snapshot or a transaction holds the
+//! registration of `S` until it drops, also after the snapshot or the transaction ended (the
+//! `RetentionPin` that `DbSnapshot::scan*` and `DbTransaction::scan*` give it), so for a scan made
+//! through the public API `S` is registered whenever a gap opens, and every gap is exact.
+//!
+//! The scan still checks, after it captures `V`, that one of two things holds
+//! ([`GapReader::holds`]), and otherwise the gap fails with an error rather than answer from a
+//! state that may lack a version. It should never fail now; it stays because it costs a gap two
+//! read locks and nothing on a hit, and it turns a crate-internal caller that passes a sequence
+//! number that nothing keeps registered into an error instead of a wrong answer:
 //!
 //! 1. `V`'s `last_l0_seq` is at or below `S`. The writer sets it in the same hold of the state's
 //!    lock that adds the L0 (`apply_uploaded_state`), and flushes and compactions only write
@@ -73,7 +78,7 @@
 //!
 //! The manifest's `recent_snapshot_min_seq` is not enough: the writer updates it in a later hold
 //! of the lock than the L0's, so a view captured between the two holds an L0 flushed with no
-//! registration and the old value. Blobtree keeps its transaction for as long as its scan cursor.
+//! registration and the old value.
 //!
 //! **Cost and counts.** Nothing on the hit path of a scan that ends in its first range, past the
 //! reference count of its thread's handle of the cache, which it holds for its later parts (see
@@ -495,6 +500,7 @@ mod tests {
         lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder,
     };
 
+    use super::GapReader;
     use crate::config::{FlushOptions, FlushType, ScanOptions, TracingOptions};
     use crate::db::Db;
     use crate::db_iter::DbIterator;
@@ -507,6 +513,7 @@ mod tests {
         QUIET_MERGE_REJECTED_COUNT, SCAN_COUNT, SPLIT_COUNT, UNUSABLE_COUNT,
     };
     use crate::range_cache::{CachedRange, Chunks, RangeCache, RangeCacheOptions, MAX_RUNS_RANGE};
+    use crate::reader::DbStateReader;
     use crate::transaction_manager::IsolationLevel;
     use crate::types::KeyValue;
 
@@ -1186,35 +1193,68 @@ mod tests {
         t.db.close().await.unwrap();
     }
 
-    /// I16, the gap guard. A snapshot scan's snapshot ends while the scan reads its cached first
-    /// range; then a key of the uncached stretch after it gets a version above the snapshot, and
-    /// the memtable flushes. With no registration, the flush keeps only the newer version, so the
-    /// gap must fail rather than return the stretch without the version that the snapshot sees.
-    /// With another snapshot held, older than the scan's or at its sequence number, the flush keeps
-    /// that version and the gap is served (rule 2); with no flush since the snapshot ended, no SST
-    /// holds a version above it and the gap is served (rule 1).
+    /// I16: a scan in a snapshot or a transaction keeps its sequence number registered until its
+    /// iterator drops. The scan reads its cached first range; then its snapshot is dropped, or
+    /// its transaction is committed, rolled back or dropped; a key of the next cached range and a
+    /// key of the uncached stretch after it get versions above the scan's sequence number, and the
+    /// memtable flushes, which keeps the older versions only for a registered sequence number.
+    /// The scan pins the next range (the cached path) and reads the stretch as a gap (the gap
+    /// path), and returns the rows at its sequence number; the managers report that sequence
+    /// number until the iterator drops, and then move on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn should_fail_a_gap_that_its_ended_snapshot_no_longer_holds() {
-        for case in ["dropped", "older held", "equal held", "no flush"] {
+    async fn should_read_at_its_sequence_number_after_its_snapshot_or_transaction_ended() {
+        for case in [
+            "snapshot dropped",
+            "snapshot dropped, no flush",
+            "older snapshot held",
+            "transaction committed",
+            "transaction rolled back",
+            "transaction dropped",
+        ] {
             let t = open(|_| {}).await;
             put_all(&t, 0, 200).await;
             t.db.cache_range(span(0, 100)).await.unwrap();
-            let older = (case == "older held").then(|| t.db.snapshot().unwrap());
+            t.db.cache_range(span(100, 150)).await.unwrap();
+            let older = (case == "older snapshot held").then(|| t.db.snapshot().unwrap());
             if older.is_some() {
                 t.db.put(key(5), value(5, 1)).await.unwrap();
             }
-            let snapshot = t.db.snapshot().unwrap();
-            let seq = snapshot.seq();
-            let equal = (case == "equal held").then(|| t.db.snapshot().unwrap());
-            if let Some(older) = &older {
-                assert!(older.seq() < seq);
-            }
-            let mut iter = snapshot.scan(key(50)..).await.unwrap();
+            let transaction = case.starts_with("transaction");
+            let (snapshot, txn) = if transaction {
+                (None, Some(t.db.begin(IsolationLevel::Snapshot).unwrap()))
+            } else {
+                (Some(t.db.snapshot().unwrap()), None)
+            };
+            let seq = match (&snapshot, &txn) {
+                (Some(snapshot), _) => snapshot.seq(),
+                (_, Some(txn)) => txn.seqnum(),
+                _ => unreachable!(),
+            };
+            let mut iter = match (&snapshot, &txn) {
+                (Some(snapshot), _) => snapshot.scan(key(50)..).await.unwrap(),
+                (_, Some(txn)) => txn.scan(key(50)..).await.unwrap(),
+                _ => unreachable!(),
+            };
             let mut got = rows(&mut iter, 5).await;
-            drop(snapshot);
-            t.db.put(key(150), value(150, 2)).await.unwrap();
+            let registered = || match transaction {
+                true => t.db.inner.txn_manager.min_active_seq(),
+                false => t.db.inner.snapshot_manager.min_active_seq(),
+            };
+            let after_end = older.as_ref().map(|older| older.seq());
+            match case {
+                "transaction committed" => {
+                    let txn = txn.unwrap();
+                    txn.put(key(300), value(300, 1)).unwrap();
+                    txn.commit().await.unwrap();
+                }
+                "transaction rolled back" => txn.unwrap().rollback(),
+                _ => drop((snapshot, txn)),
+            }
+            assert_eq!(registered(), Some(after_end.unwrap_or(seq)), "{case}");
+            t.db.put(key(120), value(120, 2)).await.unwrap();
+            t.db.put(key(170), value(170, 2)).await.unwrap();
             let last_l0_seq = || t.db.inner.state.read().state().core().last_l0_seq;
-            if case == "no flush" {
+            if case.ends_with("no flush") {
                 assert!(last_l0_seq() <= seq, "{case}");
             } else {
                 t.db.flush_with_options(FlushOptions {
@@ -1224,30 +1264,73 @@ mod tests {
                 .unwrap();
                 assert!(last_l0_seq() > seq, "{case}");
             }
-            let result = loop {
-                match iter.next().await {
-                    Ok(Some(kv)) => got.push(kv),
-                    Ok(None) => break Ok(()),
-                    Err(e) => break Err(e),
-                }
-            };
+            let (pins, gaps) = (t.pins(), t.gaps("uncovered"));
+            got.extend(rows(&mut iter, usize::MAX).await);
             let got: Vec<(Bytes, Bytes)> = got.into_iter().map(|kv| (kv.key, kv.value)).collect();
-            if case == "dropped" {
-                assert!(
-                    result.is_err(),
-                    "{case}: the gap was served, {} rows",
-                    got.len()
-                );
-                // The cached range's rows came before the gap.
-                assert_eq!(got.len(), 50, "{case}");
-            } else {
-                result.unwrap();
-                let want: Vec<(Bytes, Bytes)> = (50..200).map(|i| (key(i), value(i, 0))).collect();
-                assert_eq!(got, want, "{case}");
-            }
-            drop((older, equal));
+            let want: Vec<(Bytes, Bytes)> = (50..200).map(|i| (key(i), value(i, 0))).collect();
+            assert_eq!(got, want, "{case}");
+            assert_eq!(
+                (t.pins() - pins, t.gaps("uncovered") - gaps),
+                (1, 1),
+                "{case}"
+            );
+            assert_eq!(registered(), Some(after_end.unwrap_or(seq)), "{case}");
+            drop(iter);
+            assert_eq!(registered(), after_end, "{case}");
+            drop(older);
             t.db.close().await.unwrap();
         }
+    }
+
+    /// The gap guard itself ([`GapReader::holds`]), which a scan made through the public API
+    /// always passes: a view whose SSTs hold no version above the sequence number holds what it
+    /// sees (rule 1), so does one with a snapshot or a transaction at or below it registered
+    /// (rule 2), and one with neither may not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_check_that_a_gap_view_holds_what_its_sequence_number_sees() {
+        let t = open(|_| {}).await;
+        let inner = &t.db.inner;
+        let gaps = GapReader {
+            reader: inner.reader.clone(),
+            state: inner.state.clone(),
+            snapshots: inner.snapshot_manager.clone(),
+            transactions: inner.txn_manager.clone(),
+        };
+        let flush = || async {
+            t.db.flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        };
+        let view = || inner.state.read().view();
+        put_all(&t, 0, 10).await;
+        flush().await;
+        let seq = t.committed();
+        // Rule 1: every SST version is at or below `seq`.
+        assert!(gaps.holds(&view(), seq));
+        put_all(&t, 0, 10).await;
+        flush().await;
+        assert!(view().core().last_l0_seq > seq);
+        // Neither rule.
+        assert!(!gaps.holds(&view(), seq));
+        // Rule 2, by a snapshot at `seq`, and by a transaction below.
+        let (id, at) = inner.snapshot_manager.new_snapshot(Some(seq));
+        assert_eq!(at, seq);
+        assert!(gaps.holds(&view(), seq));
+        inner.snapshot_manager.drop_snapshot(&id);
+        assert!(!gaps.holds(&view(), seq));
+        let txn = t.db.begin(IsolationLevel::Snapshot).unwrap();
+        let txn_seq = txn.seqnum();
+        put_all(&t, 0, 10).await;
+        flush().await;
+        assert!(view().core().last_l0_seq > txn_seq);
+        assert!(gaps.holds(&view(), txn_seq));
+        assert!(gaps.holds(&view(), txn_seq + 1));
+        assert!(!gaps.holds(&view(), txn_seq - 1));
+        drop(txn);
+        assert!(!gaps.holds(&view(), txn_seq));
+        t.db.close().await.unwrap();
     }
 
     #[derive(Clone, Copy, Debug)]
