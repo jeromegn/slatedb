@@ -125,6 +125,10 @@ pub(crate) struct TransactionState {
     /// mark that read-write conflict detection compares with the reads of other transactions.
     /// Used in both Snapshot Isolation and Serializable Snapshot Isolation.
     write_keys: WriteKeys,
+    /// Written keys whose write-write check ignores the commits at or before the sequence
+    /// number given here instead of at or before `started_seq` (see
+    /// `DbTransaction::validate_write_since`). Empty unless that is called.
+    write_since: HashMap<Bytes, u64>,
     /// The read keys of the transaction for read-write conflict detection, with every
     /// conflict domain. Only tests of the manager alone track reads here: transactions keep
     /// theirs, with their masks, in their own `ReadSet`.
@@ -167,6 +171,7 @@ impl TransactionState {
     /// Mark this transaction as committed with the given sequence number.
     fn mark_as_committed(&mut self, seq: u64) {
         self.committed_seq = Some(seq);
+        self.write_since = HashMap::new();
         // when a transaction state is tracked into `recent_committed_txns`, we don't need to
         // save the read keys and ranges, since they are not needed for conflict detection.
         self.read_keys.clear();
@@ -226,6 +231,7 @@ impl TransactionManager {
                 started_seq: seq,
                 committed_seq: None,
                 write_keys: WriteKeys::default(),
+                write_since: HashMap::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -240,6 +246,7 @@ impl TransactionManager {
             started_seq: seq,
             committed_seq: None,
             write_keys: WriteKeys::default(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         };
@@ -271,13 +278,30 @@ impl TransactionManager {
         self.track_write_marks(txn_id, marks.collect());
     }
 
+    /// [`Self::track_writes`] without sequence numbers.
+    #[cfg(test)]
+    pub(crate) fn track_write_marks(&self, txn_id: &Uuid, write_keys: WriteKeys) {
+        self.track_writes(txn_id, write_keys, HashMap::new());
+    }
+
     /// Track write keys for a transaction, each with the mark of what its write changed. This
     /// is used for conflict detection. Keys should be tracked before calling commit-related
-    /// methods.
-    pub(crate) fn track_write_marks(&self, txn_id: &Uuid, write_keys: WriteKeys) {
+    /// methods. The write-write check of a key of `since` ignores the commits at or before its
+    /// sequence number there (see `DbTransaction::validate_write_since`); a key given more
+    /// than once keeps the smallest.
+    pub(crate) fn track_writes(
+        &self,
+        txn_id: &Uuid,
+        write_keys: WriteKeys,
+        since: HashMap<Bytes, u64>,
+    ) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
             txn_state.track_write_marks(write_keys.0);
+            for (key, seq) in since {
+                let had = txn_state.write_since.entry(key).or_insert(seq);
+                *had = (*had).min(seq);
+            }
         }
     }
 
@@ -326,8 +350,11 @@ impl TransactionManager {
         };
 
         // both SI and SSI need to check write-write conflicts
-        let ww_conflict =
-            inner.has_write_write_conflict(&txn_state.write_keys, txn_state.started_seq);
+        let ww_conflict = inner.has_write_write_conflict_since(
+            &txn_state.write_keys,
+            txn_state.started_seq,
+            &txn_state.write_since,
+        );
         if ww_conflict {
             return true;
         }
@@ -393,6 +420,7 @@ impl TransactionManager {
             started_seq: committed_seq,
             committed_seq: Some(committed_seq),
             write_keys: keys.iter().cloned().collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         });
@@ -462,7 +490,19 @@ impl TransactionManagerInner {
         }
     }
 
+    #[cfg(test)]
     fn has_write_write_conflict(&self, write_keys: &WriteKeys, started_seq: u64) -> bool {
+        self.has_write_write_conflict_since(write_keys, started_seq, &HashMap::new())
+    }
+
+    /// The write-write check, in which a key of `since` conflicts only with commits after
+    /// both `started_seq` and its own sequence number there.
+    fn has_write_write_conflict_since(
+        &self,
+        write_keys: &WriteKeys,
+        started_seq: u64,
+        since: &HashMap<Bytes, u64>,
+    ) -> bool {
         // If the current transaction has no write operations, there's no write-write conflict
         if write_keys.is_empty() {
             return false;
@@ -477,9 +517,27 @@ impl TransactionManagerInner {
             // if another transaction committed after the current transaction started,
             // and they have overlapping write keys, then there's a conflict. The keys
             // conflict whatever their marks: a write replaces the whole value.
-            if other_committed_seq > started_seq && write_keys.meets_keys(&committed_txn.write_keys)
-            {
-                return true;
+            if other_committed_seq <= started_seq {
+                continue;
+            }
+            let other_keys = &committed_txn.write_keys;
+            if since.is_empty() {
+                if write_keys.meets_keys(other_keys) {
+                    return true;
+                }
+            } else {
+                // One probe per key of the smaller set, as `meets_keys` does.
+                let (small, large) = if write_keys.0.len() <= other_keys.0.len() {
+                    (&write_keys.0, &other_keys.0)
+                } else {
+                    (&other_keys.0, &write_keys.0)
+                };
+                if small.keys().any(|key| {
+                    large.contains_key(key)
+                        && since.get(key).is_none_or(|&seq| other_committed_seq > seq)
+                }) {
+                    return true;
+                }
             }
         }
 
@@ -660,6 +718,7 @@ mod tests {
             started_seq: 50,
             committed_seq: Some(80),
             write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -673,6 +732,7 @@ mod tests {
             started_seq: 50,
             committed_seq: Some(150),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -687,6 +747,7 @@ mod tests {
                 started_seq: 30,
                 committed_seq: Some(50),
                 write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+                write_since: HashMap::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -694,6 +755,7 @@ mod tests {
                 started_seq: 80,
                 committed_seq: Some(150),
                 write_keys: ["key2"].into_iter().map(Bytes::from).collect(),
+                write_since: HashMap::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -708,6 +770,7 @@ mod tests {
             started_seq: 30,
             committed_seq: Some(50),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -721,6 +784,7 @@ mod tests {
             started_seq: 100,
             committed_seq: Some(100),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -737,6 +801,7 @@ mod tests {
                 .into_iter()
                 .map(Bytes::from)
                 .collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -750,6 +815,7 @@ mod tests {
             started_seq: u64::MAX - 1,
             committed_seq: Some(u64::MAX),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -851,6 +917,7 @@ mod tests {
             started_seq: 100,
             committed_seq: Some(150),
             write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -885,6 +952,7 @@ mod tests {
             started_seq: 100,
             committed_seq: Some(100),
             write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -916,6 +984,7 @@ mod tests {
             started_seq: 100,
             committed_seq: Some(150),
             write_keys: ["existing_key", "key1", "key2"].into_iter().map(Bytes::from).collect(),
+            write_since: HashMap::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -1084,6 +1153,7 @@ mod tests {
                 started_seq: 50,
                 committed_seq: None, // This should not happen in practice but let's test
                 write_keys: WriteKeys::default(),
+                write_since: HashMap::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });
@@ -1864,6 +1934,77 @@ mod tests {
                 case.conflict,
                 "case '{}'",
                 case.name
+            );
+        }
+    }
+
+    /// `track_writes` with sequence numbers: a written key conflicts only with commits of it after both the
+    /// start and its sequence number; other keys of the transaction are checked from the
+    /// start; read-write checks are unchanged; a sequence number below the start changes
+    /// nothing; a key given twice keeps the smallest.
+    #[test]
+    fn test_write_since() {
+        let k = Bytes::from_static(b"k");
+        let j = Bytes::from_static(b"j");
+        // (keys a later writer commits after the first, at start + 1, then start + 2;
+        // since for "k" given in order; read "k"; conflict)
+        type Case<'a> = (&'a str, Vec<Vec<&'a Bytes>>, Vec<i64>, bool, bool);
+        let cases: Vec<Case<'_>> = vec![
+            ("commit at since", vec![vec![&k]], vec![1], false, false),
+            ("commit before since", vec![vec![&k]], vec![2], false, false),
+            (
+                "commit after since",
+                vec![vec![], vec![&k]],
+                vec![1],
+                false,
+                true,
+            ),
+            ("other key from start", vec![vec![&j]], vec![1], false, true),
+            ("since only for k", vec![vec![&k, &j]], vec![1], false, true),
+            ("read-write unchanged", vec![vec![&k]], vec![1], true, true),
+            ("below the start", vec![vec![&k]], vec![-3], false, true),
+            ("default", vec![vec![&k]], vec![], false, true),
+            (
+                "smallest kept",
+                vec![vec![&k], vec![&k]],
+                vec![2, 1],
+                false,
+                true,
+            ),
+            (
+                "smallest kept, at it",
+                vec![vec![&k], vec![&k]],
+                vec![2, 3],
+                false,
+                false,
+            ),
+        ];
+        for (name, commits, since, read, conflict) in cases {
+            let txn_manager = create_transaction_manager();
+            // Start at 10, so that a sequence number below the start exists.
+            txn_manager.track_recent_committed_write_batch(&HashSet::new(), 10);
+            let (txn_id, started_seq) = txn_manager.new_transaction();
+            assert_eq!(started_seq, 10);
+            txn_manager.track_write_keys(&txn_id, &HashSet::from([k.clone(), j.clone()]));
+            for (i, keys) in commits.iter().enumerate() {
+                let (writer, _) = txn_manager.new_transaction();
+                let keys: HashSet<Bytes> = keys.iter().map(|key| (*key).clone()).collect();
+                txn_manager.track_write_keys(&writer, &keys);
+                txn_manager.track_recent_committed_txn(&writer, started_seq + 1 + i as u64);
+            }
+            for offset in since {
+                let seq = (started_seq as i64 + offset) as u64;
+                let since = HashMap::from([(k.clone(), seq)]);
+                txn_manager.track_writes(&txn_id, WriteKeys::default(), since);
+            }
+            let mut reads = ReadSet::default();
+            if read {
+                reads.mark(k.clone(), ALL_CONFLICT_DOMAINS);
+            }
+            assert_eq!(
+                txn_manager.check_has_conflict_with_reads(&txn_id, &reads),
+                conflict,
+                "case '{name}'"
             );
         }
     }
