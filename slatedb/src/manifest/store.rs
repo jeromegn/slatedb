@@ -490,6 +490,41 @@ impl StoredManifest {
         Ok(checkpoint)
     }
 
+    /// Update several checkpoints in one manifest write: remove the checkpoints in `delete`, and
+    /// set the expiry time of the checkpoints in `refresh` to now plus `lifetime`. Skip the ids
+    /// that the manifest does not hold. Write nothing if no checkpoint changes.
+    pub(crate) async fn update_checkpoints(
+        &mut self,
+        delete: &[Uuid],
+        refresh: &[Uuid],
+        lifetime: Duration,
+    ) -> Result<(), SlateDBError> {
+        let clock = Arc::clone(&self.clock);
+        self.inner
+            .maybe_apply_update(|sr| {
+                let mut new_val = sr.object().clone();
+                let checkpoints = &mut new_val.core.checkpoints;
+                let before = checkpoints.len();
+                checkpoints.retain(|cp| !delete.contains(&cp.id));
+                let mut changed = checkpoints.len() != before;
+                let expire_time = clock.now() + lifetime;
+                for cp in checkpoints.iter_mut().filter(|cp| refresh.contains(&cp.id)) {
+                    cp.expire_time = Some(expire_time);
+                    changed = true;
+                }
+                let result: Result<Option<DirtyObject<Manifest>>, SlateDBError> = if changed {
+                    let mut dirty = sr.prepare_dirty()?;
+                    dirty.value = new_val;
+                    Ok(Some(dirty))
+                } else {
+                    Ok(None)
+                };
+                result
+            })
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn update(
         &mut self,
         dirty: DirtyObject<Manifest>,

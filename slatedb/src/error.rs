@@ -205,6 +205,11 @@ pub(crate) enum SlateDBError {
     CheckpointOutcomeUnknown(Uuid),
 
     #[error(
+        "reader snapshot expired: the reader checkpoint that protects its files lapsed, take a new snapshot. checkpoint_id=`{checkpoint_id}`, seq=`{seq}`"
+    )]
+    ReaderSnapshotExpired { checkpoint_id: Uuid, seq: u64 },
+
+    #[error(
         "unsupported {format_name} format version. supported_versions=`{supported_versions:?}`, actual_version=`{actual_version}`"
     )]
     InvalidVersion {
@@ -754,6 +759,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::FoyerError(err) => Error::unavailable(msg).with_source(Box::new(err)),
             SlateDBError::TransactionalObjectTimeout { .. } => Error::unavailable(msg),
             SlateDBError::WalUnavailable(src) => Error::unavailable(msg).with_source(Box::new(src)),
+            SlateDBError::ReaderSnapshotExpired { .. } => Error::unavailable(msg),
 
             // Invalid errors
             SlateDBError::InvalidCompressionCodec => Error::invalid(msg),
