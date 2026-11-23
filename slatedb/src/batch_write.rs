@@ -32,6 +32,7 @@ use futures::{FutureExt, StreamExt};
 use std::sync::Arc;
 use tracing::instrument;
 
+use crate::batch::WriteOp;
 use crate::config::WriteOptions;
 use crate::db_state::DbState;
 use crate::db_transaction::DbTransaction;
@@ -39,13 +40,14 @@ use crate::dispatcher::MessageHandler;
 use crate::mem_table::KVTable;
 use crate::memtable_flusher::CheckpointCursor;
 use crate::oracle::Oracle;
-use crate::types::RowEntry;
+use crate::types::{RowEntry, ValueDeletable};
 use crate::utils::WatchableOnceCellReader;
 use crate::wal::{FlushResultFuture, WalWriter};
 use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
 use bytes::Bytes;
 use parking_lot::RwLockWriteGuard;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::panic::AssertUnwindSafe;
 use tokio::sync::oneshot;
 
 pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
@@ -216,7 +218,7 @@ impl DbInner {
     #[instrument(level = "trace", skip_all, fields(batch_size = batch.op_count()))]
     async fn write_batch<'a>(
         &'a self,
-        batch: WriteBatch,
+        mut batch: WriteBatch,
         options: &WriteOptions,
         txn: Option<&DbTransaction>,
         mut wal_writer: Option<&mut (dyn WalWriter + 'static)>,
@@ -246,10 +248,16 @@ impl DbInner {
 
         // Check for transaction conflicts before proceeding with the write batch
         // if this batch is part of a transaction.
+        // A stale key with a recomputation does not conflict: its value is recomputed here,
+        // before the entries are extracted, so the WAL, the memtable and the range cache all
+        // get the recomputed value.
         if let Some(txn) = txn {
-            if self
+            let mut stale = HashMap::new();
+            let conflict = self
                 .txn_manager
-                .check_has_conflict_with_reads(&txn.id(), &txn.read_set())
+                .check_conflicts(&txn.id(), &txn.read_set(), &mut stale);
+            if conflict
+                || (!stale.is_empty() && !self.recompute_stale_writes(&mut batch, txn, &stale))
             {
                 return Ok(Err(SlateDBError::TransactionConflict));
             }
@@ -340,6 +348,59 @@ impl DbInner {
             WriteHandle::new_with_waiter(commit_seq, now, self.status_manager.durability_waiter());
 
         Ok(Ok(write_handle))
+    }
+
+    /// Replaces the put of each key of `stale` in `batch` with the key's recomputation
+    /// (`DbTransaction::set_write_recompute`) of its newest committed value. `stale` maps
+    /// each key to the sequence number of the newest commit of it that the conflict check
+    /// found. Runs on the batch writer, which applied every earlier commit to a memtable and
+    /// writes the memtables alone. Reads the memtables only, without I/O. Returns false, with
+    /// `batch` possibly changed, if a key cannot be recomputed: its newest version in memory
+    /// must be a value without a time to live, written at exactly that sequence number. A
+    /// version that was flushed is not found, or an older one is, so it refuses too.
+    fn recompute_stale_writes(
+        &self,
+        batch: &mut WriteBatch,
+        txn: &DbTransaction,
+        stale: &HashMap<Bytes, u64>,
+    ) -> bool {
+        // The memtables at one instant: every committed version not yet in an L0.
+        let tables: Vec<Arc<KVTable>> = {
+            let guard = self.state.read();
+            let cow = guard.state();
+            let imms = cow.imm_memtable.iter().map(|imm| imm.table());
+            std::iter::once(Arc::clone(guard.memtable().table()))
+                .chain(imms)
+                .collect()
+        };
+        let mut newest = Vec::with_capacity(stale.len());
+        for (key, &seq) in stale {
+            let entry = tables.iter().filter_map(|table| table.newest(key));
+            match entry.max_by_key(|entry| entry.seq) {
+                Some(RowEntry {
+                    value: ValueDeletable::Value(value),
+                    seq: found,
+                    expire_ts: None,
+                    ..
+                }) if found == seq => newest.push((key, value)),
+                _ => return false,
+            }
+        }
+        for (key, value) in newest {
+            let (Some(recompute), Some(ops)) = (txn.write_recompute(key), batch.ops.get_mut(key))
+            else {
+                return false;
+            };
+            let [WriteOp::Put(put, _)] = ops.as_mut_slice() else {
+                return false;
+            };
+            // A panic in the recomputation refuses the commit instead of ending the writer.
+            match std::panic::catch_unwind(AssertUnwindSafe(|| recompute(&value))) {
+                Ok(Some(recomputed)) if recomputed.len() <= u32::MAX as usize => *put = recomputed,
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn maybe_freeze_current_memtable(
