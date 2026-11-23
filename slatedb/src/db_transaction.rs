@@ -22,8 +22,9 @@ use crate::{DbReadOps, DbTransactionOps};
 
 /// The reads of a transaction that its commit checks for read-write conflicts: keys
 /// that a Serializable transaction read or that `mark_read` marked, and the ranges
-/// of its scans, taken at commit. Each key and each range carries the mask of the
-/// conflict domains that its reads used (see [`DbTransaction::mark_read_masked`]).
+/// that `mark_read_range` marked or that its scans read, taken at commit. Each key
+/// and each range carries the mask of the conflict domains that its reads used (see
+/// [`DbTransaction::mark_read_masked`]).
 #[derive(Default)]
 pub(crate) struct ReadSet {
     pub(crate) keys: HashMap<Bytes, u64>,
@@ -640,6 +641,57 @@ impl DbTransaction {
         Ok(())
     }
 
+    /// Mark a range of keys as read in some of their conflict domains, without reading it.
+    ///
+    /// The commit's conflict check treats `range` as it treats the range of a Serializable scan
+    /// with the conflict mask `mask` (see [`crate::config::ScanOptions::conflict_mask`]) that
+    /// ran to its end: a write of any key inside the range, existing or not, committed by
+    /// another transaction after this one started, conflicts with it if that write changed one
+    /// of the domains whose bits are set in `mask` (see [`DbTransaction::set_write_mask`]).
+    /// SlateDB reads nothing and does not interpret the bits. Like
+    /// [`DbTransaction::mark_read_masked`], and unlike a scan, which registers its range only in
+    /// a Serializable transaction, it counts whenever it is called, regardless of the isolation
+    /// level. A mask of 0 marks nothing. Neither does an empty range (such as `b"b"..b"a"` or
+    /// `b"a"..b"a"`), which holds no key that a write could change; a scan of an empty range
+    /// panics instead.
+    ///
+    /// ## Arguments
+    /// - `range`: the range of keys to mark as read, in any form that [`DbTransaction::scan`]
+    ///   takes
+    /// - `mask`: the conflict domains that the read of the range used
+    ///
+    /// ## Examples
+    /// ```rust
+    /// # async fn example() -> Result<(), slatedb::Error> {
+    /// # use std::sync::Arc;
+    /// # use slatedb::object_store::memory::InMemory;
+    /// use slatedb::{Db, IsolationLevel};
+    ///
+    /// # let object_store = Arc::new(InMemory::new());
+    /// # let db = Db::open("test_path", object_store).await?;
+    /// let txn = db.begin(IsolationLevel::Snapshot)?;
+    /// // The read of the keys from "row1" up to "row5", excluded, used the domain of bit 0.
+    /// txn.mark_read_range(b"row1"..b"row5", 0b1)?;
+    /// // The read of every key from "user/" on used every domain.
+    /// txn.mark_read_range(b"user/".as_slice().., u64::MAX)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn mark_read_range<T>(&self, range: T, mask: u64) -> Result<(), crate::Error>
+    where
+        T: ByteRangeBounds,
+    {
+        if mask == 0 {
+            return Ok(());
+        }
+        let start = range.start_bound().map(Bytes::copy_from_slice);
+        let end = range.end_bound().map(Bytes::copy_from_slice);
+        if let Some(range) = BytesRange::try_new(start, end) {
+            self.read_set.lock().ranges.push((range, mask));
+        }
+        Ok(())
+    }
+
     /// Set the conflict domains that this transaction's write of a key changes.
     ///
     /// By default a write of a key changes every conflict domain of the key, so any read of the
@@ -847,7 +899,8 @@ impl DbTransaction {
         // range; the conflict check in `TransactionManager` will then catch
         // any committed write whose key falls inside it.
         // The ranges are taken now: a scan that goes on after this call does not
-        // add to them.
+        // add to them. The ranges of `mark_read_range` are in the read set already,
+        // at every isolation level, and both checks below read the whole read set.
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
             let ranges: Vec<(BytesRange, u64)> = self
                 .range_trackers
@@ -2775,6 +2828,165 @@ mod tests {
         writer.put(b"row", b"from the writer").unwrap();
         writer.set_write_mask(b"row", 0b01).unwrap();
         writer.commit().await.unwrap();
+        reader.commit().await.unwrap();
+    }
+
+    fn assert_conflict(result: Result<Option<WriteHandle>, crate::Error>) {
+        assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::Transaction);
+    }
+
+    /// How a transaction of a test reads a range: `mark_read_range`, or a scan with the same
+    /// mask that runs to its end.
+    #[derive(Clone, Copy, Debug)]
+    enum RangeRead {
+        Marked,
+        Scanned,
+    }
+
+    /// The bounds of a range of keys, as the tests of `mark_read_range` pass them.
+    type KeyBounds<'a> = (std::ops::Bound<&'a [u8]>, std::ops::Bound<&'a [u8]>);
+
+    async fn read_range(txn: &DbTransaction, how: RangeRead, range: KeyBounds<'_>, mask: u64) {
+        match how {
+            RangeRead::Marked => txn.mark_read_range(range, mask).unwrap(),
+            RangeRead::Scanned => {
+                let options = ScanOptions::default().with_conflict_mask(Some(mask));
+                let mut iter = txn.scan_with_options(range, &options).await.unwrap();
+                while iter.next().await.unwrap().is_some() {}
+            }
+        }
+    }
+
+    /// A marked range conflicts with a concurrent committed write of a key inside it and not
+    /// with one outside it, with or without writes of its own, at every isolation level, as
+    /// `mark_read_masked` does for a key.
+    #[rstest]
+    #[case::snapshot(IsolationLevel::Snapshot)]
+    #[case::serializable(IsolationLevel::SerializableSnapshot)]
+    #[tokio::test]
+    async fn test_mark_read_range_conflicts(#[case] isolation: IsolationLevel) {
+        for (written, commits) in [("b", false), ("c", false), ("a", true), ("d", true)] {
+            for read_only in [false, true] {
+                let db = open_mask_db(&format!("mark_range_{isolation:?}_{written}")).await;
+                let reader = db.begin(isolation).unwrap();
+                reader.mark_read_range("b".."d", 0b01).unwrap();
+                if !read_only {
+                    reader.put(b"elsewhere", b"from the reader").unwrap();
+                }
+                db.put(written, b"from the writer").await.unwrap();
+                let result = reader.commit().await;
+                if commits {
+                    result.unwrap();
+                } else {
+                    assert_conflict(result);
+                }
+            }
+        }
+    }
+
+    /// Marking a range is the same, for the commit, as a Serializable scan of it with the same
+    /// mask that runs to its end. For ranges with every kind of bound on each side, a written
+    /// key at, inside and outside the bounds, masks that share a bit or not, and readers with
+    /// and without writes of their own, the transaction that marks the range and the one that
+    /// scans it both commit or both conflict, and they conflict exactly when the written key
+    /// is in the range and its write changed a domain of the read.
+    #[tokio::test]
+    async fn test_mark_read_range_equivalent_to_scan() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let (b, d): (&[u8], &[u8]) = (b"b", b"d");
+        let ranges: [KeyBounds<'_>; 9] = [
+            (Included(b), Included(d)),
+            (Included(b), Excluded(d)),
+            (Excluded(b), Included(d)),
+            (Excluded(b), Excluded(d)),
+            (Unbounded, Included(d)),
+            (Unbounded, Excluded(d)),
+            (Included(b), Unbounded),
+            (Excluded(b), Unbounded),
+            (Unbounded, Unbounded),
+        ];
+        // (the range's mask, the write's mask: every domain if `None`)
+        let masks = [
+            (ALL_CONFLICT_DOMAINS, None),
+            (0b01, None),
+            (0b01, Some(0b10)),
+            (0b11, Some(0b10)),
+        ];
+        let db = open_mask_db("range_equivalence").await;
+        for range in ranges {
+            for written in [b"a", b"b", b"c", b"d", b"e"] {
+                let written: &[u8] = written;
+                for (read_mask, write_mask) in masks {
+                    for read_only in [false, true] {
+                        let inside = std::ops::RangeBounds::<&[u8]>::contains(&range, &written);
+                        let commits =
+                            !inside || write_mask.is_some_and(|mask: u64| mask & read_mask == 0);
+                        for how in [RangeRead::Marked, RangeRead::Scanned] {
+                            let reader = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+                            read_range(&reader, how, range, read_mask).await;
+                            if !read_only {
+                                reader.put(b"z", b"from the reader").unwrap();
+                            }
+                            let writer = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+                            writer.put(written, b"from the writer").unwrap();
+                            if let Some(mask) = write_mask {
+                                writer.set_write_mask(written, mask).unwrap();
+                            }
+                            writer.commit().await.unwrap();
+                            let result = reader.commit().await;
+                            assert_eq!(
+                                result.is_ok(),
+                                commits,
+                                "{how:?} {range:?}, written {written:?}, read mask {read_mask:#b}, \
+                                 write mask {write_mask:?}, read-only {read_only}: {result:?}"
+                            );
+                            if !commits {
+                                assert_conflict(result);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A mask of 0 marks nothing, nor does an empty range, and neither panics. A scan in a
+    /// Snapshot transaction registers nothing, where a marked range does
+    /// (`test_mark_read_range_conflicts`).
+    #[tokio::test]
+    async fn test_mark_read_range_marks_nothing() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let db = open_mask_db("mark_range_nothing").await;
+        let reader = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        reader.mark_read_range(.., 0).unwrap();
+        reader.mark_read_range("b".."d", 0).unwrap();
+        reader
+            .mark_read_range("c".."c", ALL_CONFLICT_DOMAINS)
+            .unwrap();
+        reader
+            .mark_read_range("d"..="b", ALL_CONFLICT_DOMAINS)
+            .unwrap();
+        reader
+            .mark_read_range((Excluded("c"), Excluded("c")), ALL_CONFLICT_DOMAINS)
+            .unwrap();
+        reader
+            .mark_read_range((Excluded("c"), Included("c")), ALL_CONFLICT_DOMAINS)
+            .unwrap();
+        assert!(reader.read_set().ranges.is_empty());
+        reader.put(b"elsewhere", b"from the reader").unwrap();
+        db.put(b"c", b"from the writer").await.unwrap();
+        reader.commit().await.unwrap();
+
+        let reader = db.begin(IsolationLevel::Snapshot).unwrap();
+        read_range(
+            &reader,
+            RangeRead::Scanned,
+            (Unbounded, Unbounded),
+            ALL_CONFLICT_DOMAINS,
+        )
+        .await;
+        reader.put(b"elsewhere", b"from the reader").unwrap();
+        db.put(b"c", b"from the writer").await.unwrap();
         reader.commit().await.unwrap();
     }
 }
