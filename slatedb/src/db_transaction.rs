@@ -54,7 +54,13 @@ struct WriteTracking {
     masks: HashMap<Bytes, u64>,
     /// The sequence numbers from `validate_write_since`, by key.
     since: HashMap<Bytes, u64>,
+    /// The recomputations from `set_write_recompute`, by key.
+    recompute: HashMap<Bytes, WriteRecompute>,
 }
+
+/// A recomputation of a written value from the newest committed value of its key, for
+/// [`DbTransaction::set_write_recompute`]. `None` refuses the commit.
+pub type WriteRecompute = Arc<dyn Fn(&[u8]) -> Option<Bytes> + Send + Sync>;
 
 /// A database transaction that provides atomic read-write operations with
 /// configurable isolation levels. This is the main interface for transactional
@@ -778,6 +784,46 @@ impl DbTransaction {
         Ok(())
     }
 
+    /// Recompute the write of a key at commit if the value written is stale.
+    ///
+    /// `recompute` maps the newest committed value of the key to the value to store. The
+    /// caller promises that it is pure, that the value it put for the key is `recompute` of the
+    /// version that its write-write check starts from (see
+    /// [`DbTransaction::validate_write_since`]; without it, the version in the transaction's
+    /// snapshot), and that storing `recompute` of a newer version instead keeps the transaction
+    /// correct: everything else that it read of the key is marked read (for example its
+    /// existence with [`DbTransaction::mark_read_masked`]), and its write mask covers
+    /// what `recompute` changes.
+    ///
+    /// At commit, where the write-write check of the key finds a commit of the key, the commit
+    /// does not conflict for that reason. The batch writer then reads the newest committed
+    /// version of the key, in memory only, and stores `recompute` of it in place of the value
+    /// put, with the same put options. The commit fails with the ordinary transaction conflict
+    /// if that version is no longer in memory, is a delete, a merge operand or a value with a
+    /// time to live, if `recompute` returns `None` or panics, or if the key's write in the
+    /// transaction is not a single put. Every other check is unchanged. `recompute` runs on the
+    /// batch writer, in commit order: it must be cheap and must not block. A later call for the
+    /// key replaces the recomputation. A key passed to [`DbTransaction::unmark_write`] has no
+    /// write-write check, so it is never recomputed.
+    ///
+    /// ## Arguments
+    /// - `key`: the key that the transaction writes
+    /// - `recompute`: the value to store, from the newest committed value of the key
+    pub fn set_write_recompute<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        recompute: WriteRecompute,
+    ) -> Result<(), crate::Error> {
+        let key = Bytes::copy_from_slice(key.as_ref());
+        self.write_tracking.write().recompute.insert(key, recompute);
+        Ok(())
+    }
+
+    /// The recomputation of the write of `key` (see [`Self::set_write_recompute`]).
+    pub(crate) fn write_recompute(&self, key: &Bytes) -> Option<WriteRecompute> {
+        self.write_tracking.read().recompute.get(key).cloned()
+    }
+
     /// Mark written keys as untracked for conflict detection.
     ///
     /// Keys marked with this method are still written atomically with the rest of the
@@ -964,7 +1010,7 @@ impl DbTransaction {
 
         // Track only write keys that were not explicitly unmarked, each with the conflict
         // domains that its write changes: every domain unless a mask was set.
-        let (tracked_write_keys, since): (WriteKeys, _) = {
+        let (tracked_write_keys, since, recompute): (WriteKeys, _, _) = {
             let tracking = self.write_tracking.read();
             let keys = write_batch
                 .keys()
@@ -978,10 +1024,11 @@ impl DbTransaction {
                     (key, mark)
                 })
                 .collect();
-            (keys, tracking.since.clone())
+            let recompute = tracking.recompute.keys().cloned().collect();
+            (keys, tracking.since.clone(), recompute)
         };
         self.txn_manager
-            .track_writes(&self.txn_id, tracked_write_keys, since);
+            .track_writes(&self.txn_id, tracked_write_keys, since, recompute);
 
         // Submit the WriteBatch to the database for processing. The batch is sent to a
         // dedicated background task (in batch_write.rs) that processes all WriteBatches
@@ -3143,5 +3190,416 @@ mod tests {
             second.commit().await.unwrap_err().kind(),
             crate::ErrorKind::Transaction
         );
+    }
+
+    /// A recomputation that adds `amount` to a counter. `None` if the value is not one.
+    fn add_by(amount: u64) -> WriteRecompute {
+        Arc::new(move |value: &[u8]| {
+            let value = u64::from_le_bytes(value.try_into().ok()?);
+            Some(Bytes::copy_from_slice(&(value + amount).to_le_bytes()))
+        })
+    }
+
+    /// Adds `amount` to the counter `key` in `txn` as a caller of `set_write_recompute` does:
+    /// from its newest committed value, validated since that version, with a recomputation
+    /// that adds `amount`, a write mask of bit 1 and, if `mark`, the key's existence (bit 0)
+    /// marked read. Returns the sequence number of the version read.
+    async fn add_recomputed(
+        db: &crate::Db,
+        txn: &DbTransaction,
+        key: &[u8],
+        amount: u64,
+        mark: bool,
+    ) -> u64 {
+        let newest = db.get_key_value(key).await.unwrap().unwrap();
+        txn.put(key, (counter(&newest.value) + amount).to_le_bytes())
+            .unwrap();
+        txn.validate_write_since(key, newest.seq).unwrap();
+        txn.set_write_recompute(key, add_by(amount)).unwrap();
+        txn.set_write_mask(key, 0b10).unwrap();
+        if mark {
+            txn.mark_read_masked([key], 0b01).unwrap();
+        }
+        newest.seq
+    }
+
+    async fn stored(db: &crate::Db, key: &[u8]) -> u64 {
+        counter(&db.get(key).await.unwrap().unwrap())
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        Read(usize),
+        Commit(usize),
+        Put,
+    }
+
+    /// Every order of a read then a commit for each of `txns` transactions, with one
+    /// non-transactional put among them if `put`.
+    fn step_orders(txns: usize, put: bool) -> Vec<Vec<Step>> {
+        fn extend(
+            prefix: &mut Vec<Step>,
+            state: &mut [u8],
+            put: &mut bool,
+            out: &mut Vec<Vec<Step>>,
+        ) {
+            let mut last = true;
+            for i in 0..state.len() {
+                let step = match state[i] {
+                    0 => Step::Read(i),
+                    1 => Step::Commit(i),
+                    _ => continue,
+                };
+                last = false;
+                state[i] += 1;
+                prefix.push(step);
+                extend(prefix, state, put, out);
+                prefix.pop();
+                state[i] -= 1;
+            }
+            if *put {
+                last = false;
+                *put = false;
+                prefix.push(Step::Put);
+                extend(prefix, state, put, out);
+                prefix.pop();
+                *put = true;
+            }
+            if last {
+                out.push(prefix.clone());
+            }
+        }
+        let mut out = Vec::new();
+        extend(&mut Vec::new(), &mut vec![0; txns], &mut { put }, &mut out);
+        out
+    }
+
+    /// Two or three transactions add to one counter with recomputations, in every order of
+    /// their reads and commits, with or without a non-transactional put among them, at both
+    /// isolation levels. Every one commits and the counter holds every addition made after the
+    /// put. A transaction that marked the row's existence read and commits after the put
+    /// conflicts: read-write checks are unchanged.
+    #[rstest]
+    #[case::snapshot(IsolationLevel::Snapshot)]
+    #[case::serializable(IsolationLevel::SerializableSnapshot)]
+    #[tokio::test]
+    async fn test_write_recompute_interleavings(#[case] isolation: IsolationLevel) {
+        let db = open_mask_db(&format!("recompute_orders_{isolation:?}")).await;
+        let mut rounds = 0;
+        for (txns, put) in [(2, false), (2, true), (3, false), (3, true)] {
+            for mark in [false, true] {
+                for steps in step_orders(txns, put) {
+                    db.put(b"row", 100u64.to_le_bytes()).await.unwrap();
+                    let mut open: Vec<Option<DbTransaction>> = (0..txns)
+                        .map(|_| Some(db.begin(isolation).unwrap()))
+                        .collect();
+                    let (mut expected, mut put_done) = (100, false);
+                    for step in &steps {
+                        match *step {
+                            Step::Read(i) => {
+                                let txn = open[i].as_ref().unwrap();
+                                add_recomputed(&db, txn, b"row", 1 << i, mark).await;
+                            }
+                            Step::Put => {
+                                db.put(b"row", 1000u64.to_le_bytes()).await.unwrap();
+                                (expected, put_done) = (1000, true);
+                            }
+                            Step::Commit(i) => {
+                                let result = open[i].take().unwrap().commit().await;
+                                if mark && put_done {
+                                    assert_conflict(result);
+                                } else {
+                                    result.unwrap_or_else(|err| {
+                                        panic!("{steps:?}, mark {mark}, commit {i}: {err:?}")
+                                    });
+                                    expected += 1 << i;
+                                }
+                            }
+                        }
+                    }
+                    let got = stored(&db, b"row").await;
+                    assert_eq!(got, expected, "{steps:?}, mark {mark}");
+                    rounds += 1;
+                }
+            }
+        }
+        assert_eq!(rounds, 2 * (6 + 30 + 90 + 630));
+    }
+
+    /// A stale recomputed key conflicts when its newest version is a delete, when the
+    /// recomputation returns `None` or panics, or when the transaction deletes the key instead
+    /// of putting it. Not stale, the caller's put or delete stands and nothing is recomputed.
+    #[tokio::test]
+    async fn test_write_recompute_refusals() {
+        let db = open_mask_db("recompute_refusals").await;
+        db.put(b"row", 100u64.to_le_bytes()).await.unwrap();
+
+        // A concurrent delete.
+        let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, false).await;
+        db.delete(b"row").await.unwrap();
+        assert_conflict(txn.commit().await);
+        assert_eq!(db.get(b"row").await.unwrap(), None);
+        db.put(b"row", 100u64.to_le_bytes()).await.unwrap();
+
+        // A recomputation that cannot, or panics; the writer still runs afterwards.
+        let refusing: WriteRecompute = Arc::new(|_: &[u8]| None);
+        let panicking: WriteRecompute = Arc::new(|_: &[u8]| panic!("a recomputation panicked"));
+        for recompute in [refusing, panicking] {
+            let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+            add_recomputed(&db, &txn, b"row", 1, false).await;
+            txn.set_write_recompute(b"row", Arc::clone(&recompute))
+                .unwrap();
+            db.put(b"row", 200u64.to_le_bytes()).await.unwrap();
+            assert_conflict(txn.commit().await);
+            assert_eq!(stored(&db, b"row").await, 200);
+            // Not stale: the caller's value stands, and the recomputation is not called.
+            let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+            add_recomputed(&db, &txn, b"row", 1, false).await;
+            txn.set_write_recompute(b"row", recompute).unwrap();
+            txn.commit().await.unwrap();
+            assert_eq!(stored(&db, b"row").await, 201);
+        }
+
+        // A delete of the key in place of the put: the recomputation is void.
+        let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, false).await;
+        txn.delete(b"row").unwrap();
+        db.put(b"row", 300u64.to_le_bytes()).await.unwrap();
+        assert_conflict(txn.commit().await);
+        assert_eq!(stored(&db, b"row").await, 300);
+        let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, false).await;
+        txn.delete(b"row").unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(db.get(b"row").await.unwrap(), None);
+    }
+
+    /// Other keys of a transaction with a recomputed key: an ordinary key that conflicts makes
+    /// the commit conflict, with nothing stored; a second recomputed key that is not stale
+    /// keeps the caller's value while the stale one is recomputed; a key written twice is
+    /// recomputed from its last put; an unmarked key is never recomputed.
+    #[tokio::test]
+    async fn test_write_recompute_with_other_keys() {
+        let db = open_mask_db("recompute_other_keys").await;
+        for key in [&b"row"[..], b"row2", b"other"] {
+            db.put(key, 100u64.to_le_bytes()).await.unwrap();
+        }
+
+        // A stale recomputed key and a conflicting ordinary key.
+        let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, false).await;
+        txn.put(b"other", 7u64.to_le_bytes()).unwrap();
+        let concurrent = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &concurrent, b"row", 10, false).await;
+        concurrent.put(b"other", 8u64.to_le_bytes()).unwrap();
+        concurrent.commit().await.unwrap();
+        assert_conflict(txn.commit().await);
+        assert_eq!(stored(&db, b"row").await, 110);
+        assert_eq!(stored(&db, b"other").await, 8);
+
+        // Two recomputed keys, one stale.
+        let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, true).await;
+        add_recomputed(&db, &txn, b"row2", 2, true).await;
+        let concurrent = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        add_recomputed(&db, &concurrent, b"row", 10, true).await;
+        concurrent.commit().await.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(stored(&db, b"row").await, 121);
+        assert_eq!(stored(&db, b"row2").await, 102);
+
+        // A key written twice: the last put counts, and is recomputed.
+        let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+        txn.put(b"row", 5u64.to_le_bytes()).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, false).await;
+        db.put(b"row", 200u64.to_le_bytes()).await.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(stored(&db, b"row").await, 201);
+
+        // An unmarked key has no write-write check: the caller's value stands, as for any
+        // unmarked write.
+        let txn = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &txn, b"row", 1, false).await;
+        txn.unmark_write([b"row"]).unwrap();
+        db.put(b"row", 300u64.to_le_bytes()).await.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(stored(&db, b"row").await, 202);
+    }
+
+    /// A serializable reader of the recomputed key in the write's domains conflicts with the
+    /// recomputed write; one that read other domains does not.
+    #[rstest]
+    #[case::write_domain(0b10, false)]
+    #[case::other_domain(0b01, true)]
+    #[tokio::test]
+    async fn test_write_recompute_readers(#[case] read_mask: u64, #[case] commits: bool) {
+        let db = open_mask_db(&format!("recompute_readers_{read_mask}")).await;
+        db.put(b"row", 100u64.to_le_bytes()).await.unwrap();
+        let reader = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        let options = ReadOptions::default().with_conflict_mask(Some(read_mask));
+        reader.get_with_options(b"row", &options).await.unwrap();
+        reader.put(b"other", b"from the reader").unwrap();
+        let first = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        let second = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        add_recomputed(&db, &first, b"row", 1, true).await;
+        add_recomputed(&db, &second, b"row", 2, true).await;
+        first.commit().await.unwrap();
+        // Stale: recomputed.
+        second.commit().await.unwrap();
+        assert_eq!(stored(&db, b"row").await, 103);
+        let result = reader.commit().await;
+        if commits {
+            result.unwrap();
+        } else {
+            assert_conflict(result);
+        }
+    }
+
+    /// Flushes the memtables to L0, so that nothing written so far is in memory.
+    async fn flush_memtables(db: &crate::Db) {
+        let flush = crate::config::FlushOptions {
+            flush_type: crate::config::FlushType::MemTable,
+        };
+        db.flush_with_options(flush).await.unwrap();
+    }
+
+    /// A stale recomputed key whose newest version was flushed out of memory conflicts, and
+    /// the addition already committed stays. A newer commit of the key in memory is
+    /// recomputed from again.
+    #[tokio::test]
+    async fn test_write_recompute_after_flush() {
+        let db = open_mask_db("recompute_flush").await;
+        db.put(b"row", 100u64.to_le_bytes()).await.unwrap();
+        let first = db.begin(IsolationLevel::Snapshot).unwrap();
+        let second = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &first, b"row", 1, false).await;
+        add_recomputed(&db, &second, b"row", 2, false).await;
+        first.commit().await.unwrap();
+        flush_memtables(&db).await;
+        {
+            let state = db.inner.state.read();
+            assert!(state.memtable().is_empty());
+            assert!(state.state().imm_memtable.is_empty());
+        }
+        assert_conflict(second.commit().await);
+        assert_eq!(stored(&db, b"row").await, 101);
+
+        let first = db.begin(IsolationLevel::Snapshot).unwrap();
+        let second = db.begin(IsolationLevel::Snapshot).unwrap();
+        add_recomputed(&db, &first, b"row", 10, false).await;
+        add_recomputed(&db, &second, b"row", 20, false).await;
+        flush_memtables(&db).await;
+        first.commit().await.unwrap();
+        second.commit().await.unwrap();
+        assert_eq!(stored(&db, b"row").await, 131);
+    }
+
+    /// Tasks add random amounts to a few counters with recomputations, at both isolation
+    /// levels, while another task flushes the memtables. Every counter ends as its start plus
+    /// the amounts of the committed transactions, and most commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_write_recompute_random_additions() {
+        const TASKS: u64 = 8;
+        const TRANSACTIONS: usize = 100;
+        const KEYS: [&[u8]; 3] = [b"c0", b"c1", b"c2"];
+        // Many L0s and no compactor: flushes never wait for a compaction.
+        let mut settings = test_db_options(0, 64 * 1024 * 1024, None);
+        settings.l0_max_ssts = 100_000;
+        settings.l0_max_ssts_per_key = 100_000;
+        let db = crate::Db::builder("recompute_random", Arc::new(InMemory::new()))
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        let db = Arc::new(db);
+        for key in KEYS {
+            db.put(key, 1000u64.to_le_bytes()).await.unwrap();
+        }
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flusher = {
+            let (db, done) = (Arc::clone(&db), Arc::clone(&done));
+            tokio::spawn(async move {
+                let mut flushes = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    flush_memtables(&db).await;
+                    flushes += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                flushes
+            })
+        };
+        let mut tasks = Vec::new();
+        for task in 0..TASKS {
+            let db = Arc::clone(&db);
+            tasks.push(tokio::spawn(async move {
+                let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (task + 1);
+                let mut next = move |n: u64| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state % n
+                };
+                let (mut amounts, mut commits, mut aborts) = ([0u64; 3], 0, 0);
+                for _ in 0..TRANSACTIONS {
+                    let isolation = if next(2) == 0 {
+                        IsolationLevel::Snapshot
+                    } else {
+                        IsolationLevel::SerializableSnapshot
+                    };
+                    let txn = db.begin(isolation).unwrap();
+                    let first = next(3) as usize;
+                    let keys = if next(2) == 0 {
+                        vec![first]
+                    } else {
+                        vec![first, (first + 1 + next(2) as usize) % 3]
+                    };
+                    let mut added = [0u64; 3];
+                    for &k in &keys {
+                        let amount = 1 + next(100);
+                        add_recomputed(&db, &txn, KEYS[k], amount, true).await;
+                        added[k] += amount;
+                        for _ in 0..next(3) {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    // Sometimes a flush between the reads and the commit too.
+                    if next(8) == 0 {
+                        flush_memtables(&db).await;
+                    }
+                    match txn.commit().await {
+                        Ok(_) => {
+                            commits += 1;
+                            for (total, amount) in amounts.iter_mut().zip(added) {
+                                *total += amount;
+                            }
+                        }
+                        Err(err) => {
+                            assert_eq!(err.kind(), crate::ErrorKind::Transaction);
+                            aborts += 1;
+                        }
+                    }
+                }
+                (amounts, commits, aborts)
+            }));
+        }
+        let (mut amounts, mut commits, mut aborts) = ([0u64; 3], 0, 0);
+        for task in tasks {
+            let (added, c, a) = task.await.unwrap();
+            for (total, amount) in amounts.iter_mut().zip(added) {
+                *total += amount;
+            }
+            commits += c;
+            aborts += a;
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let flushes = flusher.await.unwrap();
+        for (k, key) in KEYS.iter().enumerate() {
+            assert_eq!(stored(&db, key).await, 1000 + amounts[k], "counter {k}");
+        }
+        eprintln!(
+            "recomputed random additions: {commits} committed, {aborts} aborted, {flushes} flushes"
+        );
+        assert!(commits > aborts, "{commits} committed, {aborts} aborted");
     }
 }
