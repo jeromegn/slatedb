@@ -129,6 +129,10 @@ pub(crate) struct TransactionState {
     /// number given here instead of at or before `started_seq` (see
     /// `DbTransaction::validate_write_since`). Empty unless that is called.
     write_since: HashMap<Bytes, u64>,
+    /// Written keys with a recomputation (`DbTransaction::set_write_recompute`): a commit of
+    /// one after the point where its write-write check starts makes it stale instead of
+    /// conflicting. Empty unless that is called.
+    write_recompute: HashSet<Bytes>,
     /// The read keys of the transaction for read-write conflict detection, with every
     /// conflict domain. Only tests of the manager alone track reads here: transactions keep
     /// theirs, with their masks, in their own `ReadSet`.
@@ -172,6 +176,7 @@ impl TransactionState {
     fn mark_as_committed(&mut self, seq: u64) {
         self.committed_seq = Some(seq);
         self.write_since = HashMap::new();
+        self.write_recompute = HashSet::new();
         // when a transaction state is tracked into `recent_committed_txns`, we don't need to
         // save the read keys and ranges, since they are not needed for conflict detection.
         self.read_keys.clear();
@@ -232,6 +237,7 @@ impl TransactionManager {
                 committed_seq: None,
                 write_keys: WriteKeys::default(),
                 write_since: HashMap::new(),
+                write_recompute: HashSet::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -247,6 +253,7 @@ impl TransactionManager {
             committed_seq: None,
             write_keys: WriteKeys::default(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         };
@@ -281,19 +288,21 @@ impl TransactionManager {
     /// [`Self::track_writes`] without sequence numbers.
     #[cfg(test)]
     pub(crate) fn track_write_marks(&self, txn_id: &Uuid, write_keys: WriteKeys) {
-        self.track_writes(txn_id, write_keys, HashMap::new());
+        self.track_writes(txn_id, write_keys, HashMap::new(), HashSet::new());
     }
 
     /// Track write keys for a transaction, each with the mark of what its write changed. This
     /// is used for conflict detection. Keys should be tracked before calling commit-related
     /// methods. The write-write check of a key of `since` ignores the commits at or before its
     /// sequence number there (see `DbTransaction::validate_write_since`); a key given more
-    /// than once keeps the smallest.
+    /// than once keeps the smallest. A key of `recompute` that the check finds committed
+    /// is stale instead of conflicting (see [`Self::check_conflicts`]).
     pub(crate) fn track_writes(
         &self,
         txn_id: &Uuid,
         write_keys: WriteKeys,
         since: HashMap<Bytes, u64>,
+        recompute: HashSet<Bytes>,
     ) {
         let mut inner = self.inner.write();
         if let Some(txn_state) = inner.active_txns.get_mut(txn_id) {
@@ -302,6 +311,7 @@ impl TransactionManager {
                 let had = txn_state.write_since.entry(key).or_insert(seq);
                 *had = (*had).min(seq);
             }
+            txn_state.write_recompute.extend(recompute);
         }
     }
 
@@ -341,8 +351,24 @@ impl TransactionManager {
 
     /// Check for conflicts as [`Self::check_has_conflict`] does, with `reads`, the
     /// transaction's own read set, as its reads. The caller holds the guard of
-    /// `reads`, so the check sees every read recorded before the commit.
+    /// `reads`, so the check sees every read recorded before the commit. A stale
+    /// recomputed key (see [`Self::check_conflicts`]) counts as a conflict here.
     pub(crate) fn check_has_conflict_with_reads(&self, txn_id: &Uuid, reads: &ReadSet) -> bool {
+        let mut stale = HashMap::new();
+        self.check_conflicts(txn_id, reads, &mut stale) || !stale.is_empty()
+    }
+
+    /// [`Self::check_has_conflict_with_reads`], except that a written key with a recomputation
+    /// that a commit after the start of its write-write check wrote does not conflict: it goes
+    /// into `stale`, with the sequence number of the newest such commit, which wrote the
+    /// newest committed version of the key unless an untracked write came after it. `stale`
+    /// is complete only if this returns false.
+    pub(crate) fn check_conflicts(
+        &self,
+        txn_id: &Uuid,
+        reads: &ReadSet,
+        stale: &mut HashMap<Bytes, u64>,
+    ) -> bool {
         let inner = self.inner.read();
         let txn_state = match inner.active_txns.get(txn_id) {
             None => return false,
@@ -354,6 +380,8 @@ impl TransactionManager {
             &txn_state.write_keys,
             txn_state.started_seq,
             &txn_state.write_since,
+            &txn_state.write_recompute,
+            stale,
         );
         if ww_conflict {
             return true;
@@ -421,6 +449,7 @@ impl TransactionManager {
             committed_seq: Some(committed_seq),
             write_keys: keys.iter().cloned().collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         });
@@ -492,16 +521,26 @@ impl TransactionManagerInner {
 
     #[cfg(test)]
     fn has_write_write_conflict(&self, write_keys: &WriteKeys, started_seq: u64) -> bool {
-        self.has_write_write_conflict_since(write_keys, started_seq, &HashMap::new())
+        let mut stale = HashMap::new();
+        self.has_write_write_conflict_since(
+            write_keys,
+            started_seq,
+            &HashMap::new(),
+            &HashSet::new(),
+            &mut stale,
+        )
     }
 
     /// The write-write check, in which a key of `since` conflicts only with commits after
-    /// both `started_seq` and its own sequence number there.
+    /// both `started_seq` and its own sequence number there, and a key of `recompute` that
+    /// would conflict goes into `stale` instead, with the newest such commit's sequence number.
     fn has_write_write_conflict_since(
         &self,
         write_keys: &WriteKeys,
         started_seq: u64,
         since: &HashMap<Bytes, u64>,
+        recompute: &HashSet<Bytes>,
+        stale: &mut HashMap<Bytes, u64>,
     ) -> bool {
         // If the current transaction has no write operations, there's no write-write conflict
         if write_keys.is_empty() {
@@ -521,9 +560,30 @@ impl TransactionManagerInner {
                 continue;
             }
             let other_keys = &committed_txn.write_keys;
-            if since.is_empty() {
+            if since.is_empty() && recompute.is_empty() {
                 if write_keys.meets_keys(other_keys) {
                     return true;
+                }
+            } else if !recompute.is_empty() {
+                // As below, but a stale key with a recomputation does not end the check.
+                let (small, large) = if write_keys.0.len() <= other_keys.0.len() {
+                    (&write_keys.0, &other_keys.0)
+                } else {
+                    (&other_keys.0, &write_keys.0)
+                };
+                for key in small.keys() {
+                    if !large.contains_key(key)
+                        || since
+                            .get(key)
+                            .is_some_and(|&seq| other_committed_seq <= seq)
+                    {
+                        continue;
+                    }
+                    if !recompute.contains(key) {
+                        return true;
+                    }
+                    let newest = stale.entry(key.clone()).or_insert(other_committed_seq);
+                    *newest = (*newest).max(other_committed_seq);
                 }
             } else {
                 // One probe per key of the smaller set, as `meets_keys` does.
@@ -719,6 +779,7 @@ mod tests {
             committed_seq: Some(80),
             write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -733,6 +794,7 @@ mod tests {
             committed_seq: Some(150),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -748,6 +810,7 @@ mod tests {
                 committed_seq: Some(50),
                 write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
                 write_since: HashMap::new(),
+                write_recompute: HashSet::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -756,6 +819,7 @@ mod tests {
                 committed_seq: Some(150),
                 write_keys: ["key2"].into_iter().map(Bytes::from).collect(),
                 write_since: HashMap::new(),
+                write_recompute: HashSet::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             },
@@ -771,6 +835,7 @@ mod tests {
             committed_seq: Some(50),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -785,6 +850,7 @@ mod tests {
             committed_seq: Some(100),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -802,6 +868,7 @@ mod tests {
                 .map(Bytes::from)
                 .collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -816,6 +883,7 @@ mod tests {
             committed_seq: Some(u64::MAX),
             write_keys: ["key1"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }],
@@ -918,6 +986,7 @@ mod tests {
             committed_seq: Some(150),
             write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -953,6 +1022,7 @@ mod tests {
             committed_seq: Some(100),
             write_keys: ["key1", "key2"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -985,6 +1055,7 @@ mod tests {
             committed_seq: Some(150),
             write_keys: ["existing_key", "key1", "key2"].into_iter().map(Bytes::from).collect(),
             write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
             read_keys: HashSet::new(),
             read_ranges: Vec::new(),
         }),
@@ -1154,6 +1225,7 @@ mod tests {
                 committed_seq: None, // This should not happen in practice but let's test
                 write_keys: WriteKeys::default(),
                 write_since: HashMap::new(),
+                write_recompute: HashSet::new(),
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });
@@ -1995,7 +2067,7 @@ mod tests {
             for offset in since {
                 let seq = (started_seq as i64 + offset) as u64;
                 let since = HashMap::from([(k.clone(), seq)]);
-                txn_manager.track_writes(&txn_id, WriteKeys::default(), since);
+                txn_manager.track_writes(&txn_id, WriteKeys::default(), since, HashSet::new());
             }
             let mut reads = ReadSet::default();
             if read {
@@ -2004,6 +2076,79 @@ mod tests {
             assert_eq!(
                 txn_manager.check_has_conflict_with_reads(&txn_id, &reads),
                 conflict,
+                "case '{name}'"
+            );
+        }
+    }
+
+    /// A written key with a recomputation that a commit after its check's start wrote is
+    /// stale, with the newest such commit's sequence number, instead of conflicting; other
+    /// keys and reads still conflict; `check_has_conflict_with_reads` counts a stale key as a
+    /// conflict.
+    #[test]
+    fn test_write_recompute_stale_keys() {
+        let k = Bytes::from_static(b"k");
+        let j = Bytes::from_static(b"j");
+        // (keys committed at start + 1, + 2, ...; since for "k" as an offset from the start;
+        // read "k"; conflict; stale "k" at offset)
+        type Case<'a> = (&'a str, Vec<Vec<&'a Bytes>>, i64, bool, bool, Option<u64>);
+        let cases: Vec<Case<'_>> = vec![
+            ("nothing committed", vec![], 0, false, false, None),
+            ("other commits", vec![vec![]], 0, false, false, None),
+            ("at since", vec![vec![&k]], 1, false, false, None),
+            ("after since", vec![vec![&k]], 0, false, false, Some(1)),
+            (
+                "newest wins",
+                vec![vec![&k], vec![], vec![&k]],
+                0,
+                false,
+                false,
+                Some(3),
+            ),
+            (
+                "since below start",
+                vec![vec![&k]],
+                -3,
+                false,
+                false,
+                Some(1),
+            ),
+            ("other key", vec![vec![&k], vec![&j]], 0, false, true, None),
+            ("read", vec![vec![&k]], 0, true, true, None),
+        ];
+        for (name, commits, since, read, conflict, stale_at) in cases {
+            let txn_manager = create_transaction_manager();
+            txn_manager.track_recent_committed_write_batch(&HashSet::new(), 10);
+            let (txn_id, started_seq) = txn_manager.new_transaction();
+            txn_manager.track_writes(
+                &txn_id,
+                [k.clone(), j.clone()].into_iter().collect(),
+                HashMap::from([(k.clone(), (started_seq as i64 + since) as u64)]),
+                HashSet::from([k.clone()]),
+            );
+            for (i, keys) in commits.iter().enumerate() {
+                let (writer, _) = txn_manager.new_transaction();
+                let keys: HashSet<Bytes> = keys.iter().map(|key| (*key).clone()).collect();
+                txn_manager.track_write_keys(&writer, &keys);
+                txn_manager.track_recent_committed_txn(&writer, started_seq + 1 + i as u64);
+            }
+            let mut reads = ReadSet::default();
+            if read {
+                reads.mark(k.clone(), ALL_CONFLICT_DOMAINS);
+            }
+            let mut stale = HashMap::new();
+            let found = txn_manager.check_conflicts(&txn_id, &reads, &mut stale);
+            assert_eq!(found, conflict, "case '{name}'");
+            if !conflict {
+                let want: HashMap<Bytes, u64> = stale_at
+                    .map(|offset| (k.clone(), started_seq + offset))
+                    .into_iter()
+                    .collect();
+                assert_eq!(stale, want, "case '{name}'");
+            }
+            assert_eq!(
+                txn_manager.check_has_conflict_with_reads(&txn_id, &reads),
+                conflict || stale_at.is_some(),
                 "case '{name}'"
             );
         }
