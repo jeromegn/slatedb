@@ -6,7 +6,9 @@ use bytes::Bytes;
 use log::warn;
 use parking_lot::RwLock;
 use slatedb_common::DbRand;
-use std::collections::{HashMap, HashSet, VecDeque};
+use smallvec::SmallVec;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Bound::{Excluded, Included};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -60,6 +62,7 @@ impl WriteKeys {
             .or_insert(mark);
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -72,6 +75,8 @@ impl WriteKeys {
 
     /// True if a key is in both, whatever the marks: a write-write conflict compares whole
     /// values. Probes the larger set once per key of the smaller, as `HashSet::is_disjoint`.
+    /// For the window walk that the differential test compares the indexed checks with.
+    #[cfg(test)]
     fn meets_keys(&self, other: &WriteKeys) -> bool {
         let (small, large) = if self.0.len() <= other.0.len() {
             (&self.0, &other.0)
@@ -83,6 +88,8 @@ impl WriteKeys {
 
     /// True if a read of `reads` (key to the mask of the domains that it used) used a domain
     /// that a write of these keys changed. One probe and one AND per key of the smaller one.
+    /// For the window walk, as [`Self::meets_keys`].
+    #[cfg(test)]
     fn meets_reads(&self, reads: &HashMap<Bytes, u64>) -> bool {
         if reads.len() <= self.0.len() {
             reads
@@ -184,6 +191,93 @@ impl TransactionState {
     }
 }
 
+/// The writes of the committed transactions in the window, by key: for each key, the
+/// sequence number and write mask of each commit of it, ordered by sequence number. The
+/// conflict checks then cost a lookup per key and a range query per read range instead of a
+/// walk over every write of the window, and leaving the window drops a prefix of each
+/// key's commits. Commits may come in any order of sequence numbers.
+#[derive(Default)]
+struct WindowWrites(BTreeMap<Bytes, SmallVec<[(u64, u64); 2]>>);
+
+impl WindowWrites {
+    /// Adds the writes of `txn`, which joins the window. A transaction that has no
+    /// committed sequence number has nothing to add.
+    fn insert(&mut self, txn: &TransactionState) {
+        let Some(seq) = txn.committed_seq else {
+            return;
+        };
+        for (key, mark) in &txn.write_keys.0 {
+            let commits = self.0.entry(key.clone()).or_default();
+            // After the last commit at or before `seq`: at the end when commits come in order.
+            let at = commits.partition_point(|&(other, _)| other <= seq);
+            commits.insert(at, (seq, mark.mask));
+        }
+    }
+
+    /// Removes the commits before `min_seq` of each key that `txn` wrote, and the keys left
+    /// without commits, as `txn` leaves the window in a pass that takes out every transaction
+    /// committed before `min_seq` and no other. Those are then exactly the key's commits
+    /// before `min_seq`, a prefix of its commits, so the first call of the pass for a key
+    /// drops them all at once and later ones find none: a pass costs what it drops plus one
+    /// move of what the keys it trims keep, however many of its transactions wrote a key.
+    fn remove_before(&mut self, txn: &TransactionState, min_seq: u64) {
+        for key in txn.write_keys.0.keys() {
+            let Some(commits) = self.0.get_mut(key) else {
+                continue;
+            };
+            let before = commits.partition_point(|&(seq, _)| seq < min_seq);
+            if before == commits.len() {
+                self.0.remove(key);
+            } else if before > 0 {
+                commits.drain(..before);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The sequence number of the newest commit of `key` after `after`, whatever its mask.
+    fn newest_after(&self, key: &Bytes, after: u64) -> Option<u64> {
+        let &(seq, _) = self.0.get(key)?.last()?;
+        (seq > after).then_some(seq)
+    }
+
+    /// True if one of `commits` came after `after` and changed a domain of `mask`.
+    fn commits_meet(commits: &[(u64, u64)], after: u64, mask: u64) -> bool {
+        commits
+            .iter()
+            .rev()
+            .take_while(|&&(seq, _)| seq > after)
+            .any(|&(_, write_mask)| WriteMark { mask: write_mask }.meets(mask))
+    }
+
+    /// True if a commit of `key` after `after` changed a domain of `mask`.
+    fn key_meets(&self, key: &Bytes, after: u64, mask: u64) -> bool {
+        self.0
+            .get(key)
+            .is_some_and(|commits| Self::commits_meet(commits, after, mask))
+    }
+
+    /// True if a commit after `after` of a key in `range` changed a domain of `mask`. The
+    /// keys are those that `range.contains` takes, as the map query uses the same bounds; an
+    /// empty range has none and does not reach `BTreeMap::range`, which panics on it.
+    fn range_meets(&self, range: &BytesRange, after: u64, mask: u64) -> bool {
+        let start = RangeBounds::<Bytes>::start_bound(range);
+        let end = RangeBounds::<Bytes>::end_bound(range);
+        if let (Included(first) | Excluded(first), Included(last) | Excluded(last)) = (start, end) {
+            let both_included = matches!((start, end), (Included(_), Included(_)));
+            if first > last || (first == last && !both_included) {
+                return false;
+            }
+        }
+        self.0
+            .range::<Bytes, _>((start, end))
+            .any(|(_, commits)| Self::commits_meet(commits, after, mask))
+    }
+}
+
 /// Manages the lifecycle of transaction states and provides isolation-level-aware conflict detection.
 /// Supports both Snapshot Isolation (SI) and Serializable Snapshot Isolation (SSI).
 /// TODO: have a quota for max active transactions.
@@ -196,7 +290,8 @@ pub(crate) struct TransactionManager {
 struct TransactionManagerInner {
     /// Map of transaction state ID to transaction states.
     active_txns: HashMap<Uuid, TransactionState>,
-    /// Tracks recently committed transaction states for conflict checks at commit.
+    /// Tracks recently committed transaction states, the window that conflict checks at
+    /// commit compare with; the checks read its writes from `window_writes`.
     ///
     /// Garbage collection rules:
     /// - An entry can be garbage collected when *all* active transactions have
@@ -209,6 +304,8 @@ struct TransactionManagerInner {
     /// transaction id: a transaction's, from its start until it ends, or until the last
     /// iterator of its scans drops if one outlives it (see `RetentionPin`).
     retained: HashMap<Uuid, u64>,
+    /// Writes of `recent_committed_txns` indexed by key for conflict checks.
+    window_writes: WindowWrites,
     /// The oracle for tracking the last committed sequence number.
     oracle: Arc<DbOracle>,
 }
@@ -220,6 +317,7 @@ impl TransactionManager {
                 active_txns: HashMap::new(),
                 recent_committed_txns: VecDeque::new(),
                 retained: HashMap::new(),
+                window_writes: WindowWrites::default(),
                 oracle,
             })),
             db_rand,
@@ -318,8 +416,9 @@ impl TransactionManager {
     }
 
     /// Track write keys for a transaction, each with the mark of what its write changed. This
-    /// is used for conflict detection. Keys should be tracked before calling commit-related
-    /// methods. The write-write check of a key of `since` ignores the commits at or before its
+    /// is used for conflict detection: the transaction's own check, and once it commits, the
+    /// checks of others through `window_writes`. Keys should be tracked before calling
+    /// commit-related methods. The write-write check of a key of `since` ignores the commits at or before its
     /// sequence number there (see `DbTransaction::validate_write_since`); a key given more
     /// than once keeps the smallest. A key of `recompute` that the check finds committed
     /// is stale instead of conflicting (see [`Self::check_conflicts`]).
@@ -517,12 +616,23 @@ impl TransactionManager {
 
 impl TransactionManagerInner {
     fn track_recent_committed_state(&mut self, txn_state: TransactionState) {
+        self.window_writes.insert(&txn_state);
         self.recent_committed_txns.push_back(txn_state);
 
         if self.min_conflict_check_seq().is_none() {
             // No active write transactions remain, so there is nobody left that can
             // conflict with this committed state or any older committed state.
             self.recent_committed_txns.clear();
+            self.window_writes.clear();
+        }
+    }
+
+    /// Rebuilds `window_writes` from the window, for tests that set the window directly.
+    #[cfg(test)]
+    fn rebuild_window_writes(&mut self) {
+        self.window_writes.clear();
+        for txn in &self.recent_committed_txns {
+            self.window_writes.insert(txn);
         }
     }
 
@@ -542,8 +652,9 @@ impl TransactionManagerInner {
             // A transaction can be garbage collected when all active transactions
             // have started_seq strictly greater than the transaction's committed_seq.
             // This means we keep transactions where committed_seq >= min_seq.
+            let window_writes = &mut self.window_writes;
             self.recent_committed_txns.retain(|txn| {
-                if let Some(committed_seq) = txn.committed_seq {
+                let keep = if let Some(committed_seq) = txn.committed_seq {
                     committed_seq >= min_seq
                 } else {
                     // If committed_seq is not set, this shouldn't happen in practice.
@@ -551,11 +662,16 @@ impl TransactionManagerInner {
                         "Found transaction with committed_seq = None, this may cause memory leaks"
                     );
                     true
+                };
+                if !keep {
+                    window_writes.remove_before(txn, min_seq);
                 }
+                keep
             });
         } else {
             // No active transactions, can drain the entire deque
             self.recent_committed_txns.clear();
+            self.window_writes.clear();
         }
     }
 
@@ -574,7 +690,36 @@ impl TransactionManagerInner {
     /// The write-write check, in which a key of `since` conflicts only with commits after
     /// both `started_seq` and its own sequence number there, and a key of `recompute` that
     /// would conflict goes into `stale` instead, with the newest such commit's sequence number.
+    /// One lookup in `window_writes` per written key, whose newest commit decides; the marks
+    /// do not matter.
     fn has_write_write_conflict_since(
+        &self,
+        write_keys: &WriteKeys,
+        started_seq: u64,
+        since: &HashMap<Bytes, u64>,
+        recompute: &HashSet<Bytes>,
+        stale: &mut HashMap<Bytes, u64>,
+    ) -> bool {
+        for key in write_keys.0.keys() {
+            let after = since
+                .get(key)
+                .map_or(started_seq, |&seq| seq.max(started_seq));
+            let Some(newest) = self.window_writes.newest_after(key, after) else {
+                continue;
+            };
+            if !recompute.contains(key) {
+                return true;
+            }
+            let had = stale.entry(key.clone()).or_insert(newest);
+            *had = (*had).max(newest);
+        }
+        false
+    }
+
+    /// [`Self::has_write_write_conflict_since`] by a walk over the window, as it was before
+    /// `window_writes`: the reference of the differential test.
+    #[cfg(test)]
+    fn has_write_write_conflict_since_by_walk(
         &self,
         write_keys: &WriteKeys,
         started_seq: u64,
@@ -671,7 +816,28 @@ impl TransactionManagerInner {
     ///
     /// Each read key and each read range carries the mask of the conflict domains that the
     /// read used: a committed write conflicts with it only if its mark shares a bit with it.
+    /// One lookup in `window_writes` per read key and one range query per read range, which
+    /// visits the window's written keys in the range, and the commits of each after
+    /// `started_seq`, until one conflicts.
     fn has_masked_read_write_conflict(
+        &self,
+        read_keys: &HashMap<Bytes, u64>,
+        read_ranges: &[(BytesRange, u64)],
+        started_seq: u64,
+    ) -> bool {
+        let writes = &self.window_writes;
+        read_keys
+            .iter()
+            .any(|(key, mask)| writes.key_meets(key, started_seq, *mask))
+            || read_ranges
+                .iter()
+                .any(|(range, mask)| writes.range_meets(range, started_seq, *mask))
+    }
+
+    /// [`Self::has_masked_read_write_conflict`] by a walk over the window, as it was before
+    /// `window_writes`: the reference of the differential test.
+    #[cfg(test)]
+    fn has_masked_read_write_conflict_by_walk(
         &self,
         read_keys: &HashMap<Bytes, u64>,
         read_ranges: &[(BytesRange, u64)],
@@ -721,6 +887,7 @@ mod tests {
     use rstest::rstest;
     use slatedb_common::DbRand;
     use std::collections::HashSet;
+    use std::ops::Bound;
 
     struct CheckConflictTestCase {
         name: &'static str,
@@ -938,6 +1105,7 @@ mod tests {
         {
             let mut inner = txn_manager.inner.write();
             inner.recent_committed_txns = case.recent_committed_txns.into();
+            inner.rebuild_window_writes();
         }
 
         // Convert current transaction write keys
@@ -1269,6 +1437,7 @@ mod tests {
                 read_keys: HashSet::new(),
                 read_ranges: Vec::new(),
             });
+            inner.rebuild_window_writes();
         }
 
         // Keep active transactions around so the committed history is retained
@@ -2192,5 +2361,811 @@ mod tests {
                 "case '{name}'"
             );
         }
+    }
+
+    /// The keys of the small scenarios of the differential test: few, so that transactions
+    /// share them, with keys that are prefixes of others and bytes at both ends of the order.
+    const DIFF_KEYS: [&[u8]; 8] = [b"", b"a", b"a\x00", b"ab", b"b", b"b\xff", b"c", b"d"];
+    /// The range bounds of the small scenarios: the keys and points between and around them.
+    const DIFF_POINTS: [&[u8]; 12] = [
+        b"", b"a", b"a\x00", b"aa", b"ab", b"b", b"b\xff", b"ba", b"c", b"d", b"e", b"\xff",
+    ];
+
+    /// The tables of the large scenarios, `t<table>/`, of `DIFF_ROWS` rows `t<table>/r<row>`
+    /// each. Commits write only the rows below `DIFF_WRITTEN_ROWS` of the first
+    /// `DIFF_WRITTEN_TABLES` tables, so that some ranges cover no written key.
+    const DIFF_TABLES: usize = 8;
+    const DIFF_WRITTEN_TABLES: usize = 6;
+    const DIFF_ROWS: usize = 400;
+    const DIFF_WRITTEN_ROWS: usize = 300;
+    /// The number of hot keys of the large scenarios, `hot/<n>`, which most commits write.
+    const DIFF_HOT_KEYS: usize = 3;
+
+    fn diff_key(rng: &mut impl RngExt) -> Bytes {
+        Bytes::from_static(DIFF_KEYS[rng.random_range(0..DIFF_KEYS.len())])
+    }
+
+    /// A mask: every domain, one of few bits (so that masks meet), the top bit, a small
+    /// value (0 included), or any value.
+    fn diff_mask(rng: &mut impl RngExt) -> u64 {
+        match rng.random_range(0..6) {
+            0 | 1 => ALL_CONFLICT_DOMAINS,
+            2 => 1 << rng.random_range(0..3),
+            3 => 1 << 63,
+            4 => rng.random_range(0..8),
+            _ => rng.random::<u64>(),
+        }
+    }
+
+    fn diff_write_keys(rng: &mut impl RngExt, max: usize) -> WriteKeys {
+        let mut keys = WriteKeys::default();
+        for _ in 0..rng.random_range(0..=max) {
+            let key = diff_key(rng);
+            keys.insert(
+                key,
+                WriteMark {
+                    mask: diff_mask(rng),
+                },
+            );
+        }
+        keys
+    }
+
+    fn diff_bound(rng: &mut impl RngExt) -> Bound<Bytes> {
+        let point = Bytes::from_static(DIFF_POINTS[rng.random_range(0..DIFF_POINTS.len())]);
+        match rng.random_range(0..5) {
+            0 => Bound::Unbounded,
+            1 | 2 => Included(point),
+            _ => Excluded(point),
+        }
+    }
+
+    /// A range with any kinds of bounds; bounds that are empty give the empty range.
+    fn diff_range(rng: &mut impl RngExt) -> BytesRange {
+        match rng.random_range(0..12) {
+            0 => BytesRange::new_empty(),
+            1 => BytesRange::unbounded(),
+            _ => {
+                let start = diff_bound(rng);
+                let end = diff_bound(rng);
+                BytesRange::try_new(start, end).unwrap_or_else(BytesRange::new_empty)
+            }
+        }
+    }
+
+    /// The keys, ranges and write sets of a scenario of the differential test.
+    struct DiffUniverse {
+        /// Large scenarios use thousands of keys in tables and a few hot keys; small ones use
+        /// `DIFF_KEYS` and `DIFF_POINTS`, with the generators above.
+        large: bool,
+        /// Every key, in order.
+        keys: Vec<Bytes>,
+        /// The keys that commits write besides the hot ones, in order.
+        written: Vec<Bytes>,
+        /// The range bounds, in order: the keys, and the bounds of the tables and of the
+        /// key space.
+        points: Vec<Bytes>,
+        /// Keys that most commits write.
+        hot: Vec<Bytes>,
+        /// The prefixes of whole tables, of blocks of a hundred rows and of the hot keys.
+        prefixes: Vec<Bytes>,
+    }
+
+    impl DiffUniverse {
+        fn small() -> Self {
+            let keys: Vec<Bytes> = DIFF_KEYS
+                .iter()
+                .map(|key| Bytes::from_static(key))
+                .collect();
+            Self {
+                large: false,
+                written: keys.clone(),
+                keys,
+                points: DIFF_POINTS.iter().map(|p| Bytes::from_static(p)).collect(),
+                hot: Vec::new(),
+                prefixes: Vec::new(),
+            }
+        }
+
+        fn large() -> Self {
+            let mut keys = Vec::new();
+            let mut written = Vec::new();
+            let mut points = vec![Bytes::new(), Bytes::from_static(b"\xff")];
+            let mut prefixes = Vec::new();
+            for table in 0..DIFF_TABLES {
+                prefixes.push(Bytes::from(format!("t{table}/")));
+                points.push(Bytes::from(format!("t{table}/")));
+                // After every key of the table: b'0' follows b'/'.
+                points.push(Bytes::from(format!("t{table}0")));
+                for block in 0..DIFF_ROWS / 100 {
+                    prefixes.push(Bytes::from(format!("t{table}/r{block:02}")));
+                }
+                for row in 0..DIFF_ROWS {
+                    let key = Bytes::from(format!("t{table}/r{row:04}"));
+                    if table < DIFF_WRITTEN_TABLES && row < DIFF_WRITTEN_ROWS {
+                        written.push(key.clone());
+                    }
+                    keys.push(key);
+                }
+            }
+            let hot: Vec<Bytes> = (0..DIFF_HOT_KEYS)
+                .map(|n| Bytes::from(format!("hot/{n}")))
+                .collect();
+            keys.extend(hot.iter().cloned());
+            keys.sort();
+            prefixes.push(Bytes::from_static(b"hot/"));
+            points.extend(keys.iter().cloned());
+            points.extend([Bytes::from_static(b"hot/"), Bytes::from_static(b"hot0")]);
+            points.sort();
+            points.dedup();
+            Self {
+                large: true,
+                keys,
+                written,
+                points,
+                hot,
+                prefixes,
+            }
+        }
+
+        /// A key to read, or to name in `since`: in large scenarios, often a hot or a
+        /// written one.
+        fn key(&self, rng: &mut impl RngExt) -> Bytes {
+            if !self.large {
+                return diff_key(rng);
+            }
+            match rng.random_range(0..10) {
+                0 | 1 => self.hot[rng.random_range(0..self.hot.len())].clone(),
+                2..=6 => self.written[rng.random_range(0..self.written.len())].clone(),
+                _ => self.keys[rng.random_range(0..self.keys.len())].clone(),
+            }
+        }
+
+        /// The writes of a commit of the window: in large scenarios 5 to 40 keys, each hot
+        /// key in most of them.
+        fn commit_writes(&self, rng: &mut impl RngExt) -> WriteKeys {
+            if !self.large {
+                return diff_write_keys(rng, 5);
+            }
+            self.large_writes(rng, 5, 40, 0.75)
+        }
+
+        /// The writes of a checked transaction: in large scenarios fewer, and fewer hot keys,
+        /// so that checks find no write-write conflict too.
+        fn check_writes(&self, rng: &mut impl RngExt) -> WriteKeys {
+            if !self.large {
+                return diff_write_keys(rng, 4);
+            }
+            self.large_writes(rng, 0, 12, 0.2)
+        }
+
+        /// The keys of a write batch.
+        fn batch_keys(&self, rng: &mut impl RngExt) -> HashSet<Bytes> {
+            if !self.large {
+                return (0..rng.random_range(0..=4))
+                    .map(|_| diff_key(rng))
+                    .collect();
+            }
+            self.large_writes(rng, 1, 8, 0.5).0.into_keys().collect()
+        }
+
+        /// `min` to `max` keys: each hot key with probability `hot`, then mostly runs of
+        /// neighbouring rows, as a transaction that updates related rows does.
+        fn large_writes(
+            &self,
+            rng: &mut impl RngExt,
+            min: usize,
+            max: usize,
+            hot: f64,
+        ) -> WriteKeys {
+            let count = rng.random_range(min..=max);
+            let mut keys = WriteKeys::default();
+            for key in &self.hot {
+                if keys.0.len() < count && rng.random_bool(hot) {
+                    let mask = diff_mask(rng);
+                    keys.insert(key.clone(), WriteMark { mask });
+                }
+            }
+            let mut at = rng.random_range(0..self.written.len());
+            while keys.0.len() < count {
+                at = if rng.random_bool(0.75) {
+                    (at + rng.random_range(1..=3)) % self.written.len()
+                } else {
+                    rng.random_range(0..self.written.len())
+                };
+                let mask = diff_mask(rng);
+                keys.insert(self.written[at].clone(), WriteMark { mask });
+            }
+            keys
+        }
+
+        /// A read range. In large scenarios: a whole table or block of rows, which covers many
+        /// written keys or none; a narrow range, which covers few or none; or any bounds.
+        fn range(&self, rng: &mut impl RngExt) -> BytesRange {
+            if !self.large {
+                return diff_range(rng);
+            }
+            match rng.random_range(0..16) {
+                0 => BytesRange::new_empty(),
+                1 => BytesRange::unbounded(),
+                2..=5 => BytesRange::from_prefix(
+                    &self.prefixes[rng.random_range(0..self.prefixes.len())],
+                ),
+                6..=12 => {
+                    let first = rng.random_range(0..self.points.len());
+                    let span = if rng.random_bool(0.7) { 4 } else { 60 };
+                    let last = (first + rng.random_range(0..=span)).min(self.points.len() - 1);
+                    let start = self.point_bound(rng, first);
+                    let end = self.point_bound(rng, last);
+                    BytesRange::try_new(start, end).unwrap_or_else(BytesRange::new_empty)
+                }
+                _ => {
+                    let start = self.any_bound(rng);
+                    let end = self.any_bound(rng);
+                    BytesRange::try_new(start, end).unwrap_or_else(BytesRange::new_empty)
+                }
+            }
+        }
+
+        fn point_bound(&self, rng: &mut impl RngExt, at: usize) -> Bound<Bytes> {
+            let point = self.points[at].clone();
+            if rng.random_bool(0.5) {
+                Included(point)
+            } else {
+                Excluded(point)
+            }
+        }
+
+        fn any_bound(&self, rng: &mut impl RngExt) -> Bound<Bytes> {
+            if rng.random_bool(0.2) {
+                return Bound::Unbounded;
+            }
+            let at = rng.random_range(0..self.points.len());
+            self.point_bound(rng, at)
+        }
+    }
+
+    fn committed_state(committed_seq: u64, write_keys: WriteKeys) -> TransactionState {
+        TransactionState {
+            started_seq: committed_seq.saturating_sub(1),
+            committed_seq: Some(committed_seq),
+            write_keys,
+            write_since: HashMap::new(),
+            write_recompute: HashSet::new(),
+            read_keys: HashSet::new(),
+            read_ranges: Vec::new(),
+        }
+    }
+
+    /// Asserts that `window_writes` holds exactly the writes of the window, each key's
+    /// commits ordered by sequence number, and no key without commits.
+    fn assert_window_writes_match(inner: &TransactionManagerInner, context: &str) {
+        let mut want: BTreeMap<Bytes, Vec<(u64, u64)>> = BTreeMap::new();
+        for txn in &inner.recent_committed_txns {
+            let seq = txn.committed_seq.expect("committed");
+            for (key, mark) in &txn.write_keys.0 {
+                want.entry(key.clone()).or_default().push((seq, mark.mask));
+            }
+        }
+        want.values_mut().for_each(|commits| commits.sort());
+        let mut got: BTreeMap<Bytes, Vec<(u64, u64)>> = BTreeMap::new();
+        for (key, commits) in &inner.window_writes.0 {
+            assert!(
+                commits.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+                "{context}: commits of {key:?} out of order: {commits:?}"
+            );
+            let mut commits = commits.to_vec();
+            commits.sort();
+            got.insert(key.clone(), commits);
+        }
+        assert_eq!(got, want, "{context}: window_writes differ from the window");
+    }
+
+    /// What the checks of a group of scenarios of the differential test found, and the
+    /// windows that they ran on.
+    #[derive(Default)]
+    struct DiffCounts {
+        cases: u64,
+        write_write: u64,
+        stale: u64,
+        read_write: u64,
+        /// The times that `window_writes` was compared with the window after a change.
+        changes: u64,
+        window_total: u64,
+        window_max: usize,
+        /// The most commits of one key in `window_writes` at a check.
+        key_max: usize,
+        /// The most commits that one drop or recycle took out of the window.
+        trim_max: usize,
+    }
+
+    impl DiffCounts {
+        /// Asserts that both outcomes of each check occurred, or the test proves little.
+        fn assert_both_outcomes(&self, group: &str) {
+            assert!(
+                self.write_write > 0 && self.write_write < self.cases,
+                "{group}: write-write"
+            );
+            assert!(self.stale > 0, "{group}: stale");
+            assert!(
+                self.read_write > 0 && self.read_write < self.cases,
+                "{group}: read-write"
+            );
+        }
+    }
+
+    impl std::fmt::Display for DiffCounts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{} random check cases ({} write-write conflicts, {} with stale keys, {} \
+                 read-write conflicts), {} window changes checked, window of {:.1} transactions \
+                 on average at a check, {} at most, {} commits of one key at most, {} commits \
+                 dropped by one recycle at most",
+                self.cases,
+                self.write_write,
+                self.stale,
+                self.read_write,
+                self.changes,
+                self.window_total as f64 / self.cases.max(1) as f64,
+                self.window_max,
+                self.key_max,
+                self.trim_max,
+            )
+        }
+    }
+
+    /// Checks one random committing transaction, started at most `lookback` (plus 2) before
+    /// `seq`, against the window with the indexed checks and with the window walks, and
+    /// asserts that they agree.
+    fn diff_check(
+        inner: &TransactionManagerInner,
+        universe: &DiffUniverse,
+        rng: &mut impl RngExt,
+        seq: u64,
+        lookback: u64,
+        counts: &mut DiffCounts,
+        context: &str,
+    ) {
+        let started_seq =
+            seq.saturating_sub(rng.random_range(0..=lookback)) + rng.random_range(0..=2);
+        let write_keys = universe.check_writes(rng);
+        let written: Vec<Bytes> = write_keys.0.keys().cloned().collect();
+        let mut since = HashMap::new();
+        for _ in 0..rng.random_range(0..=3) {
+            let key = diff_written_key(rng, universe, &written);
+            let at = if universe.large && rng.random_bool(0.5) {
+                // Anywhere up to the newest commit, as for a key read late in a long transaction.
+                rng.random_range(started_seq..=seq + 2)
+            } else {
+                started_seq.saturating_add_signed(rng.random_range(-3..=3))
+            };
+            since.insert(key, at);
+        }
+        let mut recompute = HashSet::new();
+        if rng.random_bool(0.5) {
+            for _ in 0..rng.random_range(1..=3) {
+                recompute.insert(diff_written_key(rng, universe, &written));
+            }
+        }
+        // Callers give an empty map; a map with an entry checks that both merge alike.
+        let mut want_stale = HashMap::new();
+        if rng.random_bool(0.1) {
+            want_stale.insert(universe.key(rng), rng.random_range(0..=seq + 2));
+        }
+        let mut stale = want_stale.clone();
+        let want_ww = inner.has_write_write_conflict_since_by_walk(
+            &write_keys,
+            started_seq,
+            &since,
+            &recompute,
+            &mut want_stale,
+        );
+        let ww = inner.has_write_write_conflict_since(
+            &write_keys,
+            started_seq,
+            &since,
+            &recompute,
+            &mut stale,
+        );
+        let case = format!(
+            "{context}: started at {started_seq}, writes {write_keys:?}, since {since:?}, \
+             recompute {recompute:?}"
+        );
+        assert_eq!(ww, want_ww, "{case}: write-write");
+        if !ww {
+            assert_eq!(stale, want_stale, "{case}: stale");
+        }
+
+        let read_keys: HashMap<Bytes, u64> = (0..rng.random_range(0..=4))
+            .map(|_| (universe.key(rng), diff_mask(rng)))
+            .collect();
+        let read_ranges: Vec<(BytesRange, u64)> = (0..rng.random_range(0..=3))
+            .map(|_| (universe.range(rng), diff_mask(rng)))
+            .collect();
+        let want_rw =
+            inner.has_masked_read_write_conflict_by_walk(&read_keys, &read_ranges, started_seq);
+        let rw = inner.has_masked_read_write_conflict(&read_keys, &read_ranges, started_seq);
+        assert_eq!(
+            rw, want_rw,
+            "{case}: read-write, read keys {read_keys:?}, read ranges {read_ranges:?}"
+        );
+
+        counts.cases += 1;
+        counts.write_write += u64::from(ww);
+        counts.stale += u64::from(!ww && !stale.is_empty());
+        counts.read_write += u64::from(rw);
+        let window = inner.recent_committed_txns.len();
+        counts.window_total += window as u64;
+        counts.window_max = counts.window_max.max(window);
+        let key_max = inner.window_writes.0.values().map(|commits| commits.len());
+        counts.key_max = counts.key_max.max(key_max.max().unwrap_or(0));
+    }
+
+    /// Mostly one of `written`, else any key, for `since` and `recompute`.
+    fn diff_written_key(
+        rng: &mut impl RngExt,
+        universe: &DiffUniverse,
+        written: &[Bytes],
+    ) -> Bytes {
+        if !written.is_empty() && rng.random_bool(0.8) {
+            written[rng.random_range(0..written.len())].clone()
+        } else {
+            universe.key(rng)
+        }
+    }
+
+    /// Runs `change`, a drop or a recycle, and records how many commits it took out of the
+    /// window.
+    fn diff_trim(
+        txn_manager: &TransactionManager,
+        counts: &mut DiffCounts,
+        change: impl FnOnce(&TransactionManager),
+    ) {
+        let before = txn_manager.inner.read().recent_committed_txns.len();
+        change(txn_manager);
+        let after = txn_manager.inner.read().recent_committed_txns.len();
+        counts.trim_max = counts.trim_max.max(before.saturating_sub(after));
+    }
+
+    /// A small scenario of the differential test: random tracking calls on a window of a
+    /// few transactions, with commits out of order and windows set by hand, and
+    /// `window_writes` compared with the window after every change.
+    fn diff_small_scenario(base_seed: u64, scenario: u64, counts: &mut DiffCounts) {
+        const STEPS: usize = 150;
+        let seed = base_seed.wrapping_add(scenario);
+        let db_rand = DbRand::new(seed);
+        let mut rng = db_rand.rng();
+        let rng = &mut *rng;
+        let universe = DiffUniverse::small();
+        let txn_manager = create_transaction_manager();
+        let mut active: Vec<Uuid> = Vec::new();
+        let mut next_id = 0u128;
+        let mut seq = 10u64;
+        // In half of the scenarios a long transaction keeps the window growing until it
+        // drops at a random step, as the oldest of many clients does.
+        let pinned = Uuid::from_u128(u128::MAX);
+        let pinned_until = if rng.random_bool(0.5) {
+            txn_manager.new_txn_with_id(seq, pinned);
+            rng.random_range(1..STEPS)
+        } else {
+            0
+        };
+        for step in 0..STEPS {
+            let context = format!("TXN_INDEX_SEED={base_seed}, scenario {scenario}, step {step}");
+            if step == pinned_until && step > 0 {
+                diff_trim(&txn_manager, counts, |m| m.drop_txn(&pinned));
+                counts.changes += 1;
+                assert_window_writes_match(&txn_manager.inner.read(), &context);
+            }
+            let changed = match rng.random_range(0..100) {
+                0..=24 => {
+                    next_id += 1;
+                    let id = Uuid::from_u128(next_id);
+                    txn_manager.new_txn_with_id(seq.saturating_sub(rng.random_range(0..=2)), id);
+                    active.push(id);
+                    false
+                }
+                25..=39 if !active.is_empty() => {
+                    let id = active.swap_remove(rng.random_range(0..active.len()));
+                    let writes = universe.commit_writes(rng);
+                    txn_manager.track_writes(&id, writes, HashMap::new(), HashSet::new());
+                    seq += rng.random_range(1..=2);
+                    txn_manager.track_recent_committed_txn(&id, seq);
+                    true
+                }
+                40..=49 => {
+                    let keys = universe.batch_keys(rng);
+                    seq += rng.random_range(1..=2);
+                    txn_manager.track_recent_committed_write_batch(&keys, seq);
+                    true
+                }
+                50..=59 if !active.is_empty() => {
+                    let id = active.swap_remove(rng.random_range(0..active.len()));
+                    diff_trim(&txn_manager, counts, |m| m.drop_txn(&id));
+                    true
+                }
+                60..=64 => {
+                    diff_trim(&txn_manager, counts, |m| {
+                        m.inner.write().recycle_recent_committed_txns()
+                    });
+                    true
+                }
+                65..=69 => {
+                    // A commit out of order, possibly at the sequence number of another.
+                    let committed_seq = rng.random_range(0..=seq + 2);
+                    let state = committed_state(committed_seq, universe.commit_writes(rng));
+                    txn_manager
+                        .inner
+                        .write()
+                        .track_recent_committed_state(state);
+                    true
+                }
+                70..=71 => {
+                    let mut inner = txn_manager.inner.write();
+                    inner.recent_committed_txns = (0..rng.random_range(0..=10))
+                        .map(|_| {
+                            let committed_seq = rng.random_range(0..=seq + 2);
+                            committed_state(committed_seq, universe.commit_writes(rng))
+                        })
+                        .collect();
+                    inner.rebuild_window_writes();
+                    true
+                }
+                _ => {
+                    let inner = txn_manager.inner.read();
+                    for _ in 0..4 {
+                        diff_check(&inner, &universe, rng, seq, 20, counts, &context);
+                    }
+                    false
+                }
+            };
+            if changed {
+                counts.changes += 1;
+                assert_window_writes_match(&txn_manager.inner.read(), &context);
+            }
+        }
+    }
+
+    /// The state of a large scenario of the differential test.
+    struct DiffRun {
+        txn_manager: TransactionManager,
+        universe: DiffUniverse,
+        seq: u64,
+        next_id: u128,
+        /// Short transactions, begun and not yet committed or dropped.
+        active: Vec<Uuid>,
+        /// The seed and the scenario, for the context of a failure.
+        prefix: String,
+        steps: u64,
+    }
+
+    impl DiffRun {
+        fn window_len(&self) -> usize {
+            self.txn_manager.inner.read().recent_committed_txns.len()
+        }
+
+        /// One step of short transactions: a begin, a commit, a write batch, a drop, a
+        /// recycle, or now and then a commit out of order. Returns true if the window may
+        /// have changed.
+        fn step(&mut self, rng: &mut impl RngExt, counts: &mut DiffCounts) -> bool {
+            self.steps += 1;
+            match rng.random_range(0..100) {
+                0..=29 if self.active.len() < 8 => {
+                    self.next_id += 1;
+                    let id = Uuid::from_u128(self.next_id);
+                    let started_seq = self.seq.saturating_sub(rng.random_range(0..=2));
+                    self.txn_manager.new_txn_with_id(started_seq, id);
+                    self.active.push(id);
+                    false
+                }
+                0..=64 if !self.active.is_empty() => {
+                    let id = self
+                        .active
+                        .swap_remove(rng.random_range(0..self.active.len()));
+                    let writes = self.universe.commit_writes(rng);
+                    let txn_manager = &self.txn_manager;
+                    txn_manager.track_writes(&id, writes, HashMap::new(), HashSet::new());
+                    self.seq += rng.random_range(1..=2);
+                    txn_manager.track_recent_committed_txn(&id, self.seq);
+                    true
+                }
+                65..=79 => {
+                    let keys = self.universe.batch_keys(rng);
+                    self.seq += rng.random_range(1..=2);
+                    let txn_manager = &self.txn_manager;
+                    txn_manager.track_recent_committed_write_batch(&keys, self.seq);
+                    true
+                }
+                80..=91 if !self.active.is_empty() => {
+                    let id = self
+                        .active
+                        .swap_remove(rng.random_range(0..self.active.len()));
+                    diff_trim(&self.txn_manager, counts, |m| m.drop_txn(&id));
+                    true
+                }
+                92..=95 => {
+                    diff_trim(&self.txn_manager, counts, |m| {
+                        m.inner.write().recycle_recent_committed_txns()
+                    });
+                    true
+                }
+                96..=97 => {
+                    // A commit out of order, possibly before the window's oldest transaction.
+                    let committed_seq =
+                        rng.random_range(self.seq.saturating_sub(50)..=self.seq + 2);
+                    let state = committed_state(committed_seq, self.universe.commit_writes(rng));
+                    let mut inner = self.txn_manager.inner.write();
+                    inner.track_recent_committed_state(state);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        /// Compares `window_writes` with the window, then runs `checks` checks, half of them
+        /// from as far back as the window's oldest commit.
+        fn checkpoint(
+            &self,
+            rng: &mut impl RngExt,
+            checks: usize,
+            counts: &mut DiffCounts,
+            what: &str,
+        ) {
+            let inner = self.txn_manager.inner.read();
+            let context = format!("{}, step {}, {what}", self.prefix, self.steps);
+            assert_window_writes_match(&inner, &context);
+            counts.changes += 1;
+            let commits = inner.recent_committed_txns.iter();
+            let oldest = commits.filter_map(|txn| txn.committed_seq).min();
+            let span = self.seq - oldest.unwrap_or(self.seq).min(self.seq) + 3;
+            for _ in 0..checks {
+                let lookback = if rng.random_bool(0.5) { 20 } else { span };
+                diff_check(
+                    &inner,
+                    &self.universe,
+                    rng,
+                    self.seq,
+                    lookback,
+                    counts,
+                    &context,
+                );
+            }
+        }
+    }
+
+    /// A large scenario of the differential test, in two rounds: a long transaction pins
+    /// the window while it grows to hundreds or thousands of commits of thousands of keys and
+    /// a few hot keys, often with a second long transaction from halfway; each of them then
+    /// ends, and one recycle drops the hundreds of commits before the oldest transaction
+    /// left; then short transactions run on a small window. Checks run at many points.
+    fn diff_large_scenario(
+        base_seed: u64,
+        scenario: u64,
+        sizes: std::ops::RangeInclusive<usize>,
+        counts: &mut DiffCounts,
+    ) {
+        let db_rand = DbRand::new(base_seed.wrapping_add(scenario));
+        let mut rng = db_rand.rng();
+        let rng = &mut *rng;
+        let mut run = DiffRun {
+            txn_manager: create_transaction_manager(),
+            universe: DiffUniverse::large(),
+            seq: 10,
+            next_id: 0,
+            active: Vec::new(),
+            prefix: format!("TXN_INDEX_SEED={base_seed}, scenario {scenario}"),
+            steps: 0,
+        };
+        let size = rng.random_range(sizes);
+        for round in 0..2u128 {
+            let target = if round == 0 { size } else { size / 3 };
+            let pinned = Uuid::from_u128(u128::MAX - 2 * round);
+            let second = Uuid::from_u128(u128::MAX - 2 * round - 1);
+            run.txn_manager.new_txn_with_id(run.seq, pinned);
+            let wants_second = rng.random_bool(0.7);
+            let mut has_second = false;
+            let every = (target / 24).max(1);
+            let mut next_checkpoint = every;
+            while run.window_len() < target {
+                run.step(rng, counts);
+                let window = run.window_len();
+                if wants_second && !has_second && window >= target / 2 {
+                    run.txn_manager.new_txn_with_id(run.seq, second);
+                    has_second = true;
+                }
+                if window >= next_checkpoint {
+                    run.checkpoint(rng, 10, counts, "window growing");
+                    next_checkpoint = window + every;
+                }
+            }
+            run.checkpoint(rng, 10, counts, "window grown");
+            diff_trim(&run.txn_manager, counts, |m| m.drop_txn(&pinned));
+            run.checkpoint(rng, 8, counts, "pin released");
+            if has_second {
+                for _ in 0..target / 8 {
+                    run.step(rng, counts);
+                }
+                run.checkpoint(rng, 4, counts, "second pin held");
+                diff_trim(&run.txn_manager, counts, |m| m.drop_txn(&second));
+                run.checkpoint(rng, 8, counts, "second pin released");
+            }
+            for _ in 0..200 {
+                if run.step(rng, counts) {
+                    run.checkpoint(rng, 0, counts, "short transactions");
+                }
+                if rng.random_bool(0.1) {
+                    run.checkpoint(rng, 2, counts, "short transactions");
+                }
+            }
+        }
+    }
+
+    /// The indexed conflict checks agree with the window walks that they replace, on random
+    /// windows built by the tracking calls (begin, commit, write batch, drop, recycle), by
+    /// commits tracked out of order of sequence numbers, and by hand; and `window_writes`
+    /// holds exactly the window's writes after every change in small windows, and at every
+    /// check and after every change in short transactions in large ones. Replay a failure
+    /// with the printed seed in `TXN_INDEX_SEED`.
+    #[test]
+    fn test_window_writes_checks_match_window_walk() {
+        const SMALL_SCENARIOS: u64 = 400;
+        const LARGE_SIZES: [std::ops::RangeInclusive<usize>; 3] =
+            [300..=700, 800..=1500, 1800..=3000];
+        let base_seed: u64 = match std::env::var("TXN_INDEX_SEED") {
+            Ok(seed) => seed.parse().expect("TXN_INDEX_SEED is a u64"),
+            Err(_) => rand::random(),
+        };
+        let mut small = DiffCounts::default();
+        for scenario in 0..SMALL_SCENARIOS {
+            diff_small_scenario(base_seed, scenario, &mut small);
+        }
+        let mut large = DiffCounts::default();
+        for (n, sizes) in LARGE_SIZES.into_iter().enumerate() {
+            diff_large_scenario(base_seed, SMALL_SCENARIOS + n as u64, sizes, &mut large);
+        }
+        println!("TXN_INDEX_SEED={base_seed}: small windows: {small}; large windows: {large}");
+        small.assert_both_outcomes("small windows");
+        large.assert_both_outcomes("large windows");
+        assert!(large.window_max >= 1800, "large windows: no window of 1800");
+        assert!(large.trim_max >= 100, "large windows: no recycle of 100");
+    }
+
+    /// Releasing a transaction that pinned thousands of commits of one hot key trims
+    /// `window_writes` to the window in one recycle, and empties it with the window.
+    #[test]
+    fn test_window_writes_after_long_pin_released() {
+        let txn_manager = create_transaction_manager();
+        let pinned = txn_manager.new_txn_with_id(0, Uuid::from_u128(1));
+        let mut later = None;
+        let hot = Bytes::from_static(b"hot");
+        for seq in 1..=4000u64 {
+            if seq == 3000 {
+                later = Some(txn_manager.new_txn_with_id(seq, Uuid::from_u128(2)));
+            }
+            let keys: HashSet<Bytes> = [hot.clone(), Bytes::from(format!("k{seq:05}"))].into();
+            txn_manager.track_recent_committed_write_batch(&keys, seq);
+        }
+        let last = txn_manager.new_txn_with_id(4001, Uuid::from_u128(3));
+        assert_eq!(txn_manager.inner.read().window_writes.0[&hot].len(), 4000);
+
+        // The commits before `later` started leave the window.
+        txn_manager.drop_txn(&pinned);
+        {
+            let inner = txn_manager.inner.read();
+            assert_eq!(inner.recent_committed_txns.len(), 1001);
+            assert_window_writes_match(&inner, "pin released");
+            assert_eq!(inner.window_writes.0[&hot].len(), 1001);
+        }
+
+        // Every commit leaves the window, though `last` is still active.
+        txn_manager.drop_txn(&later.expect("begun"));
+        {
+            let inner = txn_manager.inner.read();
+            assert!(inner.recent_committed_txns.is_empty());
+            assert_window_writes_match(&inner, "later released");
+            assert!(inner.window_writes.0.is_empty());
+        }
+        txn_manager.drop_txn(&last);
     }
 }
