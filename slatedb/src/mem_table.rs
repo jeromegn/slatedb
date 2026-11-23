@@ -567,6 +567,15 @@ impl KVTable {
         iterator
     }
 
+    /// The entry of `key` with the highest sequence number in this table, whatever its kind.
+    pub(crate) fn newest(&self, key: &Bytes) -> Option<RowEntry> {
+        let range = KVTableInternalKeyRange::from(key.clone()..=key.clone());
+        self.map
+            .range(range)
+            .next()
+            .map(|entry| entry.value().clone())
+    }
+
     pub(crate) fn put(&self, row: RowEntry) {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
