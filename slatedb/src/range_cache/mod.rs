@@ -7,9 +7,10 @@
 //! Bloom filters for point reads), and a base file holding live rows at `base_seq`.
 //!
 //! Only the batch writer mutates the range index and layer sets; loads, flushes, merges, and
-//! removals apply at writer boundaries. Reads pin layers without locking and verify
-//! `seq >= layers.base_seq` and `seq <= layers.active.sealed_at`. Read counts accumulate per
-//! thread and fold periodically into shared metrics and range access timestamps.
+//! removals apply at writer boundaries. A range's base is a sorted list of [`Chunks`] tiling its
+//! span, each holding live rows at its own `base_seq`. Reads pin layers without locking and verify
+//! `seq >= chunk.base_seq` for each touched chunk and `seq <= layers.active.sealed_at`. Read and
+//! fallback counts accumulate per thread and fold periodically into shared metrics and range hits.
 
 mod auto;
 mod buffer;
@@ -27,7 +28,7 @@ mod writer;
 
 use std::collections::BTreeMap;
 use std::io;
-use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,15 +65,17 @@ use buffer::Kind;
 use delta::{Delta, DeltaIterator, DeltaMemory, DeltaShape};
 pub use file::RangeCachePageSource;
 use file::{
-    FileBudget, FileRead, RangeFile, RangeFileIterator, RangeFileWriter, FILE_EXTENSION,
-    TEMP_FILE_EXTENSION,
+    FileBudget, FileRead, RangeFile, RangeFileCursor, RangeFileIterator, RangeFileWriter,
+    FILE_EXTENSION, TEMP_FILE_EXTENSION,
 };
 use filter::{hash_key, Filter};
 use hits::{HitStats, RangeHits};
 pub(crate) use maintain::{Maintainer, RANGE_CACHE_MAINTENANCE_TASK_NAME};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
-use stats::{AutoStats, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
+use stats::{
+    AutoStats, Fallback, FallbackOp, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit,
+};
 use view::{DeltaView, ViewMemory};
 use writer::{Padded, Target, WriterQueue};
 
@@ -272,10 +275,12 @@ pub struct CachedRangeInfo {
     pub loading: bool,
     /// True while sealed buffers await flush or a major merge is due or running.
     pub rebuilding: bool,
-    /// Size of the base file on disk in bytes.
+    /// Size of the base chunk files on disk in bytes.
     pub file_bytes: u64,
-    /// Number of rows in the base file.
+    /// Number of rows across the base chunk files.
     pub file_rows: u64,
+    /// Number of base chunks (`0` while loading, `1` after).
+    pub chunks: usize,
     /// Estimated size of unflushed writes in memory in bytes.
     pub delta_bytes: u64,
     /// True if automatic promotion cached the range.
@@ -288,6 +293,20 @@ pub struct CachedRangeInfo {
     pub sealed_buffers: usize,
     /// Exact heap memory of active and sealed write buffers in bytes.
     pub buffer_bytes: u64,
+    /// The bytes of the run files that flushes of the range installed since its registration,
+    /// flushes at the run cap included.
+    pub flushed_bytes: u64,
+    /// The bytes of the base files that major merges of the range installed since its
+    /// registration.
+    pub major_merge_bytes: u64,
+    /// The major merges of the range that installed since its registration.
+    pub major_merges: u64,
+    /// The point reads that the range served, as of the last fold of each reading thread (see
+    /// [`RangeCacheTuning::stats_fold_events`]).
+    pub gets: u64,
+    /// The scans that started in the range and that the cache served, completely or in part, as
+    /// of the last fold of each reading thread. A scan over several ranges counts in the first.
+    pub scans: u64,
 }
 
 /// One run of a range: a file of every version of the range with a sequence number in
@@ -330,6 +349,179 @@ impl Run {
     }
 }
 
+/// One chunk of a range's base, holding live rows at `base_seq` for its key span.
+#[derive(Clone)]
+pub(crate) struct Chunk {
+    file: Arc<RangeFile>,
+    base_seq: u64,
+}
+
+impl Chunk {
+    fn new(file: Arc<RangeFile>, base_seq: u64) -> Self {
+        Self { file, base_seq }
+    }
+
+    /// Returns true if `run` is already absorbed into this chunk (`run.hi <= base_seq`).
+    fn absorbed(&self, run: &Run) -> bool {
+        run.hi <= self.base_seq
+    }
+}
+
+/// Ordered chunks tiling a range's base. Single-chunk ranges store the chunk inline inside
+/// [`Layers`] so hot reads avoid extra pointer indirections and key comparisons.
+#[derive(Clone)]
+pub(crate) enum Chunks {
+    /// Range is loading and has no base yet.
+    Loading,
+    /// Single chunk covering the entire range.
+    One(Chunk),
+    /// Multiple chunks tiling the range in key order.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Many(Arc<ChunkList>),
+}
+
+/// Multi-chunk base storage and split keys (`starts[i]` is the first key of chunk `i + 1`).
+pub(crate) struct ChunkList {
+    chunks: Box<[Chunk]>,
+    starts: Box<[Bytes]>,
+}
+
+impl ChunkList {
+    #[inline(never)]
+    fn index_of(&self, key: &[u8]) -> usize {
+        self.starts.partition_point(|s| s.as_ref() <= key)
+    }
+
+    #[inline(never)]
+    fn newest_base(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> u64 {
+        let first = match start {
+            Unbounded => 0,
+            Included(key) | Excluded(key) => self.index_of(key),
+        };
+        let last = match end {
+            Unbounded => self.chunks.len() - 1,
+            Included(key) => self.index_of(key),
+            Excluded(key) => self.starts.partition_point(|s| s.as_ref() < key),
+        };
+        self.chunks[first..=last.max(first)]
+            .iter()
+            .map(|c| c.base_seq)
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[inline(never)]
+    fn chunk_of(&self, key: &[u8]) -> Option<&Chunk> {
+        self.chunks.get(self.index_of(key))
+    }
+
+    #[cfg(test)]
+    fn new(chunks: Vec<Chunk>, starts: Vec<Bytes>) -> Self {
+        assert_eq!(
+            chunks.len(),
+            starts.len() + 1,
+            "a start for each chunk after the first"
+        );
+        Self {
+            chunks: chunks.into(),
+            starts: starts.into(),
+        }
+    }
+}
+
+impl std::ops::Deref for Chunks {
+    type Target = [Chunk];
+
+    fn deref(&self) -> &[Chunk] {
+        match self {
+            Chunks::Loading => &[],
+            Chunks::One(chunk) => std::slice::from_ref(chunk),
+            Chunks::Many(list) => &list.chunks,
+        }
+    }
+}
+
+impl Chunks {
+    #[inline]
+    fn loading(&self) -> bool {
+        matches!(self, Chunks::Loading)
+    }
+
+    #[inline]
+    fn start(&self, i: usize) -> Option<&Bytes> {
+        match self {
+            Chunks::Many(list) => i.checked_sub(1).and_then(|at| list.starts.get(at)),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn index_of(&self, key: &[u8]) -> Option<usize> {
+        match self {
+            Chunks::Loading => None,
+            Chunks::One(_) => Some(0),
+            Chunks::Many(list) => Some(list.index_of(key)),
+        }
+    }
+
+    #[inline]
+    fn of(&self, key: &[u8]) -> Option<&Chunk> {
+        match self {
+            Chunks::Loading => None,
+            Chunks::One(chunk) => Some(chunk),
+            Chunks::Many(list) => list.chunk_of(key),
+        }
+    }
+
+    /// Returns the key span of chunk `i` within `[start, end)`.
+    fn span(&self, i: usize, start: Option<&Bytes>, end: Option<&Bytes>) -> BytesRange {
+        let from = match self.start(i).or(if i == 0 { start } else { None }) {
+            Some(start) => Included(start.clone()),
+            None => Unbounded,
+        };
+        let to = match self.start(i + 1).or(end) {
+            Some(end) => Excluded(end.clone()),
+            None => Unbounded,
+        };
+        BytesRange::new(from, to)
+    }
+
+    /// Returns the highest `base_seq` among chunks intersecting `[start, end)`.
+    #[inline]
+    fn newest_base(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Option<u64> {
+        match self {
+            Chunks::Loading => None,
+            Chunks::One(chunk) => Some(chunk.base_seq),
+            Chunks::Many(list) => Some(list.newest_base(start, end)),
+        }
+    }
+
+    fn same(&self, other: &Chunks) -> bool {
+        match (self, other) {
+            (Chunks::One(a), Chunks::One(b)) => {
+                Arc::ptr_eq(&a.file, &b.file) && a.base_seq == b.base_seq
+            }
+            (Chunks::Many(a), Chunks::Many(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    fn handle_bytes(&self) -> usize {
+        match self {
+            Chunks::Many(list) => {
+                size_of::<ChunkList>()
+                    + list.chunks.len() * size_of::<Chunk>()
+                    + list.starts.len() * size_of::<Bytes>()
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn one_chunk(file: Arc<RangeFile>, base_seq: u64) -> Chunks {
+    Chunks::One(Chunk::new(file, base_seq))
+}
+
 /// Immutable layer set of a cached range, replaced atomically by the batch writer.
 ///
 /// Cache-line aligned so `Arc` reference count updates on scans do not contend with read fields.
@@ -341,21 +533,29 @@ pub(crate) struct Layers {
     /// next one, and the oldest one's `lo` is `covered_to`.
     sealed: Vec<Arc<Delta>>,
     /// Runs, newest first, at most [`RangeCacheTuning::max_runs`]: run `i` covers
-    /// `(lo_i, hi_i]` with `hi_{i+1} = lo_i`, and the oldest one's `lo` is `base_seq`.
+    /// `(lo_i, hi_i]` with `hi_{i+1} = lo_i`, and the oldest one's `lo` is the oldest chunk's
+    /// `base_seq` (see [`Layers::floor`]).
     runs: Vec<Arc<Run>>,
-    /// The view of exactly `runs`, which scans read them through; `None` when there is no run.
+    /// Delta view over `runs`, omitting versions already absorbed by a base chunk. `None` when
+    /// there are no runs.
     view: Option<Arc<DeltaView>>,
-    /// `None` while the range loads.
-    base: Option<Arc<RangeFile>>,
-    /// The base holds the state of the range at this sequence number.
-    base_seq: u64,
+    /// The base: chunks that tile the range's span (see [`Chunks`]). None while the range loads.
+    chunks: Chunks,
     /// The base and the runs hold every version of the range at or below this sequence number:
-    /// the newest run's `hi`, or `base_seq`. The buffers hold every version above it.
+    /// the newest run's `hi`, or with no run the `base_seq` of every chunk (of the registration,
+    /// while the range loads). The buffers hold every version above it.
     covered_to: u64,
     /// The end of the range, so that a scan can walk adjacent ranges with one reference to
     /// each.
     end: Option<Bytes>,
 }
+
+// Every field that a read loads, the one chunk's file and `base_seq` included, is in the layer
+// set's one cache line, as before chunks.
+const _: () = assert!(
+    size_of::<Layers>() == 128,
+    "the layer set outgrew its cache line"
+);
 
 impl Layers {
     /// The buffers, newest first: the active one, then the sealed ones.
@@ -363,8 +563,40 @@ impl Layers {
         std::iter::once(&self.active).chain(self.sealed.iter())
     }
 
+    /// Oldest sequence number covered by runs, or `covered_to` when no runs exist.
+    fn floor(&self) -> u64 {
+        self.runs.last().map_or(self.covered_to, |run| run.lo)
+    }
+
+    fn chunk_index(&self, key: &[u8]) -> Option<usize> {
+        self.chunks.index_of(key)
+    }
+
+    fn chunk_of(&self, key: &[u8]) -> Option<&Chunk> {
+        self.chunks.of(key)
+    }
+
+    fn chunk_span(&self, i: usize) -> BytesRange {
+        self.chunks.span(i, None, self.end.as_ref())
+    }
+
+    /// Total base file bytes and rows across all chunks.
+    fn base_size(&self) -> (u64, u64) {
+        self.chunks.iter().fold((0, 0), |(bytes, rows), c| {
+            (bytes + c.file.file_len(), rows + c.file.rows())
+        })
+    }
+
+    #[cfg(test)]
+    fn only_chunk(&self) -> &Chunk {
+        match &self.chunks {
+            Chunks::One(chunk) => chunk,
+            _ => panic!("a range without exactly one chunk"),
+        }
+    }
+
     /// Validates layer invariants in debug builds.
-    fn check(&self, max_runs: usize) {
+    fn check(&self, start: &[u8], max_runs: usize) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -373,13 +605,67 @@ impl Layers {
             "a range holds {} runs",
             self.runs.len()
         );
+        // I4c: the runs are contiguous and end at `covered_to`.
         let mut to = self.covered_to;
         for run in &self.runs {
             assert_eq!(run.hi, to, "runs are not contiguous");
             assert!(run.lo < run.hi || run.lo == run.hi && run.file.rows() == 0);
             to = run.lo;
         }
-        assert_eq!(to, self.base_seq, "the runs do not reach the base");
+        // I3c: the chunks are sorted, disjoint and tile the range's span: chunk 0 starts at the
+        // range's start, and each later one starts above the one before and below the range's end.
+        if let Chunks::Many(list) = &self.chunks {
+            assert_eq!(
+                list.chunks.len(),
+                list.starts.len() + 1,
+                "a chunk list without a start for each chunk after the first"
+            );
+            let mut before: &[u8] = start;
+            for later in list.starts.iter() {
+                assert!(
+                    before < later.as_ref(),
+                    "the chunks are not sorted and disjoint"
+                );
+                before = later;
+            }
+            if let Some(end) = &self.end {
+                assert!(
+                    before < end.as_ref(),
+                    "a chunk starts at or past the range's end"
+                );
+            }
+        }
+        // I4c and I7c: every chunk's versions above its `base_seq` are in runs that end above it,
+        // and the oldest run is one that a chunk needs.
+        if let Some(oldest) = self.chunks.iter().map(|c| c.base_seq).min() {
+            assert_eq!(
+                to, oldest,
+                "the runs do not start at the oldest chunk's base_seq"
+            );
+        }
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            assert!(
+                chunk.base_seq <= self.covered_to,
+                "a chunk above covered_to"
+            );
+            // I4a: a run that a chunk has not absorbed holds no version of its keys at or below
+            // its `base_seq`. A run that starts at or above it holds none by its interval.
+            for run in &self.runs {
+                if chunk.absorbed(run) || run.lo >= chunk.base_seq {
+                    continue;
+                }
+                let range_start = Bytes::copy_from_slice(start);
+                let span = self.chunks.span(i, Some(&range_start), self.end.as_ref());
+                let mut cursor = RangeFileCursor::new(&run.file, &span).expect("a run cursor");
+                while let Some(seq) = cursor.seq() {
+                    assert!(
+                        seq > chunk.base_seq,
+                        "a run holds a version at or below the base_seq of a chunk that needs it"
+                    );
+                    cursor.skip(&run.file).expect("a run cursor");
+                }
+            }
+        }
         assert_eq!(
             self.view.is_some(),
             !self.runs.is_empty(),
@@ -392,11 +678,16 @@ impl Layers {
                 self.runs.iter().all(|r| view.holds(r)),
                 "the view holds other runs"
             );
-            let rows: u64 = self.runs.iter().map(|r| r.file.rows()).sum();
+            // I12: the view lists each run's versions in the chunks that have not absorbed it.
+            let rows: u64 = self
+                .runs
+                .iter()
+                .map(|r| self.unabsorbed_rows(r, start))
+                .sum();
             assert_eq!(
                 view.len() as u64,
                 rows,
-                "the view does not list the runs' rows"
+                "the view does not list the runs' rows that no chunk absorbed"
             );
         }
         let mut lo = self.covered_to;
@@ -409,6 +700,29 @@ impl Layers {
             lo,
             "the active buffer does not follow the sealed ones"
         );
+    }
+
+    /// The rows of `run` in the chunks that have not absorbed it, in a range that starts at
+    /// `start`: all of them unless a chunk has. Counts the rows by key for a run that some chunks
+    /// have absorbed, for [`Layers::check`].
+    fn unabsorbed_rows(&self, run: &Run, start: &[u8]) -> u64 {
+        if !self.chunks.iter().any(|c| c.absorbed(run)) {
+            return run.file.rows();
+        }
+        let start = Bytes::copy_from_slice(start);
+        let mut rows = 0;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            if chunk.absorbed(run) {
+                continue;
+            }
+            let span = self.chunks.span(i, Some(&start), self.end.as_ref());
+            let mut cursor = RangeFileCursor::new(&run.file, &span).expect("a run cursor");
+            while cursor.key().is_some() {
+                rows += 1;
+                cursor.skip(&run.file).expect("a run cursor");
+            }
+        }
+        rows
     }
 }
 
@@ -544,21 +858,28 @@ impl CachedRange {
 
     fn info(&self, tuning: &RangeCacheTuning) -> CachedRangeInfo {
         let layers = self.layers.load();
+        let (file_bytes, file_rows) = layers.base_size();
         CachedRangeInfo {
             start: self.start.clone(),
             end: self.end.clone(),
-            loading: layers.base.is_none(),
+            loading: layers.chunks.loading(),
             rebuilding: !layers.sealed.is_empty()
                 || self.jobs.merging()
                 || maintain::major_due(self, &layers, tuning).is_some(),
-            file_bytes: layers.base.as_ref().map_or(0, |f| f.file_len()),
-            file_rows: layers.base.as_ref().map_or(0, |f| f.rows()),
+            file_bytes,
+            file_rows,
+            chunks: layers.chunks.len(),
             delta_bytes: self.delta_bytes(&layers),
             automatic: self.auto,
             runs: layers.runs.len(),
             run_bytes: layers.runs.iter().map(|r| r.file_bytes()).sum(),
             sealed_buffers: layers.sealed.len(),
             buffer_bytes: layers.buffers().map(|b| b.memory_bytes()).sum(),
+            flushed_bytes: self.jobs.flushed_bytes(),
+            major_merge_bytes: self.jobs.major_merge_bytes(),
+            major_merges: self.jobs.major_merges(),
+            gets: self.heat.hits.gets(),
+            scans: self.heat.hits.scans(),
         }
     }
 
@@ -575,27 +896,31 @@ impl CachedRange {
     /// The bytes of the range's base and runs, which count against the disk budget.
     fn file_bytes(&self) -> u64 {
         let layers = self.layers.load();
-        layers.base.as_ref().map_or(0, |f| f.file_len())
-            + layers.runs.iter().map(|r| r.file_bytes()).sum::<u64>()
+        layers.base_size().0 + layers.runs.iter().map(|r| r.file_bytes()).sum::<u64>()
     }
 
-    /// The heap metadata of the range's files: the fence indexes and filters of its base and
-    /// runs.
+    /// The heap metadata of the range's files: the fence indexes and filters of its base's chunks
+    /// and its runs.
     fn files_meta_bytes(&self) -> u64 {
         let layers = self.layers.load();
-        layers.base.as_ref().map_or(0, |f| f.meta_bytes())
+        layers
+            .chunks
+            .iter()
+            .map(|c| c.file.meta_bytes())
+            .sum::<u64>()
             + layers.runs.iter().map(|r| r.file.meta_bytes()).sum::<u64>()
     }
 
     /// The heap metadata of the range, which counts against the metadata budget: the fence
-    /// indexes and filters of its base and runs, and its layer set with its run handles.
+    /// indexes and filters of its base and runs, and its layer set with its run and chunk handles.
     fn meta_bytes(&self) -> u64 {
         let files = self.files_meta_bytes();
         let layers = self.layers.load();
         let handles = size_of::<CachedRange>()
             + size_of::<Layers>()
             + (layers.sealed.capacity() + layers.runs.capacity()) * size_of::<usize>()
-            + layers.runs.len() * size_of::<Run>();
+            + layers.runs.len() * size_of::<Run>()
+            + layers.chunks.handle_bytes();
         files + handles as u64 + self.view_bytes()
     }
 
@@ -656,6 +981,11 @@ fn uncovered(
         }
     }
     parts
+}
+
+/// The bound `bound` of a key range, on the key's bytes.
+fn as_slices(bound: &Bound<Bytes>) -> Bound<&[u8]> {
+    bound.as_ref().map(|key| key.as_ref())
 }
 
 /// Converts `range` to a half-open range `[start, end)`. Returns `None` if it holds no key.
@@ -871,7 +1201,7 @@ impl RangeCache {
             .index
             .load()
             .values()
-            .filter(|r| r.layers.load().base.is_some())
+            .filter(|r| !r.layers.load().chunks.loading())
             .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)))
             .cloned()
             .collect::<Vec<_>>();
@@ -955,16 +1285,47 @@ impl RangeCache {
         meta <= self.options.tuning.meta_limit(self.options.max_disk_bytes)
     }
 
-    /// Checks whether a read at `seq` can use `layers`. See the sequence number rules. Callers
-    /// treat a loading range, which has no base, as uncovered before they call this.
-    fn usable(layers: &Layers, seq: u64) -> Result<(), Unfit> {
-        if layers.base.is_none() || seq < layers.base_seq {
+    /// Checks whether a read at `seq` can use `layers` when the chunks that it needs hold the
+    /// state at `base_seq` or older: the highest `base_seq` among them. See the sequence number
+    /// rules. Callers treat a loading range, which has no chunk, as uncovered before they call
+    /// this.
+    fn usable_from(layers: &Layers, base_seq: u64, seq: u64) -> Result<(), Unfit> {
+        if seq < base_seq {
             return Err(Unfit::TooOld);
         }
         if layers.active.sealed_at().load(Ordering::SeqCst) < seq {
             return Err(Unfit::Sealed);
         }
         Ok(())
+    }
+
+    /// Checks whether a read of `[start, end)` at `seq` can use `layers`.
+    fn usable_for(
+        layers: &Layers,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        seq: u64,
+    ) -> Result<(), Unfit> {
+        match layers.chunks.newest_base(start, end) {
+            Some(base_seq) => Self::usable_from(layers, base_seq, seq),
+            None => Err(Unfit::TooOld),
+        }
+    }
+
+    #[cfg(test)]
+    fn usable(layers: &Layers, seq: u64) -> Result<(), Unfit> {
+        Self::usable_for(layers, Unbounded, Unbounded, seq)
+    }
+
+    /// Records a normal-path fallback on the current thread.
+    #[cold]
+    #[inline(never)]
+    fn count_fallback(&self, op: FallbackOp, reason: Fallback) {
+        let count = ReadCount::fallback(op, reason);
+        debug_assert!(count.is_some(), "a fallback of {op:?} for {reason:?}");
+        if let Some(count) = count {
+            self.hits.count(count);
+        }
     }
 
     fn count_read(&self, range: &CachedRange, count: ReadCount) {
@@ -988,18 +1349,21 @@ impl RangeCache {
         for attempt in 1..=PIN_ATTEMPTS {
             let index = self.index.load();
             let Some(cached) = covering(&index, key) else {
+                self.count_fallback(FallbackOp::Get, Fallback::Uncovered);
                 return CacheRead::Uncovered;
             };
             let layers = cached.layers.load();
-            if layers.base.is_none() {
+            let Some(chunk) = layers.chunk_of(key) else {
+                self.count_fallback(FallbackOp::Get, Fallback::Loading);
                 return CacheRead::Uncovered;
-            }
+            };
             fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
             let seq = read_seq(oracle, at);
-            if let Err(reason) = Self::usable(&layers, seq) {
+            if let Err(reason) = Self::usable_from(&layers, chunk.base_seq, seq) {
                 if self.count_unfit(PinOp::Get, reason, attempt) {
                     continue;
                 }
+                self.count_fallback(FallbackOp::Get, reason.into());
                 return CacheRead::Unusable;
             }
             return match lookup(&layers, key, seq) {
@@ -1021,10 +1385,12 @@ impl RangeCache {
                 Err(e) => {
                     warn!("range cache read failed [error={:?}]", e);
                     self.request_removal(Target::Range(cached.clone()), RemoveReason::Error);
+                    self.count_fallback(FallbackOp::Get, Fallback::Error);
                     CacheRead::Uncovered
                 }
             };
         }
+        // The last attempt returns: `count_unfit` never retries it.
         CacheRead::Unusable
     }
 
@@ -1044,7 +1410,10 @@ impl RangeCache {
     }
 
     /// See [`RangeCache::pin_scan`]. Returns `None` if ready ranges do not hold all of `range`,
-    /// and `Some(Err(()))` if they do but fail the sequence number rules.
+    /// and `Some(Err(()))` if they do but fail the sequence number rules, which it counts as the
+    /// scan's fallback (the error carries no reason, so that the result keeps the plain layout of a
+    /// `PinnedScan`, which the read copies out cheaply). A part is usable if
+    /// the chunks that the scan meets in it are.
     fn try_pin_scan(
         &self,
         range: &BytesRange,
@@ -1074,39 +1443,55 @@ impl RangeCache {
                 last = index.get(last.end.as_ref()?)?;
                 parts.push(last.layers.load_full());
             }
-            if parts.iter().any(|l| l.base.is_none()) {
+            if parts.iter().any(|l| l.chunks.loading()) {
                 return None;
             }
             fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
             let seq = read_seq(oracle, at);
-            if let Some(first) = parts.iter().find_map(|l| Self::usable(l, seq).err()) {
+            // The scan meets its first part from its start, its last part up to its end, and the
+            // parts between whole.
+            let end = RangeBounds::end_bound(range).map(|key| key.as_ref());
+            let last_part = parts.len() - 1;
+            let usable = |i: usize, layers: &Layers| {
+                let from = if i == 0 { Included(start) } else { Unbounded };
+                let to = if i == last_part { end } else { Unbounded };
+                Self::usable_for(layers, from, to, seq)
+            };
+            let unfit = parts
+                .iter()
+                .enumerate()
+                .find_map(|(i, l)| usable(i, l).err());
+            if let Some(first) = unfit {
                 // One part that is too old makes every attempt fail.
                 let too_old = first == Unfit::TooOld
                     || parts
                         .iter()
-                        .any(|l| Self::usable(l, seq) == Err(Unfit::TooOld));
+                        .enumerate()
+                        .any(|(i, l)| usable(i, l) == Err(Unfit::TooOld));
                 let reason = if too_old { Unfit::TooOld } else { first };
                 if self.count_unfit(PinOp::Scan, reason, attempt) {
                     continue;
                 }
+                self.count_fallback(FallbackOp::Scan, reason.into());
                 return Some(Err(()));
             }
             // Only the first range counts as read: most scans end in it.
             self.count_read(first, ReadCount::Scan);
             return Some(Ok(PinnedScan { parts, seq }));
         }
+        // The last attempt returns: `count_unfit` never retries it.
         Some(Err(()))
     }
 
-    /// Plans a mixed scan of cached parts and gaps at one sequence number. Returns `None` if no
-    /// usable cached range intersects `range`.
+    /// Plans a mixed scan of cached parts and gaps at one sequence number. Returns the highest-
+    /// priority fallback reason if no usable cached range intersects `range`.
     fn pin_mixed(
         &self,
         range: &BytesRange,
         oracle: &dyn Oracle,
         at: Option<u64>,
-    ) -> Option<MixedPin> {
-        let (start, end) = half_open(range)?;
+    ) -> Result<MixedPin, Fallback> {
+        let (start, end) = half_open(range).ok_or(Fallback::Uncovered)?;
         let index = self.index.load();
         let intersecting: Vec<&Arc<CachedRange>> = covering(&index, &start)
             .into_iter()
@@ -1118,7 +1503,7 @@ impl RangeCache {
             )
             .collect();
         if intersecting.is_empty() {
-            return None;
+            return Err(Fallback::Uncovered);
         }
         let pinned: Vec<Arc<Layers>> = intersecting.iter().map(|r| r.layers.load_full()).collect();
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
@@ -1126,13 +1511,21 @@ impl RangeCache {
 
         let scan_end = RangeBounds::end_bound(range).cloned();
         let mut parts = Vec::with_capacity(2 * intersecting.len() + 1);
-        let mut push = |kind, start: std::ops::Bound<Bytes>, end: std::ops::Bound<Bytes>| {
+        let mut push = |kind, start: Bound<Bytes>, end: Bound<Bytes>| {
             if BytesRange::try_new(start.clone(), end.clone()).is_some() {
                 parts.push(Part { kind, start, end });
             }
         };
         let mut cursor = Some(RangeBounds::start_bound(range).cloned());
         let mut first_cached: Option<&Arc<CachedRange>> = None;
+        // Why no part is cached, if none is.
+        let mut closest = Fallback::Uncovered;
+        let mut gap = |reason: Fallback| {
+            if reason.rank() < closest.rank() {
+                closest = reason;
+            }
+            PartKind::Gap(reason)
+        };
         for (cached, layers) in intersecting.iter().zip(pinned) {
             let Some(from) = cursor.take() else {
                 break;
@@ -1144,7 +1537,7 @@ impl RangeCache {
             };
             let from = if before {
                 push(
-                    PartKind::Gap { sample: true },
+                    PartKind::Gap(Fallback::Uncovered),
                     from,
                     Excluded(cached.start.clone()),
                 );
@@ -1153,10 +1546,10 @@ impl RangeCache {
                 from
             };
             let to = scan::min_end(&scan_end, &cached.end);
-            let kind = if layers.base.is_none() {
-                PartKind::Gap { sample: true }
+            let kind = if layers.chunks.loading() {
+                gap(Fallback::Loading)
             } else {
-                match Self::usable(&layers, seq) {
+                match Self::usable_for(&layers, as_slices(&from), as_slices(&to), seq) {
                     Ok(()) => {
                         first_cached.get_or_insert(*cached);
                         PartKind::Cached(layers)
@@ -1164,7 +1557,7 @@ impl RangeCache {
                     Err(reason) => {
                         self.hits
                             .count(ReadCount::unusable(PinOp::ScanPart, reason));
-                        PartKind::Gap { sample: false }
+                        gap(reason.into())
                     }
                 }
             };
@@ -1172,10 +1565,10 @@ impl RangeCache {
             cursor = cached.end.clone().map(Included);
         }
         if let Some(from) = cursor {
-            push(PartKind::Gap { sample: true }, from, scan_end);
+            push(PartKind::Gap(Fallback::Uncovered), from, scan_end);
         }
-        let first = first_cached?.clone();
-        Some(MixedPin { parts, seq, first })
+        let first = first_cached.ok_or(closest)?.clone();
+        Ok(MixedPin { parts, seq, first })
     }
 
     pub(crate) fn ranges(&self) -> Vec<CachedRangeInfo> {
@@ -1321,9 +1714,9 @@ fn read_seq(oracle: &dyn Oracle, at: Option<u64>) -> u64 {
 
 /// Result of [`RangeCache::get`].
 pub(crate) enum CacheRead {
-    /// No ready range holds the key, or the cache hit an error.
+    /// No ready range holds the key, or a cache read failed (`uncovered`, `loading`, or `error`).
     Uncovered,
-    /// A ready range holds the key, but failed sequence number checks.
+    /// A ready range holds the key, but failed sequence checks (`too_old` or `sealed`).
     Unusable,
     /// Resolved value or definite miss at the read sequence number.
     Answer(Option<KeyValue>),
@@ -1357,8 +1750,8 @@ pub(crate) enum ScanPin {
     Pinned(PinnedScan),
     /// Ready ranges do not hold all of the scan range.
     Uncovered,
-    /// Ready ranges hold the scan range, but failed the sequence number rules. See
-    /// [`CacheRead::Unusable`].
+    /// Ready ranges hold the scan range, but failed the sequence number rules, which the pin
+    /// counted. See [`CacheRead::Unusable`].
     Unusable,
 }
 
@@ -1400,7 +1793,8 @@ enum Found {
     Merge,
 }
 
-/// Finds the newest version of `key` in `layers` at `seq`, checking buffers, runs, then base.
+/// Finds the newest version of `key` in `layers` at `seq`, checking buffers, unabsorbed runs,
+/// and the chunk holding `key`.
 fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
     let mut hash = None;
     let mut hash_of = || *hash.get_or_insert_with(|| hash_key(key));
@@ -1434,6 +1828,10 @@ fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
         if !run.filter.may_contain(hash_of()) {
             continue;
         }
+        // Runs are newest first and contiguous, so stop once the chunk already absorbed this run.
+        if run.hi <= layers.chunk_of(key).map_or(0, |c| c.base_seq) {
+            break;
+        }
         if let Some(found) = run.file.read_version(key, seq)? {
             return Ok(match found {
                 FileRead::Value(row) => Found::Value(KeyValue::from(row)),
@@ -1442,8 +1840,8 @@ fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
             });
         }
     }
-    let row = match &layers.base {
-        Some(file) => file.get(key)?,
+    let row = match layers.chunk_of(key) {
+        Some(chunk) => chunk.file.get(key)?,
         None => None,
     };
     Ok(match row {
@@ -1456,8 +1854,8 @@ fn lookup(layers: &Layers, key: &[u8], seq: u64) -> io::Result<Found> {
     })
 }
 
-/// Opens a normal iterator stack over `layers` at `seq` for merge resolution, skipping runs
-/// ruled out by sequence bounds, key bounds, or Bloom filter.
+/// Opens a normal iterator stack over `layers` at `seq` for merge resolution, reading each
+/// touched chunk and only the unabsorbed runs meeting it.
 async fn stack_iterator(
     layers: &Layers,
     seq: u64,
@@ -1472,24 +1870,45 @@ async fn stack_iterator(
         })
         .collect();
     let hash = one_key(&range).map(hash_key);
-    for run in &layers.runs {
-        if run.lo >= seq
-            || run.file.rows() == 0
-            || !run_meets(run, &range)
-            || hash.is_some_and(|hash| !run.filter.may_contain(hash))
-        {
-            continue;
+    // The runs above `floor` that can hold a version of `part` at or below `seq`.
+    let push_runs =
+        |sources: &mut Vec<Box<dyn RowEntryIterator + 'static>>, floor: u64, part: &BytesRange| {
+            for run in &layers.runs {
+                if run.hi <= floor {
+                    break;
+                }
+                if run.lo >= seq
+                    || run.file.rows() == 0
+                    || !run_meets(run, part)
+                    || hash.is_some_and(|hash| !run.filter.may_contain(hash))
+                {
+                    continue;
+                }
+                sources.push(Box::new(RangeFileIterator::new(
+                    run.file.clone(),
+                    part.clone(),
+                )));
+            }
+        };
+    match &layers.chunks {
+        // Layers without a base, which only tests read: every run counts.
+        Chunks::Loading => push_runs(&mut sources, 0, &range),
+        Chunks::One(only) => {
+            push_runs(&mut sources, only.base_seq, &range);
+            sources.push(Box::new(RangeFileIterator::new(
+                only.file.clone(),
+                range.clone(),
+            )));
         }
-        sources.push(Box::new(RangeFileIterator::new(
-            run.file.clone(),
-            range.clone(),
-        )));
-    }
-    if let Some(file) = &layers.base {
-        sources.push(Box::new(RangeFileIterator::new(
-            file.clone(),
-            range.clone(),
-        )));
+        Chunks::Many(list) => {
+            for (i, chunk) in list.chunks.iter().enumerate() {
+                let Some(part) = range.intersect(&layers.chunk_span(i)) else {
+                    continue;
+                };
+                push_runs(&mut sources, chunk.base_seq, &part);
+                sources.push(Box::new(RangeFileIterator::new(chunk.file.clone(), part)));
+            }
+        }
     }
     DbIterator::new(
         range,
@@ -1550,19 +1969,39 @@ fn scan_start(range: &BytesRange) -> Bytes {
 ///
 /// Traced reads bypass the cache so tests can compare cached reads against the normal path.
 pub(crate) fn can_serve_get(options: &ReadOptions) -> bool {
-    matches!(options.durability_filter, DurabilityLevel::Memory)
-        && !options.dirty
-        && options.filter_context.is_none()
-        && options.tracing_options.is_none()
+    get_options_fallback(options).is_none()
 }
 
-/// Returns true if an ascending scan with `options` can use the range cache.
-pub(crate) fn can_serve_scan(options: &ScanOptions) -> bool {
-    matches!(options.durability_filter, DurabilityLevel::Memory)
-        && !options.dirty
-        && matches!(options.order, IterationOrder::Ascending)
-        && options.filter_context.is_none()
-        && options.tracing_options.is_none()
+/// Returns the first option preventing a point read from using the range cache, if any.
+fn get_options_fallback(options: &ReadOptions) -> Option<Fallback> {
+    if !matches!(options.durability_filter, DurabilityLevel::Memory) {
+        Some(Fallback::Remote)
+    } else if options.dirty {
+        Some(Fallback::Dirty)
+    } else if options.filter_context.is_some() {
+        Some(Fallback::Filter)
+    } else if options.tracing_options.is_some() {
+        Some(Fallback::Traced)
+    } else {
+        None
+    }
+}
+
+/// Returns the first option preventing a scan from using the range cache, if any.
+fn scan_options_fallback(options: &ScanOptions) -> Option<Fallback> {
+    if !matches!(options.durability_filter, DurabilityLevel::Memory) {
+        Some(Fallback::Remote)
+    } else if options.dirty {
+        Some(Fallback::Dirty)
+    } else if !matches!(options.order, IterationOrder::Ascending) {
+        Some(Fallback::Descending)
+    } else if options.filter_context.is_some() {
+        Some(Fallback::Filter)
+    } else if options.tracing_options.is_some() {
+        Some(Fallback::Traced)
+    } else {
+        None
+    }
 }
 
 /// Normal-path read sampled for automatic promotion, paired with its key or scan start key.
@@ -1599,7 +2038,8 @@ impl DbInner {
         let Some(cache) = &self.range_cache else {
             return GetRoute::Normal(None);
         };
-        if !can_serve_get(options) {
+        if let Some(reason) = get_options_fallback(options) {
+            cache.count_fallback(FallbackOp::Get, reason);
             return GetRoute::Normal(None);
         }
         cache.hits.bind_db(&self.db_stats);
@@ -1629,7 +2069,8 @@ impl DbInner {
         let Some(cache) = &self.range_cache else {
             return ScanRoute::Normal(range, None);
         };
-        if !can_serve_scan(options) {
+        if let Some(reason) = scan_options_fallback(options) {
+            cache.count_fallback(FallbackOp::Scan, reason);
             return ScanRoute::Normal(range, None);
         }
         cache.hits.bind_db(&self.db_stats);
@@ -1640,12 +2081,18 @@ impl DbInner {
                     .await,
             ),
             ScanPin::Uncovered => {
+                // Why the scan uses the normal read path, if no attempt plans a mixed scan.
+                let mut reason = Fallback::Frozen;
                 for _ in 0..PIN_ATTEMPTS {
                     // For latest-state scans, capture the state view before pinning so it retains
                     // all versions at or below the pinned sequence number unless a freeze occurs.
                     let latest_view = at.is_none().then(|| self.state.read().view());
-                    let Some(pin) = cache.pin_mixed(&range, self.oracle.as_ref(), at) else {
-                        break;
+                    let pin = match cache.pin_mixed(&range, self.oracle.as_ref(), at) {
+                        Ok(pin) => pin,
+                        Err(why) => {
+                            reason = why;
+                            break;
+                        }
                     };
                     fail_point!(Arc::clone(&cache.fp_registry), "range-cache-mixed-pinned");
                     let view = match latest_view {
@@ -1679,6 +2126,7 @@ impl DbInner {
                         DbIterator::new_resolved(range, Box::new(scan), ReadTrace::none()).await,
                     );
                 }
+                cache.count_fallback(FallbackOp::Scan, reason);
                 let sample = cache.sample().map(|sample| SampledRead {
                     sample,
                     key: scan_start(&range),
@@ -1950,8 +2398,7 @@ mod tests {
                             sealed: Vec::new(),
                             runs: Vec::new(),
                             view: None,
-                            base: None,
-                            base_seq: 0,
+                            chunks: Chunks::Loading,
                             covered_to: 0,
                             end: end.map(b),
                         },
@@ -2165,6 +2612,9 @@ mod tests {
                     ]
                 );
                 assert_eq!(range.heat.hits.last_access(), clock);
+                // The range's own counts, gets and scans apart.
+                let info = &t.db.cached_ranges()[0];
+                assert_eq!((info.gets, info.scans), (400, 20));
             });
         }
 
@@ -2264,6 +2714,15 @@ mod tests {
                     1,
                     "{reason}"
                 );
+                // Each read used the normal path once for its reason: the mixed scan too, as no
+                // range served a part of it.
+                assert_eq!(t.unfit(stats::FALLBACK_COUNT, "get", reason), 1, "{reason}");
+                assert_eq!(
+                    t.unfit(stats::FALLBACK_COUNT, "scan", reason),
+                    2,
+                    "{reason}"
+                );
+                assert_eq!(t.unfit(stats::FALLBACK_COUNT, "gap", reason), 0, "{reason}");
             }
             // None of them counts as served.
             assert_eq!(t.read_metrics()[..3], [0, 0, 0]);

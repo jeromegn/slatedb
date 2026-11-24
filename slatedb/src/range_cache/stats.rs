@@ -1,8 +1,9 @@
 //! Metrics for the range cache.
 //!
 //! Read-path counters (`get_count`, `scan_count`, `mixed_scan_count`, `scan_gap_count`,
-//! `mixed_scan_retry_count`, `pin_retry_count`, and `unusable_count`) accumulate per thread and
-//! fold into shared counters periodically. See [`crate::RangeCacheTuning::stats_fold_events`].
+//! `mixed_scan_retry_count`, `pin_retry_count`, `unusable_count`, and `fallback_count`) accumulate
+//! per thread and fold into shared counters periodically. See
+//! [`crate::RangeCacheTuning::stats_fold_events`].
 
 use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
 use std::sync::Arc;
@@ -29,6 +30,10 @@ pub const PIN_RETRY_COUNT: &str = range_cache_stat_name!("pin_retry_count");
 /// Reads that fell back to the normal read path because a cached range failed sequence rules.
 /// `op` is `get`, `scan`, or `scan_part`; `reason` is `too_old` or `sealed`.
 pub const UNUSABLE_COUNT: &str = range_cache_stat_name!("unusable_count");
+/// Reads that used the normal read path instead of the range cache, counted once by `op` (`get`,
+/// `scan`, or `gap`) and `reason` (`uncovered`, `loading`, `too_old`, `sealed`, `error`, `frozen`,
+/// `descending`, `remote`, `dirty`, `filter`, or `traced`).
+pub const FALLBACK_COUNT: &str = range_cache_stat_name!("fallback_count");
 /// Ranges loaded into the cache.
 pub const LOAD_COUNT: &str = range_cache_stat_name!("load_count");
 /// Bytes of range cache files written by loads.
@@ -115,10 +120,55 @@ impl RemoveReason {
 /// Why a ready cached range failed sequence number checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unfit {
-    /// The read sequence number is below the base sequence number.
+    /// The read sequence number is below a needed chunk's `base_seq`.
     TooOld,
     /// The read sequence number is above the active buffer seal.
     Sealed,
+}
+
+/// Why a read or mixed-scan gap used the normal read path. See [`FALLBACK_COUNT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    Uncovered,
+    Loading,
+    TooOld,
+    Sealed,
+    Error,
+    Frozen,
+    Descending,
+    Remote,
+    Dirty,
+    Filter,
+    Traced,
+}
+
+impl From<Unfit> for Fallback {
+    fn from(reason: Unfit) -> Self {
+        match reason {
+            Unfit::TooOld => Fallback::TooOld,
+            Unfit::Sealed => Fallback::Sealed,
+        }
+    }
+}
+
+impl Fallback {
+    /// Priority order when choosing one fallback reason for an unserved scan.
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Fallback::TooOld => 0,
+            Fallback::Sealed => 1,
+            Fallback::Loading => 2,
+            _ => 3,
+        }
+    }
+}
+
+/// Operation label for [`FALLBACK_COUNT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FallbackOp {
+    Get,
+    Scan,
+    Gap,
 }
 
 /// The kind of read pinning cached ranges.
@@ -149,10 +199,33 @@ pub(crate) enum ReadCount {
     UnusableScanSealed,
     UnusablePartTooOld,
     UnusablePartSealed,
+    FallbackGetUncovered,
+    FallbackGetLoading,
+    FallbackGetTooOld,
+    FallbackGetSealed,
+    FallbackGetError,
+    FallbackGetRemote,
+    FallbackGetDirty,
+    FallbackGetFilter,
+    FallbackGetTraced,
+    FallbackScanUncovered,
+    FallbackScanLoading,
+    FallbackScanTooOld,
+    FallbackScanSealed,
+    FallbackScanFrozen,
+    FallbackScanDescending,
+    FallbackScanRemote,
+    FallbackScanDirty,
+    FallbackScanFilter,
+    FallbackScanTraced,
+    FallbackGapUncovered,
+    FallbackGapLoading,
+    FallbackGapTooOld,
+    FallbackGapSealed,
 }
 
 /// Number of [`ReadCount`] variants.
-pub(crate) const READ_COUNTS: usize = 17;
+pub(crate) const READ_COUNTS: usize = 40;
 
 impl ReadCount {
     /// Every variant in discriminant order.
@@ -174,12 +247,71 @@ impl ReadCount {
         ReadCount::UnusableScanSealed,
         ReadCount::UnusablePartTooOld,
         ReadCount::UnusablePartSealed,
+        ReadCount::FallbackGetUncovered,
+        ReadCount::FallbackGetLoading,
+        ReadCount::FallbackGetTooOld,
+        ReadCount::FallbackGetSealed,
+        ReadCount::FallbackGetError,
+        ReadCount::FallbackGetRemote,
+        ReadCount::FallbackGetDirty,
+        ReadCount::FallbackGetFilter,
+        ReadCount::FallbackGetTraced,
+        ReadCount::FallbackScanUncovered,
+        ReadCount::FallbackScanLoading,
+        ReadCount::FallbackScanTooOld,
+        ReadCount::FallbackScanSealed,
+        ReadCount::FallbackScanFrozen,
+        ReadCount::FallbackScanDescending,
+        ReadCount::FallbackScanRemote,
+        ReadCount::FallbackScanDirty,
+        ReadCount::FallbackScanFilter,
+        ReadCount::FallbackScanTraced,
+        ReadCount::FallbackGapUncovered,
+        ReadCount::FallbackGapLoading,
+        ReadCount::FallbackGapTooOld,
+        ReadCount::FallbackGapSealed,
     ];
 
     pub(crate) fn index(self) -> usize {
         self as usize
     }
 
+    /// Returns true if this read counts as a scan rather than a get on the range.
+    pub(crate) fn is_scan(self) -> bool {
+        matches!(self, ReadCount::Scan | ReadCount::MixedScan)
+    }
+
+    /// Maps `(op, reason)` to its fallback counter, or `None` for impossible combinations.
+    pub(crate) fn fallback(op: FallbackOp, reason: Fallback) -> Option<Self> {
+        use Fallback as F;
+        use FallbackOp as O;
+        Some(match (op, reason) {
+            (O::Get, F::Uncovered) => ReadCount::FallbackGetUncovered,
+            (O::Get, F::Loading) => ReadCount::FallbackGetLoading,
+            (O::Get, F::TooOld) => ReadCount::FallbackGetTooOld,
+            (O::Get, F::Sealed) => ReadCount::FallbackGetSealed,
+            (O::Get, F::Error) => ReadCount::FallbackGetError,
+            (O::Get, F::Remote) => ReadCount::FallbackGetRemote,
+            (O::Get, F::Dirty) => ReadCount::FallbackGetDirty,
+            (O::Get, F::Filter) => ReadCount::FallbackGetFilter,
+            (O::Get, F::Traced) => ReadCount::FallbackGetTraced,
+            (O::Scan, F::Uncovered) => ReadCount::FallbackScanUncovered,
+            (O::Scan, F::Loading) => ReadCount::FallbackScanLoading,
+            (O::Scan, F::TooOld) => ReadCount::FallbackScanTooOld,
+            (O::Scan, F::Sealed) => ReadCount::FallbackScanSealed,
+            (O::Scan, F::Frozen) => ReadCount::FallbackScanFrozen,
+            (O::Scan, F::Descending) => ReadCount::FallbackScanDescending,
+            (O::Scan, F::Remote) => ReadCount::FallbackScanRemote,
+            (O::Scan, F::Dirty) => ReadCount::FallbackScanDirty,
+            (O::Scan, F::Filter) => ReadCount::FallbackScanFilter,
+            (O::Scan, F::Traced) => ReadCount::FallbackScanTraced,
+            (O::Gap, F::Uncovered) => ReadCount::FallbackGapUncovered,
+            (O::Gap, F::Loading) => ReadCount::FallbackGapLoading,
+            (O::Gap, F::TooOld) => ReadCount::FallbackGapTooOld,
+            (O::Gap, F::Sealed) => ReadCount::FallbackGapSealed,
+            _ => return None,
+        })
+    }
     pub(crate) fn retry(op: PinOp, reason: Unfit) -> Self {
         match (op, reason) {
             (PinOp::Get, Unfit::TooOld) => ReadCount::RetryGetTooOld,
@@ -236,8 +368,55 @@ impl ReadCount {
             ReadCount::UnusablePartSealed => {
                 (UNUSABLE_COUNT, &[("op", "scan_part"), ("reason", "sealed")])
             }
+            ReadCount::FallbackGetUncovered => fallback_labels("get", "uncovered"),
+            ReadCount::FallbackGetLoading => fallback_labels("get", "loading"),
+            ReadCount::FallbackGetTooOld => fallback_labels("get", "too_old"),
+            ReadCount::FallbackGetSealed => fallback_labels("get", "sealed"),
+            ReadCount::FallbackGetError => fallback_labels("get", "error"),
+            ReadCount::FallbackGetRemote => fallback_labels("get", "remote"),
+            ReadCount::FallbackGetDirty => fallback_labels("get", "dirty"),
+            ReadCount::FallbackGetFilter => fallback_labels("get", "filter"),
+            ReadCount::FallbackGetTraced => fallback_labels("get", "traced"),
+            ReadCount::FallbackScanUncovered => fallback_labels("scan", "uncovered"),
+            ReadCount::FallbackScanLoading => fallback_labels("scan", "loading"),
+            ReadCount::FallbackScanTooOld => fallback_labels("scan", "too_old"),
+            ReadCount::FallbackScanSealed => fallback_labels("scan", "sealed"),
+            ReadCount::FallbackScanFrozen => fallback_labels("scan", "frozen"),
+            ReadCount::FallbackScanDescending => fallback_labels("scan", "descending"),
+            ReadCount::FallbackScanRemote => fallback_labels("scan", "remote"),
+            ReadCount::FallbackScanDirty => fallback_labels("scan", "dirty"),
+            ReadCount::FallbackScanFilter => fallback_labels("scan", "filter"),
+            ReadCount::FallbackScanTraced => fallback_labels("scan", "traced"),
+            ReadCount::FallbackGapUncovered => fallback_labels("gap", "uncovered"),
+            ReadCount::FallbackGapLoading => fallback_labels("gap", "loading"),
+            ReadCount::FallbackGapTooOld => fallback_labels("gap", "too_old"),
+            ReadCount::FallbackGapSealed => fallback_labels("gap", "sealed"),
         }
     }
+}
+
+/// Returns the metric name and label slice for `fallback_count`.
+fn fallback_labels(
+    op: &'static str,
+    reason: &'static str,
+) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    macro_rules! labels {
+        ($($op:literal, $reason:literal;)*) => {
+            match (op, reason) {
+                $(($op, $reason) => &[("op", $op), ("reason", $reason)],)*
+                _ => &[],
+            }
+        };
+    }
+    let labels: &'static [(&'static str, &'static str)] = labels! {
+        "get", "uncovered"; "get", "loading"; "get", "too_old"; "get", "sealed"; "get", "error";
+        "get", "remote"; "get", "dirty"; "get", "filter"; "get", "traced";
+        "scan", "uncovered"; "scan", "loading"; "scan", "too_old"; "scan", "sealed";
+        "scan", "frozen"; "scan", "descending"; "scan", "remote"; "scan", "dirty";
+        "scan", "filter"; "scan", "traced";
+        "gap", "uncovered"; "gap", "loading"; "gap", "too_old"; "gap", "sealed";
+    };
+    (FALLBACK_COUNT, labels)
 }
 
 /// Registers read-path counters indexed by [`ReadCount::index`].
@@ -444,5 +623,49 @@ mod tests {
                 &[("op", "scan_part"), ("reason", "sealed")][..]
             )
         );
+    }
+
+    #[test]
+    fn should_map_each_possible_fallback_to_its_own_counter() {
+        use Fallback as F;
+        let reasons = [
+            (F::Uncovered, "uncovered"),
+            (F::Loading, "loading"),
+            (F::TooOld, "too_old"),
+            (F::Sealed, "sealed"),
+            (F::Error, "error"),
+            (F::Frozen, "frozen"),
+            (F::Descending, "descending"),
+            (F::Remote, "remote"),
+            (F::Dirty, "dirty"),
+            (F::Filter, "filter"),
+            (F::Traced, "traced"),
+        ];
+        let ops = [
+            (FallbackOp::Get, "get"),
+            (FallbackOp::Scan, "scan"),
+            (FallbackOp::Gap, "gap"),
+        ];
+        let mut counters = BTreeSet::new();
+        for (op, op_label) in ops {
+            for (reason, reason_label) in reasons {
+                let possible = match op {
+                    FallbackOp::Get => !matches!(reason, F::Frozen | F::Descending),
+                    FallbackOp::Scan => reason != F::Error,
+                    FallbackOp::Gap => {
+                        matches!(reason, F::Uncovered | F::Loading | F::TooOld | F::Sealed)
+                    }
+                };
+                let Some(count) = ReadCount::fallback(op, reason) else {
+                    assert!(!possible, "{op_label} {reason_label}");
+                    continue;
+                };
+                assert!(possible, "{op_label} {reason_label}");
+                let labels = [("op", op_label), ("reason", reason_label)];
+                assert_eq!(count.metric(), (FALLBACK_COUNT, &labels[..]));
+                assert!(counters.insert(count.index()));
+            }
+        }
+        assert_eq!(counters.len(), 23);
     }
 }

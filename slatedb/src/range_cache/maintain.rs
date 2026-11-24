@@ -5,10 +5,10 @@
 //!   view incrementally, and sends `InstallRun`. When a range holds `max_runs`, the flush merges
 //!   up to [`FLUSH_MERGE_RUNS`] newest free runs into the new run so flushes never block on a
 //!   major merge.
-//! - **Major merge**: merges a range's base with its oldest runs (at most `max_runs - 1`, none
-//!   held by an in-flight flush) when run bytes reach `min_rebuild_delta_bytes` and either
-//!   `major_merge_factor * base` or `max_runs - headroom` runs. Adaptive headroom tracks flushes
-//!   that land while a merge runs.
+//! - **Major merge**: merges each chunk of a range's base with the oldest unabsorbed runs (at most
+//!   `max_runs - 1`, none held by an in-flight flush) into a single new chunk when run bytes reach
+//!   `min_rebuild_delta_bytes` and either `major_merge_factor * base` or `max_runs - headroom`
+//!   runs. Adaptive headroom tracks flushes that land while a merge runs.
 //! - **View races**: flushes and major merges run concurrently on blocking threads. If one
 //!   changes the view before the other installs, the second rebuilds its view on the new state
 //!   (up to [`VIEW_ATTEMPTS`] times) without rewriting its file.
@@ -22,6 +22,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use fail_parallel::fail_point;
 use futures::stream::BoxStream;
 use log::{debug, warn};
@@ -33,9 +34,9 @@ use super::merge::merge_versions;
 use super::stats::RemoveReason;
 use super::writer::{same_view, Target, ViewSwap};
 use super::{
-    CachedRange, DeltaView, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run, MAX_RUNS_RANGE,
+    CachedRange, Chunks, DeltaView, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run,
+    MAX_RUNS_RANGE,
 };
-use crate::bytes_range::BytesRange;
 use crate::db::DbInner;
 use crate::db_iter::DbIterator;
 use crate::dispatcher::{MessageHandler, MessageTickerDef};
@@ -140,6 +141,13 @@ pub(super) struct RangeJobs {
     /// The flushes of the range that installed. Only the writer stores it, before it stores the
     /// layers with the flush's run, so a look at those layers sees the count.
     flushes: AtomicU64,
+    /// The bytes of the runs that flushes of the range installed, flushes at the run cap
+    /// included. Only the writer stores it.
+    flushed_bytes: AtomicU64,
+    /// The major merges of the range that installed, and the bytes of their bases. Only the
+    /// writer stores them.
+    major_merges: AtomicU64,
+    major_merge_bytes: AtomicU64,
     /// `flushes` when the task queued the range's major merge. Only the task stores it.
     merge_queued_at: AtomicU64,
     /// The headroom of the count trigger (see the module documentation), or 0 before the first
@@ -188,14 +196,32 @@ impl RangeJobs {
         h.clamp(1, (max_runs / 2).max(1))
     }
 
-    /// Counts a flush that installs. The writer calls it.
-    pub(super) fn record_flush(&self) {
+    /// Counts a flush that installs a run of `bytes`. The writer calls it.
+    pub(super) fn record_flush(&self, bytes: u64) {
         self.flushes.fetch_add(1, Ordering::Relaxed);
+        self.flushed_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Sets the headroom when a major merge installs, from the flushes that installed since the
-    /// task queued it, and returns their number. The writer calls it.
-    pub(super) fn record_major(&self) -> u64 {
+    /// The bytes of the runs that the range's flushes installed.
+    pub(super) fn flushed_bytes(&self) -> u64 {
+        self.flushed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The major merges of the range that installed.
+    pub(super) fn major_merges(&self) -> u64 {
+        self.major_merges.load(Ordering::Relaxed)
+    }
+
+    /// The bytes of the bases that the range's major merges installed.
+    pub(super) fn major_merge_bytes(&self) -> u64 {
+        self.major_merge_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Counts a major merge that installs a base of `bytes`, sets the headroom from the flushes
+    /// that installed since the task queued it, and returns their number. The writer calls it.
+    pub(super) fn record_major(&self, bytes: u64) -> u64 {
+        self.major_merges.fetch_add(1, Ordering::Relaxed);
+        self.major_merge_bytes.fetch_add(bytes, Ordering::Relaxed);
         let landed = self
             .flushes
             .load(Ordering::Relaxed)
@@ -260,13 +286,15 @@ pub(super) fn major_due(
     layers: &Layers,
     tuning: &RangeCacheTuning,
 ) -> Option<Trigger> {
-    let base = layers.base.as_ref()?;
+    if layers.chunks.loading() {
+        return None;
+    }
     let runs = layers.runs.len();
     let run_bytes: u64 = layers.runs.iter().map(|r| r.file_bytes()).sum();
     if runs == 0 || run_bytes < tuning.min_rebuild_delta_bytes as u64 {
         return None;
     }
-    if run_bytes >= major_threshold(base.file_len(), tuning) {
+    if run_bytes >= major_threshold(layers.base_size().0, tuning) {
         return Some(Trigger::Bytes);
     }
     (runs + range.jobs.headroom(tuning.max_runs) >= tuning.max_runs).then_some(Trigger::Runs)
@@ -431,12 +459,12 @@ impl RangeCache {
         Ok((Run::new(file, lo, hi)?, rows))
     }
 
-    /// Merges `base` with `absorbed` (newest first) into a new base at the newest absorbed run's
-    /// `hi`, and installs it with the updated delta view.
+    /// Merges `chunks` with `absorbed` (newest first) into a new single-chunk base at the newest
+    /// absorbed run's `hi`, and installs it with the updated delta view.
     async fn major_merge(
         self: &Arc<Self>,
         range: &Arc<CachedRange>,
-        base: Arc<RangeFile>,
+        chunks: Chunks,
         absorbed: Vec<Arc<Run>>,
     ) -> Result<(), SlateDBError> {
         let Some(base_seq) = absorbed.first().map(|r| r.hi) else {
@@ -447,15 +475,18 @@ impl RangeCache {
             .store(range.heat.reads(), Ordering::Relaxed);
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-rebuild");
         let new_base = {
-            let (cache, absorbed, base) = (self.clone(), absorbed.clone(), base.clone());
+            let (cache, absorbed, chunks) = (self.clone(), absorbed.clone(), chunks.clone());
+            let (start, end) = (range.start.clone(), range.end.clone());
             let handle = tokio::runtime::Handle::current();
-            Arc::new(
-                off_workers(move || handle.block_on(cache.merge_files(&absorbed, &base, base_seq)))
-                    .await?,
-            )
+            let file = off_workers(move || {
+                let merge = cache.merge_files(&absorbed, &chunks, &start, end.as_ref(), base_seq);
+                handle.block_on(merge)
+            })
+            .await?;
+            Arc::new(file)
         };
         if self
-            .install_major_with_view(range, &base, absorbed, new_base, base_seq)
+            .install_major_with_view(range, &chunks, absorbed, new_base, base_seq)
             .await?
         {
             self.evict(None).await;
@@ -466,7 +497,7 @@ impl RangeCache {
     async fn install_major_with_view(
         self: &Arc<Self>,
         range: &Arc<CachedRange>,
-        base: &Arc<RangeFile>,
+        chunks: &Chunks,
         absorbed: Vec<Arc<Run>>,
         new_base: Arc<RangeFile>,
         base_seq: u64,
@@ -497,7 +528,7 @@ impl RangeCache {
             if self
                 .install_major(
                     range,
-                    base,
+                    chunks,
                     absorbed.clone(),
                     new_base.clone(),
                     base_seq,
@@ -514,48 +545,54 @@ impl RangeCache {
         Ok(false)
     }
 
-    /// Writes the state at `base_seq` of `runs` (newest first) over `base` to a new base: newest
-    /// versions, tombstones dropped, merge operands folded, base-less merge operands kept.
+    /// Writes the state at `base_seq` of `chunks` and `runs` (newest first) into a new base file.
+    /// Merges each chunk within its span against runs it has not yet absorbed.
     pub(super) async fn merge_files(
         &self,
         runs: &[Arc<Run>],
-        base: &Arc<RangeFile>,
+        chunks: &Chunks,
+        start: &Bytes,
+        end: Option<&Bytes>,
         base_seq: u64,
     ) -> Result<RangeFile, SlateDBError> {
-        let all = BytesRange::unbounded();
-        let mut sources: Vec<Box<dyn RowEntryIterator + 'static>> = runs
-            .iter()
-            .map(|run| {
-                Box::new(RangeFileIterator::new(run.file.clone(), all.clone()))
-                    as Box<dyn RowEntryIterator + 'static>
-            })
-            .collect();
-        sources.push(Box::new(RangeFileIterator::new(base.clone(), all.clone())));
-        let mut iter = DbIterator::new(
-            all,
-            None,
-            sources,
-            Box::new(EmptyIterator::new()),
-            Some(base_seq),
-            self.merge_operator.clone(),
-            IterationOrder::Ascending,
-            ReadTrace::none(),
-        )
-        .await?;
         let mut writer = RangeFileWriter::create(
             &self.options.root_folder,
             &self.new_file_name(),
             self.options.tuning.page_size,
         )?;
-        while let Some(entry) = iter.next_entry().await? {
-            writer.push(&entry)?;
+        for (i, chunk) in chunks.iter().enumerate() {
+            debug_assert!(chunk.base_seq <= base_seq, "a chunk newer than its merge");
+            let span = chunks.span(i, Some(start), end);
+            let mut sources: Vec<Box<dyn RowEntryIterator + 'static>> = runs
+                .iter()
+                .filter(|run| !chunk.absorbed(run))
+                .map(|run| {
+                    Box::new(RangeFileIterator::new(run.file.clone(), span.clone()))
+                        as Box<dyn RowEntryIterator + 'static>
+                })
+                .collect();
+            sources.push(Box::new(RangeFileIterator::new(
+                chunk.file.clone(),
+                span.clone(),
+            )));
+            let mut iter = DbIterator::new(
+                span,
+                None,
+                sources,
+                Box::new(EmptyIterator::new()),
+                Some(base_seq),
+                self.merge_operator.clone(),
+                IterationOrder::Ascending,
+                ReadTrace::none(),
+            )
+            .await?;
+            while let Some(entry) = iter.next_entry().await? {
+                writer.push(&entry)?;
+            }
         }
         let path = writer.finish()?;
-        Ok(RangeFile::open(
-            path,
-            self.options.page_source,
-            self.files.clone(),
-        )?)
+        let file = RangeFile::open(path, self.options.page_source, self.files.clone())?;
+        Ok(file)
     }
 }
 
@@ -583,9 +620,9 @@ enum Job {
         lo: u64,
         hi: u64,
     },
-    /// Merge `base` with `absorbed`, the oldest runs (newest first), into a new base.
+    /// Merge `chunks`, the base, with `absorbed`, the oldest runs (newest first), into a new base.
     Major {
-        base: Arc<RangeFile>,
+        chunks: Chunks,
         absorbed: Vec<Arc<Run>>,
     },
 }
@@ -731,15 +768,15 @@ impl Maintainer {
             let Some(runs) = plan_major(&range, &layers, tuning, range.jobs.flush_held()) else {
                 continue;
             };
-            let Some(base) = layers.base.clone() else {
+            if layers.chunks.loading() {
                 continue;
-            };
-            if !cache.rebuild_pays(&range, base.file_len()) {
+            }
+            if !cache.rebuild_pays(&range, layers.base_size().0) {
                 cache.request_removal(Target::Range(range.clone()), RemoveReason::NotWorthIt);
                 continue;
             }
             let job = Job::Major {
-                base,
+                chunks: layers.chunks.clone(),
                 absorbed: layers.runs[runs].to_vec(),
             };
             drop(layers);
@@ -823,8 +860,8 @@ impl Maintainer {
                         lo,
                         hi,
                     } => cache.flush(&range, buffers, replaces, lo, hi).await,
-                    Job::Major { base, absorbed } => {
-                        cache.major_merge(&range, base, absorbed).await
+                    Job::Major { chunks, absorbed } => {
+                        cache.major_merge(&range, chunks, absorbed).await
                     }
                 }
             },
@@ -1105,7 +1142,7 @@ mod tests {
         assert!(sealed.allocated_bytes() >= 16 * 1024);
         assert_eq!(layers.active.lo(), s);
         assert!(layers.active.is_empty());
-        assert_eq!(layers.covered_to, layers.base_seq);
+        assert_eq!(layers.covered_to, layers.only_chunk().base_seq);
         // A reader that pinned the earlier set sees the seal through the shared word.
         assert_eq!(RangeCache::usable(&before, s), Ok(()));
         assert_eq!(RangeCache::usable(&before, s + 1), Err(Unfit::Sealed));
@@ -1121,10 +1158,14 @@ mod tests {
         .await;
         let layers = range.layers.load_full();
         let run = &layers.runs[0];
-        assert_eq!((run.lo, run.hi, layers.covered_to), (layers.base_seq, s, s));
+        assert_eq!(
+            (run.lo, run.hi, layers.covered_to),
+            (layers.only_chunk().base_seq, s, s)
+        );
         assert_eq!(run.file.rows(), sealed.len());
         assert_eq!(t.metric(FLUSH_COUNT, &[]), 1);
         assert_eq!(t.metric(FLUSH_BYTES, &[]) as u64, run.file_bytes());
+        assert_eq!(t.info(&key(0)).flushed_bytes, run.file_bytes());
         assert_eq!(t.cache_files(), 2);
         assert!(!t.info(&key(0)).rebuilding);
         t.assert_reads(0, 100, Some(&snapshot)).await;
@@ -1172,7 +1213,7 @@ mod tests {
         assert_eq!(
             (layers.runs.last().unwrap().lo, layers.runs[0].hi),
             (
-                layers.base_seq,
+                layers.only_chunk().base_seq,
                 sealed[0].sealed_at().load(Ordering::SeqCst)
             )
         );
@@ -1257,13 +1298,24 @@ mod tests {
             .await;
         // A later merge sleeps too, so this state holds while the test reads it.
         let layers = range.layers.load_full();
-        assert_eq!(layers.base_seq, cut);
+        assert_eq!(layers.only_chunk().base_seq, cut);
         assert_eq!(assert_view(&range), 1);
         assert_eq!(layers.runs[0].lo, cut);
         assert!(!Arc::ptr_eq(
-            layers.base.as_ref().unwrap(),
-            one.base.as_ref().unwrap()
+            &layers.only_chunk().file,
+            &one.only_chunk().file
         ));
+        // The range's own counts: two flushes, one major merge.
+        let info = t.info(&key(0));
+        assert_eq!(
+            (info.major_merges, info.major_merge_bytes),
+            (1, layers.only_chunk().file.file_len())
+        );
+        assert_eq!(
+            info.flushed_bytes,
+            one.runs[0].file_bytes() + layers.runs[0].file_bytes()
+        );
+        assert_eq!(info.chunks, 1);
         // The snapshot is older than the new base: it uses the normal path, and stays exact.
         assert!(snapshot.seq() < cut);
         t.assert_reads(0, 100, Some(&snapshot)).await;
@@ -1632,17 +1684,24 @@ mod tests {
         .await;
 
         // A major merge whose base, runs, cut or view moved on.
-        let base = after.base.clone().unwrap();
+        let base = after.chunks.clone();
         let merged = |base_seq| {
             let cache = cache.clone();
-            let (runs, base) = (vec![first.clone()], base.clone());
-            async move { Arc::new(cache.merge_files(&runs, &base, base_seq).await.unwrap()) }
+            let (runs, base, end) = (vec![first.clone()], base.clone(), range.end.clone());
+            async move {
+                let file = cache
+                    .merge_files(&runs, &base, &key(0), end.as_ref(), base_seq)
+                    .await
+                    .unwrap();
+                Arc::new(file)
+            }
         };
         let without = || ViewSwap {
             new: None,
             was: range.layers.load().view.clone(),
         };
-        let other = merged(first.hi).await;
+        // A base that is not the range's: another file at the same sequence number.
+        let other = super::super::one_chunk(merged(first.hi).await, base[0].base_seq);
         let absorbed = vec![first.clone()];
         for (base_was, absorbed, cut, swap) in [
             (&other, absorbed.clone(), first.hi, without()),
@@ -1684,7 +1743,10 @@ mod tests {
                 .await
         );
         let after = range.layers.load_full();
-        assert_eq!((after.base_seq, after.runs.len()), (first.hi, 0));
+        assert_eq!(
+            (after.only_chunk().base_seq, after.runs.len()),
+            (first.hi, 0)
+        );
         assert!(after.view.is_none());
         assert_eq!(t.metric(REBUILD_COUNT, &[]), 1);
         t.assert_reads(0, 100, None).await;
@@ -1715,7 +1777,7 @@ mod tests {
             None => assert!(layers.runs.is_empty(), "runs without a view"),
             Some(view) => view.check().unwrap(),
         }
-        layers.check(*MAX_RUNS_RANGE.end());
+        layers.check(&range.start, *MAX_RUNS_RANGE.end());
         layers.runs.len()
     }
 
@@ -1819,7 +1881,7 @@ mod tests {
             .await;
         assert_eq!(t.metric(INSTALL_REJECTED_COUNT, &[]), 1);
         assert_eq!(assert_view(&range), 1);
-        assert_eq!(range.layers.load().base_seq, held.runs[0].hi);
+        assert_eq!(range.layers.load().only_chunk().base_seq, held.runs[0].hi);
         // Three flushes installed while it waited and ran: the headroom grows to four, held at
         // half of `max_runs`.
         assert_eq!(range.jobs.headroom.load(Ordering::Relaxed), 4);
@@ -1982,8 +2044,7 @@ mod tests {
                 sealed: Vec::new(),
                 runs: Vec::new(),
                 view: None,
-                base: None,
-                base_seq: 0,
+                chunks: Chunks::Loading,
                 covered_to: 0,
                 end: None,
             },
@@ -1999,8 +2060,10 @@ mod tests {
             sealed: Vec::new(),
             runs: runs[8 - n..].to_vec(),
             view: None,
-            base: with_base.then(|| base.clone()),
-            base_seq: 0,
+            chunks: match with_base {
+                true => super::super::one_chunk(base.clone(), 0),
+                false => Chunks::Loading,
+            },
             covered_to: 0,
             end: None,
         };
@@ -2032,9 +2095,9 @@ mod tests {
                 Ordering::Relaxed,
             );
             for _ in 0..flushes {
-                range.jobs.record_flush();
+                range.jobs.record_flush(0);
             }
-            assert_eq!(range.jobs.record_major(), flushes);
+            assert_eq!(range.jobs.record_major(0), flushes);
             range.jobs.headroom(64)
         };
         assert_eq!(land(9), 10);

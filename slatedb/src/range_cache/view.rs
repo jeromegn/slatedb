@@ -1,10 +1,11 @@
 //! Sorted delta view over all run files of a cached range.
 //!
 //! Each entry stores a run slot plus first-version flag, a 32-bit file offset, and front-coded
-//! key metadata (shared prefix length and next byte). Periodic anchor keys let seeks binary-search
-//! anchors and scan one segment without reading run files in the common case. Flushes add a run
-//! incrementally from its writer's row locators; major merges drop absorbed runs without reading
-//! keys except to replace dropped anchors.
+//! key metadata (shared prefix length and next byte). The view omits run versions already
+//! absorbed by a base chunk. Periodic anchor keys let seeks binary-search anchors and scan one
+//! segment without reading run files in the common case. Flushes add a run incrementally from its
+//! writer's row locators; major merges drop absorbed runs without reading keys except to replace
+//! dropped anchors.
 
 use std::borrow::Cow;
 use std::cmp::Ordering as Cmp;
@@ -337,6 +338,16 @@ impl DeltaView {
     /// Builds a view from `runs` (newest first) by reading every key from their files.
     #[cfg(test)]
     pub(crate) fn from_runs(runs: &[Arc<Run>], memory: &Arc<ViewMemory>) -> io::Result<Self> {
+        Self::from_runs_where(runs, memory, |_, _| true)
+    }
+
+    /// Builds a view from `runs` keeping only entries matching `keep(run, key)`.
+    #[cfg(test)]
+    pub(crate) fn from_runs_where(
+        runs: &[Arc<Run>],
+        memory: &Arc<ViewMemory>,
+        keep: impl Fn(&Run, &[u8]) -> bool,
+    ) -> io::Result<Self> {
         if runs.len() > VIEW_SLOTS {
             return Err(corrupt("too many runs"));
         }
@@ -344,7 +355,9 @@ impl DeltaView {
         for (slot, run) in runs.iter().enumerate() {
             check_size(run)?;
             run.file.for_each_row(|offset, key, seq| {
-                rows.push((key.to_vec(), seq, slot as u8, offset as u32));
+                if keep(run, key) {
+                    rows.push((key.to_vec(), seq, slot as u8, offset as u32));
+                }
                 Ok(())
             })?;
         }

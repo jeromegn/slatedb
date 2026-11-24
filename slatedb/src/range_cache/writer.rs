@@ -17,7 +17,8 @@ use super::auto::Removal;
 use super::file::RangeFile;
 use super::stats::RemoveReason;
 use super::{
-    covering, uncovered, CachedRange, Delta, DeltaView, Layers, Origin, RangeCache, RangeIndex, Run,
+    covering, one_chunk, uncovered, CachedRange, Chunks, Delta, DeltaView, Layers, Origin,
+    RangeCache, RangeIndex, Run,
 };
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
@@ -42,7 +43,8 @@ pub(super) enum Request {
         origin: Origin,
         reply: oneshot::Sender<Result<Registered, SlateDBError>>,
     },
-    /// Publish the base of a loading range. The base holds the state at `base_seq`.
+    /// Publish the base of a loading range, one chunk over the range that holds the state at
+    /// `base_seq`.
     AttachBase {
         range: Arc<CachedRange>,
         base: Arc<RangeFile>,
@@ -61,11 +63,11 @@ pub(super) enum Request {
         view: ViewSwap,
         reply: oneshot::Sender<bool>,
     },
-    /// Replace the base `base_was` of `range` and its oldest runs `absorbed` (newest first) with
-    /// `base`, which a major merge wrote with the state at `base_seq`.
+    /// Replace the base `chunks_was` of `range` and its oldest runs `absorbed` (newest first) with
+    /// `base`, one chunk over the range that a major merge wrote with the state at `base_seq`.
     InstallMajor {
         range: Arc<CachedRange>,
-        base_was: Arc<RangeFile>,
+        chunks_was: Chunks,
         absorbed: Vec<Arc<Run>>,
         base: Arc<RangeFile>,
         base_seq: u64,
@@ -334,13 +336,13 @@ impl RangeCache {
         answer.await.unwrap_or(false)
     }
 
-    /// Installs a base that a major merge wrote from `base_was` and `absorbed`, with its view.
+    /// Installs a base that a major merge wrote from `chunks_was` and `absorbed`, with its view.
     /// Returns false if the state moved on (see [`RangeCache::install_major_at`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn install_major(
         &self,
         range: &Arc<CachedRange>,
-        base_was: &Arc<RangeFile>,
+        chunks_was: &Chunks,
         absorbed: Vec<Arc<Run>>,
         base: Arc<RangeFile>,
         base_seq: u64,
@@ -349,7 +351,7 @@ impl RangeCache {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::InstallMajor {
             range: range.clone(),
-            base_was: base_was.clone(),
+            chunks_was: chunks_was.clone(),
             absorbed,
             base,
             base_seq,
@@ -563,8 +565,7 @@ impl RangeCache {
                 sealed: buffers,
                 runs: layers.runs.clone(),
                 view: layers.view.clone(),
-                base: layers.base.clone(),
-                base_seq: layers.base_seq,
+                chunks: layers.chunks.clone(),
                 covered_to: layers.covered_to,
                 end: range.end.clone(),
             },
@@ -574,7 +575,7 @@ impl RangeCache {
 
     /// Publishes a new layer set of `range`.
     fn store_layers(&self, range: &CachedRange, layers: Layers) {
-        layers.check(self.options.tuning.max_runs);
+        layers.check(&range.start, self.options.tuning.max_runs);
         range.layers.store(Arc::new(layers));
     }
 
@@ -636,7 +637,7 @@ impl RangeCache {
             }
             Request::InstallMajor {
                 range,
-                base_was,
+                chunks_was,
                 absorbed,
                 base,
                 base_seq,
@@ -644,7 +645,7 @@ impl RangeCache {
                 reply,
             } => {
                 let installed =
-                    self.install_major_at(&range, &base_was, &absorbed, base, base_seq, view);
+                    self.install_major_at(&range, &chunks_was, &absorbed, base, base_seq, view);
                 let _ = reply.send(installed);
             }
             Request::Seal { range, buffer } => {
@@ -671,7 +672,7 @@ impl RangeCache {
                     if self.within_budgets() {
                         break;
                     }
-                    if victim.layers.load().base.is_some() {
+                    if !victim.layers.load().chunks.loading() {
                         self.remove_at(&victim, w, RemoveReason::Evicted);
                     }
                 }
@@ -702,9 +703,8 @@ impl RangeCache {
                 sealed: Vec::new(),
                 runs: Vec::new(),
                 view: None,
-                // A loading range serves no read.
-                base: None,
-                base_seq: w,
+                // A loading range serves no read. Its runs start at `w`, the base's `base_seq`.
+                chunks: Chunks::Loading,
                 covered_to: w,
                 end: part_end.clone(),
             };
@@ -726,13 +726,13 @@ impl RangeCache {
         Registered { seq: w, ranges }
     }
 
-    /// Publishes the base of a loading range while preserving buffers and runs built concurrently.
+    /// Publishes the base of a loading range as one chunk while preserving buffers and runs.
     fn attach_at(&self, range: &Arc<CachedRange>, base: Arc<RangeFile>, base_seq: u64) -> bool {
         if !self.is_indexed(range) {
             return false;
         }
         let layers = range.layers.load_full();
-        if layers.base.is_some() || layers.base_seq != base_seq {
+        if !layers.chunks.loading() || layers.floor() != base_seq {
             return false;
         }
         self.stats.loads.increment(1);
@@ -746,8 +746,7 @@ impl RangeCache {
                 sealed: layers.sealed.clone(),
                 runs: layers.runs.clone(),
                 view: layers.view.clone(),
-                base: Some(base),
-                base_seq,
+                chunks: one_chunk(base, base_seq),
                 covered_to: layers.covered_to,
                 end: range.end.clone(),
             },
@@ -797,11 +796,12 @@ impl RangeCache {
         }
         let mut runs = Vec::with_capacity(layers.runs.len() + 1 - replaces.len());
         let covered_to = run.hi;
+        let covered_bytes = run.file_bytes();
         runs.push(run);
         runs.extend(layers.runs[replaces.len()..].iter().cloned());
         let sealed = layers.sealed[..kept.unwrap_or(0)].to_vec();
         // Count before storing layers so maintenance sees the updated flush count.
-        range.jobs.record_flush();
+        range.jobs.record_flush(covered_bytes);
         self.store_layers(
             range,
             Layers {
@@ -809,8 +809,7 @@ impl RangeCache {
                 sealed,
                 runs,
                 view: view.new,
-                base: layers.base.clone(),
-                base_seq: layers.base_seq,
+                chunks: layers.chunks.clone(),
                 covered_to,
                 end: range.end.clone(),
             },
@@ -818,12 +817,12 @@ impl RangeCache {
         true
     }
 
-    /// Installs a major-merged base at `base_seq`, dropping `absorbed` runs and swapping the delta
-    /// view. Newer runs flushed during the merge remain intact.
+    /// Installs a major-merged single-chunk base at `base_seq`, dropping `absorbed` runs and
+    /// swapping the delta view. Newer runs flushed during the merge remain intact.
     pub(super) fn install_major_at(
         &self,
         range: &Arc<CachedRange>,
-        base_was: &Arc<RangeFile>,
+        chunks_was: &Chunks,
         absorbed: &[Arc<Run>],
         base: Arc<RangeFile>,
         base_seq: u64,
@@ -834,10 +833,7 @@ impl RangeCache {
             return false;
         }
         let layers = range.layers.load_full();
-        let same_base = layers
-            .base
-            .as_ref()
-            .is_some_and(|b| Arc::ptr_eq(b, base_was));
+        let same_base = layers.chunks.same(chunks_was);
         let kept = layers.runs.len().checked_sub(absorbed.len());
         let oldest = kept.is_some_and(|kept| {
             layers.runs[kept..]
@@ -856,7 +852,7 @@ impl RangeCache {
         let kept = kept.unwrap_or(0);
         self.stats.rebuilds.increment(1);
         self.stats.rebuild_bytes.increment(base.file_len());
-        range.jobs.record_major();
+        range.jobs.record_major(base.file_len());
         self.store_layers(
             range,
             Layers {
@@ -864,8 +860,7 @@ impl RangeCache {
                 sealed: layers.sealed.clone(),
                 runs: layers.runs[..kept].to_vec(),
                 view: view.new,
-                base: Some(base),
-                base_seq,
+                chunks: one_chunk(base, base_seq),
                 covered_to: layers.covered_to,
                 end: range.end.clone(),
             },
@@ -1247,14 +1242,14 @@ mod tests {
         t.db.cache_range(span(10, 90)).await.unwrap();
         let range = t.range(&key(10));
         // The file holds the state at the boundary, the last committed sequence number then.
-        assert_eq!(range.layers.load().base_seq, before);
+        assert_eq!(range.layers.load().only_chunk().base_seq, before);
         assert_eq!(t.cache().writer.applied(), before);
         // A later batch goes to the delta, above the file.
         t.db.put(key(20), "new").await.unwrap();
         let seq = t.committed();
         let layers = range.layers.load();
         assert_eq!(layers.active.len(), 1);
-        assert!(seq > layers.base_seq);
+        assert!(seq > layers.only_chunk().base_seq);
         assert_eq!(t.db.get(key(20)).await.unwrap(), Some(Bytes::from("new")));
         t.db.close().await.unwrap();
     }
@@ -1319,6 +1314,110 @@ mod tests {
         assert_eq!(unfit(PIN_RETRY_COUNT, "get"), 0);
         assert_eq!(unfit(PIN_RETRY_COUNT, "scan"), 0);
         drop(txn);
+        t.db.close().await.unwrap();
+    }
+
+    /// Every unserved read counts once by fallback reason so served plus fallbacks equals total.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_count_each_fallback_once_by_reason() {
+        use crate::config::{DurabilityLevel, ScanOptions};
+        use crate::iter::IterationOrder;
+        use crate::range_cache::stats::{FALLBACK_COUNT, GET_COUNT, MIXED_SCAN_COUNT, SCAN_COUNT};
+
+        let t = open(|_| {}).await;
+        put_all(&t.db, 0..100).await;
+        let fallback =
+            |op: &str, reason: &str| t.metric(FALLBACK_COUNT, &[("op", op), ("reason", reason)]);
+        let scan = |range: (std::ops::Bound<Bytes>, std::ops::Bound<Bytes>),
+                    options: ScanOptions| {
+            let db = t.db.clone();
+            async move {
+                let mut iter = db.scan_with_options(range, &options).await.unwrap();
+                while iter.next().await.unwrap().is_some() {}
+            }
+        };
+        let traced = || ScanOptions::default().with_tracing_options(Some(TracingOptions::new("n")));
+
+        // No range at all.
+        t.db.get(key(5)).await.unwrap();
+        scan(span(5, 10), ScanOptions::default()).await;
+        assert_eq!(
+            (fallback("get", "uncovered"), fallback("scan", "uncovered")),
+            (1, 1)
+        );
+
+        // Read options that the cache does not serve, the first in order.
+        let remote = ReadOptions::default().with_durability_filter(DurabilityLevel::Remote);
+        t.db.get_with_options(key(5), &remote).await.unwrap();
+        let dirty = ReadOptions::default().with_dirty(true);
+        t.db.get_with_options(key(5), &dirty).await.unwrap();
+        t.db.get_with_options(key(5), &normal()).await.unwrap();
+        let descending = ScanOptions::default().with_order(IterationOrder::Descending);
+        scan(span(5, 10), descending.clone()).await;
+        scan(
+            span(5, 10),
+            descending.with_tracing_options(Some(TracingOptions::new("n"))),
+        )
+        .await;
+        scan(span(5, 10), traced()).await;
+        for (op, reason, n) in [
+            ("get", "remote", 1),
+            ("get", "dirty", 1),
+            ("get", "traced", 1),
+            ("scan", "descending", 2),
+            ("scan", "traced", 1),
+        ] {
+            assert_eq!(fallback(op, reason), n, "{op} {reason}");
+        }
+
+        // A range that loads.
+        t.fail("range-cache-load", "pause");
+        let load = {
+            let db = t.db.clone();
+            tokio::spawn(async move { db.cache_range(span(10, 50)).await })
+        };
+        tokio::time::timeout(PROMPT, async {
+            while !t.db.cached_ranges().first().is_some_and(|r| r.loading) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        t.db.get(key(20)).await.unwrap();
+        scan(span(20, 30), ScanOptions::default()).await;
+        assert_eq!(
+            (fallback("get", "loading"), fallback("scan", "loading")),
+            (1, 1)
+        );
+        t.fail("range-cache-load", "off");
+        load.await.unwrap().unwrap();
+
+        // Served: a get, a scan, and a mixed scan whose gap the normal path reads.
+        t.db.get(key(20)).await.unwrap();
+        scan(span(20, 30), ScanOptions::default()).await;
+        scan(span(40, 60), ScanOptions::default()).await;
+        assert_eq!(t.metric(SCAN_COUNT, &[]), 1);
+        assert_eq!(t.metric(MIXED_SCAN_COUNT, &[]), 1);
+        assert_eq!(fallback("gap", "uncovered"), 1);
+
+        // Every read counted once: 6 gets and 7 scans.
+        let served_gets: i64 = ["hit", "absent", "merge"]
+            .iter()
+            .map(|r| t.metric(GET_COUNT, &[("result", r)]))
+            .sum();
+        let get_fallbacks: i64 = ["uncovered", "loading", "remote", "dirty", "traced"]
+            .iter()
+            .map(|r| fallback("get", r))
+            .sum();
+        assert_eq!(served_gets + get_fallbacks, 6);
+        let scan_fallbacks: i64 = ["uncovered", "loading", "descending", "traced"]
+            .iter()
+            .map(|r| fallback("scan", r))
+            .sum();
+        assert_eq!(
+            t.metric(SCAN_COUNT, &[]) + t.metric(MIXED_SCAN_COUNT, &[]) + scan_fallbacks,
+            7
+        );
         t.db.close().await.unwrap();
     }
 

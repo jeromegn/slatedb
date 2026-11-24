@@ -1,9 +1,9 @@
 //! Direct scan path for cached ranges.
 //!
-//! [`CachedScan`] merges cursors over the base file, visible write buffers, and the range's delta
-//! view at one sequence number. It skips tombstones, resolves merge operands via the normal stack
-//! for that single key, and copies small page spans so returned rows never keep file mappings
-//! alive. Adjacent ranges are scanned sequentially at the same sequence number.
+//! [`CachedScan`] merges cursors over the base chunks, visible write buffers, and the range's
+//! delta view at one sequence number. It walks base chunks and adjacent ranges sequentially as
+//! parts, skips tombstones, resolves merge operands via the normal stack for that single key,
+//! and copies small page spans so returned rows never keep file mappings alive.
 
 use std::collections::VecDeque;
 use std::io;
@@ -16,9 +16,9 @@ use bytes::Bytes;
 
 use super::buffer::{Cursor, Kind, Version};
 use super::delta::{past_end, to_row, Delta};
-use super::file::RowSpan;
+use super::file::{RangeFile, RowSpan};
 use super::view::DeltaView;
-use super::Layers;
+use super::{Chunks, Layers};
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::iter::RowEntryIterator;
@@ -432,8 +432,10 @@ pub(crate) struct CachedScan {
     /// The end of the scan range.
     scan_end: Bound<Bytes>,
     seq: u64,
-    /// A cursor over the base of the current layers, which it reads through `layers`.
+    /// A cursor over the file of chunk `chunk` of the current layers' base, which it reads through
+    /// `layers`, within the part, which ends at or before the chunk's end.
     base: Option<RangeFileCursor>,
+    chunk: u32,
     /// A cursor for each buffer of the current layers that can hold a visible version, newest
     /// first.
     buffers: Vec<DeltaCursor>,
@@ -469,6 +471,7 @@ impl CachedScan {
             scan_end,
             seq,
             base: None,
+            chunk: 0,
             buffers: Vec::new(),
             view: None,
             merge_operator,
@@ -486,14 +489,40 @@ impl CachedScan {
         self.point = point;
     }
 
-    /// Starts reading the current layers from `start` to `end`.
+    /// The file of the base cursor's chunk, `chunk`. A base of one chunk has only chunk 0, so
+    /// the step that reads a row tests the base's kind and nothing more, as it tested the base
+    /// before chunks. No case calls out: a call here takes registers from the step's loop.
+    #[inline]
+    fn base_file(layers: &Layers, chunk: u32) -> Option<&RangeFile> {
+        match &layers.chunks {
+            Chunks::One(only) => Some(&only.file),
+            Chunks::Many(list) => list.chunks.get(chunk as usize).map(|c| &*c.file),
+            Chunks::Loading => None,
+        }
+    }
+
+    /// The first key of the chunk after the current one in the current layers, if any.
+    fn next_chunk(&self) -> Option<&Bytes> {
+        self.layers.chunks.start(self.chunk as usize + 1)
+    }
+
+    /// Starts reading the current layers from `start` to `end`, the end of the scan in these
+    /// layers: from the chunk that holds `start`, and up to that chunk's end if it ends first, so
+    /// that the part reads one chunk (see [`CachedScan::next_part`]).
     fn open(&mut self, start: Bound<&[u8]>, end: Bound<Bytes>) -> io::Result<()> {
-        let layers = &self.layers;
+        let end = match &self.layers.chunks {
+            Chunks::Many(_) => self.enter_chunk(start, end),
+            _ => {
+                self.chunk = 0;
+                end
+            }
+        };
         // The cursors read the files of the pinned layers, so they take no reference to them.
-        self.base = match &layers.base {
+        self.base = match Self::base_file(&self.layers, self.chunk) {
             Some(file) => Some(RangeFileCursor::with_bounds(file, start, end.clone())?),
             None => None,
         };
+        let layers = &self.layers;
         let seq = self.seq;
         self.buffers.clear();
         // Skip empty buffers and buffers whose versions all exceed `seq`.
@@ -511,9 +540,32 @@ impl CachedScan {
         Ok(())
     }
 
-    /// Moves to the next part, which starts where the current one ends. Returns false after
-    /// the last part.
+    /// Sets `chunk` to the chunk of a base of more than one chunk that holds `start`, and returns
+    /// `end` cut where that chunk ends.
+    #[inline(never)]
+    fn enter_chunk(&mut self, start: Bound<&[u8]>, end: Bound<Bytes>) -> Bound<Bytes> {
+        let chunk = match start {
+            Unbounded => 0,
+            Included(key) | Excluded(key) => self.layers.chunk_index(key).unwrap_or(0),
+        };
+        self.chunk = chunk as u32;
+        match self.next_chunk() {
+            None => end,
+            Some(next) => min_end(&end, &Some(next.clone())),
+        }
+    }
+
+    /// Moves to the next part, which starts where the current one ends: the next chunk of the
+    /// current layers, or the next layers. Returns false after the last part.
     fn next_part(&mut self) -> io::Result<bool> {
+        if let Some(next) = self.next_chunk().cloned() {
+            if past_end(&self.scan_end, &next) {
+                return Ok(false);
+            }
+            let end = min_end(&self.scan_end, &self.layers.end);
+            self.open(Included(next.as_ref()), end)?;
+            return Ok(true);
+        }
         let Some(start) = self.layers.end.clone() else {
             return Ok(false);
         };
@@ -575,7 +627,7 @@ impl CachedScan {
                 return Ok(Step::End);
             };
             if order == std::cmp::Ordering::Less {
-                let row = match (self.base.as_mut(), &self.layers.base) {
+                let row = match (self.base.as_mut(), Self::base_file(layers, self.chunk)) {
                     (Some(cursor), Some(file)) => cursor.take(file)?,
                     _ => return Ok(Step::End),
                 };
@@ -585,7 +637,9 @@ impl CachedScan {
                 });
             }
             if order == std::cmp::Ordering::Equal {
-                if let (Some(cursor), Some(file)) = (self.base.as_mut(), &layers.base) {
+                if let (Some(cursor), Some(file)) =
+                    (self.base.as_mut(), Self::base_file(layers, self.chunk))
+                {
                     cursor.skip(file)?;
                 }
             }
@@ -656,6 +710,17 @@ impl CachedScan {
         }
     }
 
+    /// Moves the base cursor forward to the first row at or after `key` in the current part.
+    fn seek_base(&mut self, key: &[u8]) -> io::Result<()> {
+        if let (Some(cursor), Some(file)) = (
+            self.base.as_mut(),
+            Self::base_file(&self.layers, self.chunk),
+        ) {
+            cursor.seek(file, key)?;
+        }
+        Ok(())
+    }
+
     /// Resolves merge operands for `key` via the normal iterator stack. Non-point scans use
     /// `[key, key + 0x00)` so entry kinds match scan semantics.
     async fn resolve(&self, key: Bytes) -> Result<Option<RowEntry>, SlateDBError> {
@@ -707,7 +772,7 @@ impl RowEntryIterator for CachedScan {
             self.unresolved = None;
         }
         // Skip the parts that end at or before `next_key`.
-        while !self.rest.is_empty()
+        while (!self.rest.is_empty() || self.next_chunk().is_some())
             && match &self.part_end {
                 Unbounded => false,
                 Included(end) => next_key > end.as_ref(),
@@ -718,9 +783,7 @@ impl RowEntryIterator for CachedScan {
                 break;
             }
         }
-        if let (Some(cursor), Some(file)) = (self.base.as_mut(), &self.layers.base) {
-            cursor.seek(file, next_key)?;
-        }
+        self.seek_base(next_key)?;
         let layers = &*self.layers;
         for cursor in self.buffers.iter_mut() {
             cursor.seek(buffer_of(layers, cursor.index), next_key);
@@ -757,6 +820,7 @@ mod tests {
     use crate::range_cache::Run;
     use crate::read_trace::ReadTrace;
     use crate::test_utils::StringConcatMergeOperator;
+    use crate::types::KeyValue;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::ops::Bound::{self, Unbounded};
@@ -880,8 +944,7 @@ mod tests {
             sealed: Vec::new(),
             runs: Vec::new(),
             view: None,
-            base: None,
-            base_seq: 0,
+            chunks: Chunks::Loading,
             covered_to: 0,
             end: None,
         })
@@ -1076,12 +1139,11 @@ mod tests {
             sealed,
             runs,
             view: view.map(Arc::new),
-            base: Some(Arc::new(base)),
-            base_seq: BASE_SEQ,
+            chunks: crate::range_cache::one_chunk(Arc::new(base), BASE_SEQ),
             covered_to: bounds[shape.runs],
             end,
         };
-        layers.check(*crate::range_cache::MAX_RUNS_RANGE.end());
+        layers.check(&[], *crate::range_cache::MAX_RUNS_RANGE.end());
         Arc::new(layers)
     }
 
@@ -1101,6 +1163,334 @@ mod tests {
             RangeCachePageSource::Mmap
         } else {
             RangeCachePageSource::PositionalRead
+        }
+    }
+
+    /// The `base_seq`s of the chunks of [`two_chunks`]: the lower one is where the runs start.
+    const LOW: u64 = 100;
+    const HIGH: u64 = 200;
+    /// The runs of [`two_chunks`]: `(LOW, HIGH]` and `(HIGH, RUN_HI]`; then a sealed buffer of
+    /// `(RUN_HI, SEALED_HI]` and the active buffer above it, up to `MAX_SEQ`.
+    const RUN_HI: u64 = 250;
+    const SEALED_HI: u64 = 275;
+
+    /// The state at `at` of the keys of `history` that pass `keys`, written as a load or a major
+    /// merge writes a chunk's file.
+    async fn chunk_file(
+        dir: &std::path::Path,
+        name: &str,
+        history: &History,
+        keys: impl Fn(u8) -> bool,
+        at: u64,
+        source: RangeCachePageSource,
+    ) -> RangeFile {
+        let part: History = history
+            .iter()
+            .filter(|((k, _), _)| keys(*k))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+        let mut writer = RangeFileWriter::create(dir, name, 512).unwrap();
+        let mut rows = crate::range_cache::stack_iterator(
+            &all_of(&part, history_entry),
+            at,
+            BytesRange::unbounded(),
+            Some(merge),
+        )
+        .await
+        .unwrap();
+        while let Some(row) = rows.next_entry().await.unwrap() {
+            writer.push(&row).unwrap();
+        }
+        let path = writer.finish().unwrap();
+        RangeFile::open(
+            path,
+            source,
+            crate::range_cache::file::FileBudget::detached(),
+        )
+        .unwrap()
+    }
+
+    /// Builds a two-chunk layer set: keys below `split` at `a_seq`, the rest at `b_seq`.
+    /// The newer chunk absorbs the older run, and the view omits those absorbed versions.
+    async fn two_chunks(
+        dir: &std::path::Path,
+        history: &History,
+        split: u8,
+        a_seq: u64,
+        b_seq: u64,
+        source: RangeCachePageSource,
+    ) -> Arc<Layers> {
+        let disk = crate::range_cache::file::FileBudget::detached();
+        let a = chunk_file(dir, "a", history, |k| k < split, a_seq, source).await;
+        let b = chunk_file(dir, "b", history, |k| k >= split, b_seq, source).await;
+        let versions = |lo: u64, hi: u64| {
+            let mut out: Vec<RowEntry> = history
+                .iter()
+                .filter(|((_, seq), _)| *seq > lo && *seq <= hi)
+                .map(|((k, seq), kind)| history_entry(*k, *kind, *seq))
+                .collect();
+            out.sort_by(|a, b| a.key.cmp(&b.key).then(b.seq.cmp(&a.seq)));
+            out
+        };
+        let run = |name: &str, lo: u64, hi: u64| {
+            let mut writer = RangeFileWriter::create_run(dir, name, 512).unwrap();
+            for row in versions(lo, hi) {
+                writer.push(&row).unwrap();
+            }
+            let file = RangeFile::open(writer.finish().unwrap(), source, disk.clone()).unwrap();
+            Arc::new(Run::new(file, lo, hi).unwrap())
+        };
+        let buffer = |lo: u64, hi: u64| {
+            let delta = Delta::for_test(&DeltaMemory::detached(), lo);
+            let mut writer = delta.writer();
+            for row in versions(lo, hi) {
+                writer.append(&row);
+            }
+            drop(writer);
+            Arc::new(delta)
+        };
+        let runs = vec![run("run1", HIGH, RUN_HI), run("run0", LOW, HIGH)];
+        let chunks = Chunks::Many(Arc::new(crate::range_cache::ChunkList::new(
+            vec![
+                crate::range_cache::Chunk::new(Arc::new(a), a_seq),
+                crate::range_cache::Chunk::new(Arc::new(b), b_seq),
+            ],
+            vec![key(split)],
+        )));
+        let base_of = |k: &[u8]| {
+            if k < key(split).as_ref() {
+                a_seq
+            } else {
+                b_seq
+            }
+        };
+        let memory = Arc::new(ViewMemory::default());
+        let view =
+            DeltaView::from_runs_where(&runs, &memory, |run, k| run.hi > base_of(k)).unwrap();
+        let sealed = buffer(RUN_HI, SEALED_HI);
+        sealed.sealed_at().store(SEALED_HI, Ordering::Release);
+        let layers = Layers {
+            active: buffer(SEALED_HI, MAX_SEQ),
+            sealed: vec![sealed],
+            runs,
+            view: Some(Arc::new(view)),
+            chunks,
+            covered_to: RUN_HI,
+            end: None,
+        };
+        layers.check(&[], *crate::range_cache::MAX_RUNS_RANGE.end());
+        Arc::new(layers)
+    }
+
+    /// The point read of `key(k)` at `seq` as `RangeCache::get` answers it: the key's chunk,
+    /// `lookup`, and `Pinned::get` for a merge operand. `None` if the chunk is too old for `seq`.
+    async fn cached_get(layers: &Arc<Layers>, k: u8, seq: u64) -> Option<Option<KeyValue>> {
+        let chunk = layers.chunk_of(&key(k)).unwrap();
+        if crate::range_cache::RangeCache::usable_from(layers, chunk.base_seq, seq).is_err() {
+            return None;
+        }
+        let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+        Some(
+            match crate::range_cache::lookup(layers, &key(k), seq).unwrap() {
+                crate::range_cache::Found::Value(kv) => Some(kv),
+                crate::range_cache::Found::Absent => None,
+                crate::range_cache::Found::Merge => crate::range_cache::Pinned {
+                    layers: layers.clone(),
+                    seq,
+                }
+                .get(&key(k), Some(merge))
+                .await
+                .unwrap(),
+            },
+        )
+    }
+
+    /// The value of `key(k)` at `seq` in `history`, from all of its versions.
+    async fn model_get(history: &History, k: u8, seq: u64) -> Option<KeyValue> {
+        let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+        let point = BytesRange::new(Included(key(k)), Included(key(k)));
+        crate::range_cache::stack_iterator(&all_of(history, history_entry), seq, point, Some(merge))
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .map(KeyValue::from)
+    }
+
+    /// A merge operand that chunk A absorbed: `key(5)` has a value at 50 and operands at 150 and
+    /// 220. Chunk A, at 200, folded the operand at 150 into its file, and the first run holds it
+    /// too. A read of `key(5)` after 220 must apply it once.
+    #[tokio::test]
+    async fn should_apply_an_operand_that_a_chunk_absorbed_once() {
+        let history: History = [
+            ((5, 50), Kind::Value),
+            ((5, 150), Kind::Merge),
+            ((5, 220), Kind::Merge),
+            ((30, 50), Kind::Value),
+            ((30, 150), Kind::Merge),
+            ((30, 220), Kind::Merge),
+        ]
+        .into_iter()
+        .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let layers = two_chunks(dir.path(), &history, 20, HIGH, LOW, page_source(true)).await;
+        let want = |k: u8| Bytes::from(format!("{k}@50{k}@150{k}@220"));
+        for k in [5, 30] {
+            let got = cached_get(&layers, k, 260).await.unwrap().unwrap();
+            assert_eq!(got.value, want(k), "key {k}");
+        }
+        // At 210 the newest version of key(5) is the operand at 150, which chunk A absorbed: the
+        // point read takes the value that A's file folded it into, without reading the run (which
+        // would answer a merge operand, for the iterator stack to resolve).
+        match crate::range_cache::lookup(&layers, &key(5), 210).unwrap() {
+            crate::range_cache::Found::Value(kv) => assert_eq!(kv.value, Bytes::from("5@505@150")),
+            _ => panic!("the read of key(5) at 210 did not stop at the run floor"),
+        }
+        // Chunk A is too old for a read at 150; chunk B is not.
+        assert_eq!(cached_get(&layers, 5, 150).await, None);
+        let got = cached_get(&layers, 30, 150).await.unwrap().unwrap();
+        assert_eq!(got.value, Bytes::from("30@5030@150"));
+        // A scan across the boundary, and the normal stack over the same layers.
+        let range = BytesRange::new(Included(key(0)), Excluded(key(40)));
+        let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+        let scan = CachedScan::new(vec![layers.clone()], 260, &range, Some(merge.clone())).unwrap();
+        let mut scan = DbIterator::new_resolved(range.clone(), Box::new(scan), ReadTrace::none())
+            .await
+            .unwrap();
+        let rows: Vec<KeyValue> = drain(&mut scan, usize::MAX)
+            .await
+            .into_iter()
+            .map(KeyValue::from)
+            .collect();
+        let values: Vec<Bytes> = rows.iter().map(|kv| kv.value.clone()).collect();
+        assert_eq!(values, vec![want(5), want(30)]);
+        let mut stack = crate::range_cache::stack_iterator(&layers, 260, range, Some(merge))
+            .await
+            .unwrap();
+        let stacked: Vec<KeyValue> = drain(&mut stack, usize::MAX)
+            .await
+            .into_iter()
+            .map(KeyValue::from)
+            .collect();
+        assert_eq!(stacked, rows);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 300,
+            max_global_rejects: 1_000_000,
+            ..ProptestConfig::default()
+        })]
+
+        /// Reads of a layer set with two chunks at different `base_seq`s (see [`two_chunks`])
+        /// return the history's state: point reads and merge resolutions of every key whose chunk
+        /// allows `seq`, a scan of any range whose chunks all allow it (across the chunk boundary
+        /// too, with a seek), and the normal iterator stack over the same layers. A read that needs
+        /// a chunk newer than `seq` fails the sequence number rules.
+        #[test]
+        fn should_read_two_chunks_at_different_base_seqs(
+            history in proptest::collection::btree_map((0u8..40, 1..=MAX_SEQ), kind(), 0..200),
+            split in 1u8..40,
+            a_high in any::<bool>(),
+            seq in LOW..=MAX_SEQ,
+            start in bound(),
+            end in bound(),
+            prefix_rows in 0usize..20,
+            seek_to in proptest::option::of(0u8..40),
+            mmap in any::<bool>(),
+        ) {
+            let range = BytesRange::try_new(start.map(key), end.map(key));
+            prop_assume!(range.is_some());
+            let range = range.unwrap();
+            let (a_seq, b_seq) = if a_high { (HIGH, LOW) } else { (LOW, HIGH) };
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let layers = two_chunks(dir.path(), &history, split, a_seq, b_seq, page_source(mmap)).await;
+                for k in 0u8..40 {
+                    let chunk_seq = if k < split { a_seq } else { b_seq };
+                    let got = cached_get(&layers, k, seq).await;
+                    if seq < chunk_seq {
+                        assert_eq!(got, None, "key {k} at {seq}");
+                    } else {
+                        assert_eq!(got, Some(model_get(&history, k, seq).await), "key {k} at {seq}");
+                    }
+                }
+
+                // The chunks that the scan needs: A if it starts below `split`, B if it ends
+                // after it.
+                let in_a = match RangeBounds::start_bound(&range) {
+                    Unbounded => true,
+                    Included(k) | Excluded(k) => *k < key(split),
+                };
+                let in_b = match RangeBounds::end_bound(&range) {
+                    Unbounded => true,
+                    Included(k) => *k >= key(split),
+                    Excluded(k) => *k > key(split),
+                };
+                let needed = [(in_a, a_seq), (in_b, b_seq)]
+                    .iter()
+                    .filter(|(meets, _)| *meets)
+                    .map(|(_, s)| *s)
+                    .max()
+                    .unwrap();
+                let usable = crate::range_cache::RangeCache::usable_for(
+                    &layers,
+                    RangeBounds::start_bound(&range).map(|k| k.as_ref()),
+                    RangeBounds::end_bound(&range).map(|k| k.as_ref()),
+                    seq,
+                );
+                if seq < needed {
+                    assert_eq!(usable, Err(crate::range_cache::stats::Unfit::TooOld));
+                    return;
+                }
+                assert_eq!(usable, Ok(()));
+                let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+                let visible = |rows: Vec<RowEntry>| {
+                    rows.into_iter().map(KeyValue::from).collect::<Vec<_>>()
+                };
+                let all = all_of(&history, history_entry);
+                let mut expected =
+                    crate::range_cache::stack_iterator(&all, seq, range.clone(), Some(merge.clone()))
+                        .await
+                        .unwrap();
+                let scan = CachedScan::new(vec![layers.clone()], seq, &range, Some(merge.clone())).unwrap();
+                let mut actual = DbIterator::new_resolved(range.clone(), Box::new(scan), ReadTrace::none())
+                    .await
+                    .unwrap();
+                let want = drain(&mut expected, prefix_rows).await;
+                let got = drain(&mut actual, prefix_rows).await;
+                assert_eq!(visible(got), visible(want.clone()));
+                if let Some(target) = seek_to {
+                    let target = key(target);
+                    let allowed = RangeBounds::contains(&range, &target)
+                        && want.last().is_none_or(|last| last.key < target);
+                    if allowed {
+                        expected.seek(&target).await.unwrap();
+                        actual.seek(&target).await.unwrap();
+                    }
+                }
+                assert_eq!(
+                    visible(drain(&mut actual, usize::MAX).await),
+                    visible(drain(&mut expected, usize::MAX).await)
+                );
+
+                // The normal iterator stack over the chunked layers.
+                let mut expected =
+                    crate::range_cache::stack_iterator(&all, seq, range.clone(), Some(merge.clone()))
+                        .await
+                        .unwrap();
+                let mut stacked =
+                    crate::range_cache::stack_iterator(&layers, seq, range.clone(), Some(merge))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    visible(drain(&mut stacked, usize::MAX).await),
+                    visible(drain(&mut expected, usize::MAX).await)
+                );
+            });
         }
     }
 
@@ -1213,7 +1603,7 @@ mod tests {
                 // tombstones, so a merge over a tombstone in the history is a merge over nothing
                 // in the cache, which the stack returns as a merge operand with the same bytes.
                 let visible = |rows: Vec<RowEntry>| {
-                    rows.into_iter().map(crate::types::KeyValue::from).collect::<Vec<_>>()
+                    rows.into_iter().map(KeyValue::from).collect::<Vec<_>>()
                 };
                 let mut expected =
                     crate::range_cache::stack_iterator(&all, seq, range.clone(), Some(merge.clone()))
@@ -1237,7 +1627,7 @@ mod tests {
                         .next_entry()
                         .await
                         .unwrap()
-                        .map(crate::types::KeyValue::from);
+                        .map(KeyValue::from);
                     let got = match crate::range_cache::lookup(&layers, &key(k), seq).unwrap() {
                         crate::range_cache::Found::Value(kv) => Some(kv),
                         crate::range_cache::Found::Absent => None,

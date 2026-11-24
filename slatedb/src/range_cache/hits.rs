@@ -1,8 +1,8 @@
 //! Thread-local read bookkeeping without shared writes.
 //!
 //! Each thread accumulates read counts and range hits locally and folds them into shared metrics
-//! and [`RangeHits`] after [`RangeCacheTuning::stats_fold_events`] events or after
-//! [`RangeCacheTuning::stats_fold_interval`] (checked at power-of-two event counts).
+//! and [`RangeHits`] (including per-range scan counts) after
+//! [`RangeCacheTuning::stats_fold_events`] events or [`RangeCacheTuning::stats_fold_interval`].
 //!
 //! [`RangeCacheTuning::stats_fold_events`]: super::RangeCacheTuning::stats_fold_events
 //! [`RangeCacheTuning::stats_fold_interval`]: super::RangeCacheTuning::stats_fold_interval
@@ -26,8 +26,11 @@ const MAX_BLOCKS: usize = 8;
 /// The read count and the last access of one cached range, which folds update.
 #[derive(Debug, Default)]
 pub(crate) struct RangeHits {
-    /// The reads that used the range, up to the last fold of each thread.
+    /// The reads that used the range, up to the last fold of each thread: point reads, and scans
+    /// that started in the range.
     reads: AtomicU64,
+    /// The scans among `reads`.
+    scans: AtomicU64,
     /// The value of the cache's access clock at the last fold that counted a read of the range,
     /// or at its load.
     last_access: AtomicU64,
@@ -36,6 +39,18 @@ pub(crate) struct RangeHits {
 impl RangeHits {
     pub(crate) fn reads(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
+    }
+
+    /// The scans that started in the range (served completely or in part).
+    pub(crate) fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
+    /// The point reads of the range. A fold adds its reads before its scans, so between the two
+    /// adds this can count a fold's scans as point reads for a moment.
+    pub(crate) fn gets(&self) -> u64 {
+        let scans = self.scans();
+        self.reads().saturating_sub(scans)
     }
 
     pub(crate) fn last_access(&self) -> u64 {
@@ -48,8 +63,11 @@ impl RangeHits {
         self.last_access.store(clock, Ordering::Relaxed);
     }
 
-    fn fold(&self, reads: u64, clock: u64) {
+    fn fold(&self, reads: u64, scans: u64, clock: u64) {
         self.reads.fetch_add(reads, Ordering::Relaxed);
+        if scans > 0 {
+            self.scans.fetch_add(scans, Ordering::Relaxed);
+        }
         if self.last_access.load(Ordering::Relaxed) < clock {
             self.last_access.fetch_max(clock, Ordering::Relaxed);
         }
@@ -109,16 +127,18 @@ impl Shared {
         let mut counts = [0; READ_COUNTS];
         counts[count.index()] = 1;
         if let Some((_, hits)) = range {
-            hits.fold(1, self.access_clock.load(Ordering::Relaxed));
+            let scans = u64::from(count.is_scan());
+            hits.fold(1, scans, self.access_clock.load(Ordering::Relaxed));
         }
         self.add_counts(&counts);
     }
 }
 
-/// The reads of one range that a thread counted since its last fold.
+/// The reads of one range that a thread counted since its last fold, and the scans among them.
 struct Tally {
     hits: Arc<RangeHits>,
     reads: u64,
+    scans: u64,
 }
 
 /// One thread's counts for one cache.
@@ -152,7 +172,7 @@ impl Block {
     fn add(&mut self, count: ReadCount, range: Option<(u32, &Arc<RangeHits>)>) -> bool {
         self.counts[count.index()] += 1;
         if let Some((slot, hits)) = range {
-            self.add_range(slot, hits);
+            self.add_range(slot, hits, count.is_scan());
         }
         self.events += 1;
         self.events >= self.shared.fold_events
@@ -160,7 +180,9 @@ impl Block {
                 && self.shared.now_ms() - self.last_fold_ms >= self.shared.fold_interval_ms)
     }
 
-    fn add_range(&mut self, slot: u32, hits: &Arc<RangeHits>) {
+    /// Counts a read of the range in `slot`, a scan if `scan`. The caller's `count` is a constant
+    /// at each call site, so `scan` costs a point read nothing.
+    fn add_range(&mut self, slot: u32, hits: &Arc<RangeHits>, scan: bool) {
         let index = slot as usize;
         if index >= self.ranges.len() {
             self.ranges.resize_with(index + 1, || None);
@@ -172,6 +194,9 @@ impl Block {
                     self.dirty.push(slot);
                 }
                 tally.reads += 1;
+                if scan {
+                    tally.scans += 1;
+                }
                 return;
             }
         }
@@ -181,12 +206,15 @@ impl Block {
         let previous = entry.replace(Tally {
             hits: hits.clone(),
             reads: 1,
+            scans: u64::from(scan),
         });
         match previous {
             // The slot is in `dirty` already, now for the new range.
-            Some(old) if old.reads > 0 => old
-                .hits
-                .fold(old.reads, self.shared.access_clock.load(Ordering::Relaxed)),
+            Some(old) if old.reads > 0 => old.hits.fold(
+                old.reads,
+                old.scans,
+                self.shared.access_clock.load(Ordering::Relaxed),
+            ),
             _ => self.dirty.push(slot),
         }
     }
@@ -204,8 +232,9 @@ impl Block {
         let clock = self.shared.access_clock.load(Ordering::Relaxed);
         for slot in self.dirty.drain(..) {
             if let Some(tally) = &mut self.ranges[slot as usize] {
-                tally.hits.fold(tally.reads, clock);
+                tally.hits.fold(tally.reads, tally.scans, clock);
                 tally.reads = 0;
+                tally.scans = 0;
             }
         }
         let counts = std::mem::replace(&mut self.counts, [0; READ_COUNTS]);
@@ -536,6 +565,31 @@ mod tests {
             &[("op", "get"), ("reason", "sealed")],
         );
         assert_eq!(retries, Some((8 * 20_000u64.div_ceil(7)) as i64));
+    }
+
+    #[test]
+    fn should_count_a_range_s_gets_and_scans_apart() {
+        let (stats, _recorder) = stats(1_000_000, Duration::from_secs(3600));
+        let (old, new) = (
+            Arc::new(RangeHits::default()),
+            Arc::new(RangeHits::default()),
+        );
+        on_thread(|| {
+            for count in [
+                ReadCount::GetHit,
+                ReadCount::GetAbsent,
+                ReadCount::GetMerge,
+                ReadCount::Scan,
+                ReadCount::MixedScan,
+            ] {
+                stats.read(1, &old, count);
+            }
+            // A range that takes the slot folds the old range's counts at once.
+            stats.read(1, &new, ReadCount::Scan);
+            assert_eq!((old.reads(), old.gets(), old.scans()), (5, 3, 2));
+            stats.read(1, &new, ReadCount::GetHit);
+        });
+        assert_eq!((new.reads(), new.gets(), new.scans()), (2, 1, 1));
     }
 
     #[test]
