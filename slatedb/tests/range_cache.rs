@@ -375,6 +375,49 @@ async fn should_serve_covered_scans_only() {
 }
 
 #[tokio::test]
+async fn should_read_batches_like_next() {
+    let t = open(|o| o.tuning.min_rebuild_delta_bytes = 2048).await;
+    let db = &t.db;
+    for i in 0..300 {
+        db.put(key(i), value(i, 0)).await.unwrap();
+    }
+    db.cache_range(key(0)..key(200)).await.unwrap();
+    // Merge operands require an await in a cached scan, and tombstones are skipped.
+    for i in (0..300).step_by(13) {
+        db.merge(key(i), b"+m").await.unwrap();
+    }
+    for i in (0..300).step_by(17) {
+        db.delete(key(i)).await.unwrap();
+    }
+    // Check both a fully cached scan and a scan that crosses into the normal path.
+    for range in [key(0)..key(200), key(150)..key(300)] {
+        let expected = collect(db.scan(range.clone()).await.unwrap()).await;
+        for max in [1, 7, 64, 1000] {
+            let mut iter = db.scan(range.clone()).await.unwrap();
+            let mut got = Vec::new();
+            loop {
+                let n = iter.next_batch(&mut got, max).await.unwrap();
+                assert!(n <= max);
+                if n == 0 {
+                    break;
+                }
+            }
+            assert_eq!(got, expected, "{range:?} in batches of {max}");
+            assert_eq!(iter.next().await.unwrap(), None);
+        }
+    }
+    // A batch advances the iterator like `next`, so seek must move past its last row.
+    let mut iter = db.scan(key(0)..key(200)).await.unwrap();
+    let mut got = Vec::new();
+    assert_eq!(iter.next_batch(&mut got, 10).await.unwrap(), 10);
+    assert!(iter.seek(got[9].key.clone()).await.is_err());
+    iter.seek(key(100)).await.unwrap();
+    assert_eq!(iter.next().await.unwrap().unwrap().key, key(100));
+    assert_eq!(iter.next_batch(&mut got, 0).await.unwrap(), 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn should_scan_across_adjacent_ranges() {
     let t = open(|o| o.tuning.min_rebuild_delta_bytes = 2048).await;
     let db = &t.db;
@@ -2226,9 +2269,11 @@ async fn should_not_open_gaps_that_a_scan_does_not_reach() {
     let before = scan_counts(&t);
     // A limit that ends inside the first cached part.
     let mut iter = db.scan(range_of(60, 250)).await.unwrap();
-    for i in 60..90 {
+    for i in 60..70 {
         assert_eq!(iter.next().await.unwrap().unwrap().key, key(i));
     }
+    let mut rows = Vec::new();
+    assert_eq!(iter.next_batch(&mut rows, 20).await.unwrap(), 20);
     drop(iter);
     assert_eq!(scan_counts(&t), (before.0, before.1 + 1, before.2));
     // A seek across a gap into the next cached part skips the gap without opening it.

@@ -446,6 +446,82 @@ impl DbIterator {
         }
     }
 
+    /// Appends up to `max` rows to `out` and returns the appended count.
+    ///
+    /// Returns `0` when the iterator reaches its end or `max` is `0`. Produces the same rows and
+    /// iterator state as calling [`DbIterator::next`] repeatedly. On cached scans, reads rows
+    /// synchronously without a per-row future.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from [`DbIterator::next`]. Rows appended before the error stay in `out`.
+    #[cfg(feature = "range_cache")]
+    pub async fn next_batch(
+        &mut self,
+        out: &mut Vec<KeyValue>,
+        max: usize,
+    ) -> Result<usize, crate::Error> {
+        let mut n = 0;
+        if self.sync_source && self.invalidated_error.is_none() {
+            while n < max {
+                match self.iter.next_sync() {
+                    Some(Ok(Some(entry))) => {
+                        if !entry.value.is_tombstone() {
+                            out.push(KeyValue::from(entry));
+                            n += 1;
+                        }
+                    }
+                    Some(Ok(None)) => break,
+                    Some(Err(e)) => {
+                        self.set_last_key(out, n);
+                        self.invalidated_error = Some(e.clone());
+                        return Err(e.into());
+                    }
+                    // The source needs an await for this row, such as a merge operand.
+                    None => {
+                        self.set_last_key(out, n);
+                        match self.next().await? {
+                            Some(kv) => {
+                                out.push(kv);
+                                n += 1;
+                                continue;
+                            }
+                            None => return Ok(n),
+                        }
+                    }
+                }
+                self.unbudgeted += 1;
+                if self.unbudgeted >= RESOLVED_BUDGET_EVERY {
+                    self.unbudgeted = 0;
+                    self.set_last_key(out, n);
+                    tokio::task::coop::consume_budget().await;
+                }
+            }
+            self.set_last_key(out, n);
+            return Ok(n);
+        }
+        while n < max {
+            match self.next().await? {
+                Some(kv) => {
+                    out.push(kv);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(n)
+    }
+
+    /// Updates `last_key` from the final appended row in `out`.
+    #[cfg(feature = "range_cache")]
+    fn set_last_key(&mut self, out: &[KeyValue], appended: usize) {
+        if appended > 0 {
+            if let Some(kv) = out.last() {
+                self.last_key = Some(kv.key.clone());
+            }
+        }
+    }
+
     pub(crate) async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         let read_span = self.read_span.clone();
         self.next_entry_inner().instrument(read_span).await
