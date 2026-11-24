@@ -442,6 +442,9 @@ impl RangeCache {
         let Some(base_seq) = absorbed.first().map(|r| r.hi) else {
             return Ok(());
         };
+        range
+            .reads_at_build
+            .store(range.heat.reads(), Ordering::Relaxed);
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-rebuild");
         let new_base = {
             let (cache, absorbed, base) = (self.clone(), absorbed.clone(), base.clone());
@@ -731,6 +734,10 @@ impl Maintainer {
             let Some(base) = layers.base.clone() else {
                 continue;
             };
+            if !cache.rebuild_pays(&range, base.file_len()) {
+                cache.request_removal(Target::Range(range.clone()), RemoveReason::NotWorthIt);
+                continue;
+            }
             let job = Job::Major {
                 base,
                 absorbed: layers.runs[runs].to_vec(),
@@ -1980,6 +1987,8 @@ mod tests {
                 covered_to: 0,
                 end: None,
             },
+            super::super::Origin::Explicit,
+            0,
             0,
         );
         let layers = |n: usize, with_base: bool| Layers {

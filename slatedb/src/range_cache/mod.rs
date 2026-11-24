@@ -11,6 +11,7 @@
 //! `seq >= layers.base_seq` and `seq <= layers.active.sealed_at`. Read counts accumulate per
 //! thread and fold periodically into shared metrics and range access timestamps.
 
+mod auto;
 mod buffer;
 mod delta;
 mod file;
@@ -37,8 +38,11 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use fail_parallel::{fail_point, FailPointRegistry};
 use log::warn;
+use parking_lot::Mutex;
+use rand::RngExt;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
+use slatedb_common::DbRand;
 
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{DurabilityLevel, ReadOptions, ScanOptions};
@@ -53,6 +57,9 @@ use crate::read_trace::ReadTrace;
 use crate::reader::ScanContext;
 use crate::types::{KeyValue, ValueDeletable};
 
+pub use auto::AutoPromoteOptions;
+use auto::AutoSettings;
+pub(crate) use auto::{Promoter, PromoterMessage, RANGE_CACHE_PROMOTER_TASK_NAME};
 use buffer::Kind;
 use delta::{Delta, DeltaIterator, DeltaMemory, DeltaShape};
 pub use file::RangeCachePageSource;
@@ -65,7 +72,7 @@ use hits::{HitStats, RangeHits};
 pub(crate) use maintain::{Maintainer, RANGE_CACHE_MAINTENANCE_TASK_NAME};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
-use stats::{PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
+use stats::{AutoStats, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit};
 use view::{DeltaView, ViewMemory};
 use writer::{Padded, Target, WriterQueue};
 
@@ -89,6 +96,8 @@ pub struct RangeCacheOptions {
     pub max_disk_bytes: u64,
     /// How the cache reads range cache files.
     pub page_source: RangeCachePageSource,
+    /// Automatic promotion settings. `None` disables automatic promotion.
+    pub auto_promote: Option<AutoPromoteOptions>,
     /// Internal tuning parameters. See [`RangeCacheTuning`].
     #[doc(hidden)]
     pub tuning: RangeCacheTuning,
@@ -101,6 +110,7 @@ impl RangeCacheOptions {
             root_folder: root_folder.into(),
             max_disk_bytes: 1024 * 1024 * 1024,
             page_source: RangeCachePageSource::default(),
+            auto_promote: None,
             tuning: RangeCacheTuning::default(),
         }
     }
@@ -137,6 +147,34 @@ pub struct RangeCacheTuning {
     /// Heap metadata budget for fence indexes, filters, delta views, and layer sets. `None` uses
     /// `max(max_disk_bytes / 16, 64 MiB)`.
     pub max_meta_bytes: Option<u64>,
+    /// Interval between promoter candidate evaluations.
+    pub evaluate_interval: Duration,
+    /// Max candidates formed or re-evaluated per evaluation pass.
+    pub max_candidates_per_evaluation: usize,
+    /// Sampled reads required to admit a candidate when the disk budget is at most half full.
+    pub min_evidence: u32,
+    /// Sampled reads required to admit a candidate when the disk budget is full.
+    pub full_evidence: u32,
+    /// Minimum time span across a candidate's samples to reject single-pass scans.
+    pub min_reuse_span: Duration,
+    /// Required read-density multiple over automatic eviction victims.
+    pub admission_margin: f64,
+    /// Retention duration for ghosts of recently removed automatic ranges.
+    pub ghost_ttl: Duration,
+    /// Retention duration for rejected candidates.
+    pub candidate_ttl: Duration,
+    /// Minimum wait before re-evaluating a remembered rejected candidate.
+    pub candidate_recheck: Duration,
+    /// Initial exponential backoff wait after a failed automatic promotion.
+    pub backoff_base: Duration,
+    /// Total sample capacity across the windowed reservoir.
+    pub reservoir_capacity: usize,
+    /// Capacity of the sample channel from reads to the promoter.
+    pub queue_capacity: usize,
+    /// Floor on per-sample read cost.
+    pub min_read_cost: Duration,
+    /// Estimated base rewrite cost per byte in nanoseconds for payback checks.
+    pub rebuild_cost_ns_per_byte: f64,
     /// Target read-ahead size for object store fetches during range loads.
     pub load_fetch_bytes: usize,
     /// Max concurrent fetch tasks per SST during range loads.
@@ -161,6 +199,20 @@ impl Default for RangeCacheTuning {
             buffer_filter_bytes: 128 * 1024,
             range_target_bytes: 64 * 1024 * 1024,
             max_meta_bytes: None,
+            evaluate_interval: Duration::from_millis(250),
+            max_candidates_per_evaluation: 2,
+            min_evidence: 8,
+            full_evidence: 32,
+            min_reuse_span: Duration::from_secs(2),
+            admission_margin: 2.0,
+            ghost_ttl: Duration::from_secs(60),
+            candidate_ttl: Duration::from_secs(30),
+            candidate_recheck: Duration::from_secs(1),
+            backoff_base: Duration::from_secs(10),
+            reservoir_capacity: 8192,
+            queue_capacity: 4096,
+            min_read_cost: Duration::from_micros(1),
+            rebuild_cost_ns_per_byte: 5.0,
             load_fetch_bytes: 2 * 1024 * 1024,
             load_fetch_tasks: 4,
             stats_fold_events: 4096,
@@ -226,6 +278,8 @@ pub struct CachedRangeInfo {
     pub file_rows: u64,
     /// Estimated size of unflushed writes in memory in bytes.
     pub delta_bytes: u64,
+    /// True if automatic promotion cached the range.
+    pub automatic: bool,
     /// Number of run files above the base.
     pub runs: usize,
     /// Total size of run files on disk in bytes.
@@ -358,14 +412,79 @@ impl Layers {
     }
 }
 
+/// Source that requested caching a range.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Origin {
+    /// Application call to `cache_range`.
+    Explicit,
+    /// Automatic promotion.
+    Auto {
+        /// Estimated normal-path cost of one read in nanoseconds.
+        read_cost_ns: u64,
+        /// Estimated reads per second when admitted.
+        read_rate: f64,
+    },
+}
+
+/// Folded read count, access timestamp, and decayed read rate of a cached range.
+struct Heat {
+    hits: Arc<RangeHits>,
+    rate: Mutex<HeatRate>,
+}
+
+struct HeatRate {
+    reads: u64,
+    at_ms: i64,
+    rate: f64,
+}
+
+impl Heat {
+    fn new(rate: f64, now_ms: i64) -> Self {
+        Self {
+            hits: Arc::new(RangeHits::default()),
+            rate: Mutex::new(HeatRate {
+                reads: 0,
+                at_ms: now_ms,
+                rate,
+            }),
+        }
+    }
+
+    fn reads(&self) -> u64 {
+        self.hits.reads()
+    }
+
+    /// Returns exponentially decayed reads per second at `now_ms`.
+    fn rate(&self, now_ms: i64, half_life_ms: f64) -> f64 {
+        let mut state = self.rate.lock();
+        let dt_ms = (now_ms - state.at_ms) as f64;
+        if dt_ms < 50.0 {
+            return state.rate;
+        }
+        let reads = self.reads();
+        let instant = (reads - state.reads) as f64 * 1000.0 / dt_ms;
+        let keep = (-dt_ms * std::f64::consts::LN_2 / half_life_ms.max(1.0)).exp();
+        state.rate = state.rate * keep + instant * (1.0 - keep);
+        state.reads = reads;
+        state.at_ms = now_ms;
+        state.rate
+    }
+}
+
 struct CachedRange {
     start: Bytes,
     end: Option<Bytes>,
     layers: ArcSwap<Layers>,
     /// Reusable slot index used by thread-local hit tracking.
     slot: u32,
-    /// Folded read count and last access clock for LRU eviction.
-    hits: Arc<RangeHits>,
+    /// True if automatic promotion cached this range.
+    auto: bool,
+    /// Folded read count, last access clock, and decayed read rate.
+    heat: Heat,
+    /// Estimated normal-path cost per read in nanoseconds (`0` for explicit ranges).
+    read_cost_ns: u64,
+    /// Read count when the current base was built, for major-merge payback checks.
+    reads_at_build: AtomicU64,
     /// Sequence number of the last batch that wrote to this range.
     last_write_seq: Padded<AtomicU64>,
     /// Maintenance state for in-flight flush and major merge jobs.
@@ -373,13 +492,30 @@ struct CachedRange {
 }
 
 impl CachedRange {
-    fn new(start: Bytes, end: Option<Bytes>, layers: Layers, slot: u32) -> Self {
+    fn new(
+        start: Bytes,
+        end: Option<Bytes>,
+        layers: Layers,
+        origin: Origin,
+        now_ms: i64,
+        slot: u32,
+    ) -> Self {
+        let (auto, read_cost_ns, rate) = match origin {
+            Origin::Explicit => (false, 0, 0.0),
+            Origin::Auto {
+                read_cost_ns,
+                read_rate,
+            } => (true, read_cost_ns, read_rate),
+        };
         Self {
             start,
             end,
             layers: ArcSwap::from_pointee(layers),
             slot,
-            hits: Arc::new(RangeHits::default()),
+            auto,
+            heat: Heat::new(rate, now_ms),
+            read_cost_ns,
+            reads_at_build: AtomicU64::new(0),
             last_write_seq: Padded(AtomicU64::new(0)),
             jobs: maintain::RangeJobs::default(),
         }
@@ -418,6 +554,7 @@ impl CachedRange {
             file_bytes: layers.base.as_ref().map_or(0, |f| f.file_len()),
             file_rows: layers.base.as_ref().map_or(0, |f| f.rows()),
             delta_bytes: self.delta_bytes(&layers),
+            automatic: self.auto,
             runs: layers.runs.len(),
             run_bytes: layers.runs.iter().map(|r| r.file_bytes()).sum(),
             sealed_buffers: layers.sealed.len(),
@@ -544,6 +681,25 @@ fn half_open(range: &BytesRange) -> Option<(Bytes, Option<Bytes>)> {
     }
 }
 
+/// State shared between the cache core and the automatic promotion task.
+struct AutoShared {
+    options: AutoSettings,
+    tx: async_channel::Sender<PromoterMessage>,
+    stats: AutoStats,
+    /// Moving average normal-path cost of sampled reads in nanoseconds.
+    avg_read_cost_ns: AtomicU64,
+    /// Removal notifications from the batch writer to the promoter.
+    removals: (
+        async_channel::Sender<auto::Removal>,
+        async_channel::Receiver<auto::Removal>,
+    ),
+}
+
+/// Timing token for a sampled normal-path read.
+pub(crate) struct ReadSample {
+    start: chrono::DateTime<chrono::Utc>,
+}
+
 /// Range cache state for one database.
 pub(crate) struct RangeCache {
     options: RangeCacheOptions,
@@ -556,6 +712,9 @@ pub(crate) struct RangeCache {
     next_file_id: AtomicU64,
     hits: HitStats,
     stats: RangeCacheStats,
+    auto: Option<AutoShared>,
+    clock: Arc<dyn SystemClock>,
+    rand: Arc<DbRand>,
     handle: tokio::runtime::Handle,
     merge_operator: Option<MergeOperatorType>,
     #[allow(dead_code)]
@@ -564,6 +723,8 @@ pub(crate) struct RangeCache {
 
 impl RangeCache {
     /// Creates the cache directory if missing and removes stale cache files.
+    /// Returns the promoter queue receiver when automatic promotion is enabled.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         options: RangeCacheOptions,
         recorder: &MetricsRecorderHelper,
@@ -571,7 +732,8 @@ impl RangeCache {
         merge_operator: Option<MergeOperatorType>,
         fp_registry: Arc<FailPointRegistry>,
         clock: Arc<dyn SystemClock>,
-    ) -> Result<Arc<Self>, SlateDBError> {
+        rand: Arc<DbRand>,
+    ) -> Result<(Arc<Self>, Option<async_channel::Receiver<PromoterMessage>>), SlateDBError> {
         if !file::valid_page_size(options.tuning.page_size) {
             return Err(SlateDBError::InvalidConfiguration(format!(
                 "range cache page size {} is not a power of two in 512..=65536",
@@ -614,13 +776,29 @@ impl RangeCache {
                 std::fs::remove_file(&path)?;
             }
         }
+        let (auto, rx) = match &options.auto_promote {
+            Some(auto_options) => {
+                let auto_options = AutoSettings::new(auto_options, &options.tuning);
+                auto_options.validate()?;
+                let (tx, rx) = async_channel::bounded(auto_options.queue_capacity.max(1));
+                let auto = AutoShared {
+                    tx,
+                    stats: AutoStats::new(recorder),
+                    avg_read_cost_ns: AtomicU64::new(auto_options.min_read_cost.as_nanos() as u64),
+                    removals: async_channel::unbounded(),
+                    options: auto_options,
+                };
+                (Some(auto), Some(rx))
+            }
+            None => (None, None),
+        };
         let hits = HitStats::new(
             stats::read_counters(recorder),
             options.tuning.stats_fold_events,
             options.tuning.stats_fold_interval,
-            clock,
+            clock.clone(),
         );
-        Ok(Arc::new(Self {
+        let cache = Arc::new(Self {
             options,
             index: ArcSwap::from_pointee(RangeIndex::new()),
             writer: WriterQueue::new(),
@@ -631,10 +809,35 @@ impl RangeCache {
             next_file_id: AtomicU64::new(0),
             hits,
             stats: RangeCacheStats::new(recorder),
+            auto,
+            clock,
+            rand,
             handle,
             merge_operator,
             fp_registry,
-        }))
+        });
+        Ok((cache, rx))
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.clock.now().timestamp_millis()
+    }
+
+    /// Returns true if reads served since the current base was built justify rewriting `file_bytes`.
+    fn rebuild_pays(&self, range: &CachedRange, file_bytes: u64) -> bool {
+        let Some(auto) = &self.auto else {
+            return true;
+        };
+        if !range.auto || file_bytes < 4 * self.options.tuning.min_rebuild_delta_bytes as u64 {
+            return true;
+        }
+        let reads = range
+            .heat
+            .reads()
+            .saturating_sub(range.reads_at_build.load(Ordering::Relaxed));
+        let saved_ns = reads as f64 * range.read_cost_ns as f64;
+        let cost_ns = file_bytes as f64 * auto.options.rebuild_cost_ns_per_byte;
+        saved_ns >= cost_ns
     }
 
     fn new_buffer(&self, lo: u64) -> Arc<Delta> {
@@ -657,21 +860,62 @@ impl RangeCache {
             .is_some_and(|r| Arc::ptr_eq(r, range))
     }
 
-    /// Returns eviction candidates in least-recently-read order when budgets are exceeded.
+    /// Returns eviction candidates when budgets are exceeded. Evicts automatic ranges by lowest
+    /// read density first when automatic promotion is on, then explicit ranges in LRU order.
     fn eviction_order(&self, skip: Option<&Arc<CachedRange>>) -> Vec<Arc<CachedRange>> {
         if self.within_budgets() {
             return Vec::new();
         }
-        let mut candidates: Vec<_> = self
+        let now = self.now_ms();
+        let candidates = self
             .index
             .load()
             .values()
             .filter(|r| r.layers.load().base.is_some())
             .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)))
             .cloned()
-            .collect();
-        candidates.sort_by_key(|r| r.hits.last_access());
-        candidates
+            .collect::<Vec<_>>();
+        match &self.auto {
+            None => {
+                let mut candidates = candidates;
+                candidates.sort_by_key(|r| r.heat.hits.last_access());
+                candidates
+            }
+            Some(_) => {
+                let mut keyed: Vec<_> = candidates
+                    .into_iter()
+                    .map(|r| (self.eviction_key(&r, now), r))
+                    .collect();
+                keyed.sort_by(|(a, _), (b, _)| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                keyed.into_iter().map(|(_, r)| r).collect()
+            }
+        }
+    }
+
+    fn eviction_key(&self, range: &CachedRange, now_ms: i64) -> (bool, f64, u64) {
+        let density = if range.auto {
+            self.density(range, now_ms)
+        } else {
+            0.0
+        };
+        (!range.auto, density, range.heat.hits.last_access())
+    }
+
+    /// Decayed normal-path cost saved per second per byte of `range`.
+    fn density(&self, range: &CachedRange, now_ms: i64) -> f64 {
+        let Some(auto) = &self.auto else {
+            return 0.0;
+        };
+        let half_life_ms = auto.options.heat_half_life.as_millis() as f64;
+        let read_cost_ns = if range.auto {
+            range.read_cost_ns
+        } else {
+            auto.avg_read_cost_ns.load(Ordering::Relaxed)
+        };
+        range.heat.rate(now_ms, half_life_ms) * read_cost_ns as f64
+            / range.file_bytes().max(1) as f64
     }
 
     fn update_gauges(&self) {
@@ -724,7 +968,7 @@ impl RangeCache {
     }
 
     fn count_read(&self, range: &CachedRange, count: ReadCount) {
-        self.hits.read(range.slot, &range.hits, count);
+        self.hits.read(range.slot, &range.heat.hits, count);
     }
 
     /// Records an unfit pin attempt and returns true if the read should retry (sealed delta only).
@@ -899,14 +1143,18 @@ impl RangeCache {
                 Included(key) | Excluded(key) => *key < cached.start,
             };
             let from = if before {
-                push(PartKind::Gap, from, Excluded(cached.start.clone()));
+                push(
+                    PartKind::Gap { sample: true },
+                    from,
+                    Excluded(cached.start.clone()),
+                );
                 Included(cached.start.clone())
             } else {
                 from
             };
             let to = scan::min_end(&scan_end, &cached.end);
             let kind = if layers.base.is_none() {
-                PartKind::Gap
+                PartKind::Gap { sample: true }
             } else {
                 match Self::usable(&layers, seq) {
                     Ok(()) => {
@@ -916,7 +1164,7 @@ impl RangeCache {
                     Err(reason) => {
                         self.hits
                             .count(ReadCount::unusable(PinOp::ScanPart, reason));
-                        PartKind::Gap
+                        PartKind::Gap { sample: false }
                     }
                 }
             };
@@ -924,7 +1172,7 @@ impl RangeCache {
             cursor = cached.end.clone().map(Included);
         }
         if let Some(from) = cursor {
-            push(PartKind::Gap, from, scan_end);
+            push(PartKind::Gap { sample: true }, from, scan_end);
         }
         let first = first_cached?.clone();
         Some(MixedPin { parts, seq, first })
@@ -937,6 +1185,85 @@ impl RangeCache {
 
     pub(crate) fn buffer_memory(&self) -> u64 {
         self.delta_memory.bytes()
+    }
+
+    /// Starts timing a normal-path read sample when automatic promotion is on.
+    pub(crate) fn sample(&self) -> Option<ReadSample> {
+        let auto = self.auto.as_ref()?;
+        let one_in = auto.options.sample_one_in.max(1);
+        if one_in > 1 && self.rand.rng().random_range(0..one_in) != 0 {
+            return None;
+        }
+        Some(ReadSample {
+            start: self.clock.now(),
+        })
+    }
+
+    /// Records a sampled normal-path read of `key` and drops it if the promoter queue is full.
+    pub(crate) fn record(&self, sample: ReadSample, key: &[u8]) {
+        let Some(auto) = &self.auto else {
+            return;
+        };
+        let now = self.clock.now();
+        let elapsed_ns = (now - sample.start).num_nanoseconds().unwrap_or(i64::MAX);
+        let cost_ns = (elapsed_ns.max(0) as u64).max(auto.options.min_read_cost.as_nanos() as u64);
+        let message = PromoterMessage::Sample(auto::Sample {
+            key: Bytes::copy_from_slice(key),
+            cost_ns,
+            at_ms: now.timestamp_millis(),
+        });
+        match auto.tx.try_send(message) {
+            Ok(()) => auto.stats.samples_recorded.increment(1),
+            Err(_) => auto.stats.samples_dropped.increment(1),
+        }
+    }
+
+    /// Returns true if any ready or loading range covers `key`.
+    fn covers(&self, key: &[u8]) -> bool {
+        covering(&self.index.load(), key).is_some()
+    }
+
+    /// Returns the bounds of the uncovered gap around `key`.
+    fn neighbours(&self, key: &[u8]) -> (Bytes, Option<Bytes>) {
+        let index = self.index.load();
+        let below = index
+            .range::<[u8], _>((Unbounded, Included(key)))
+            .next_back()
+            .and_then(|(_, r)| r.end.clone())
+            .unwrap_or_default();
+        let above = index
+            .range::<[u8], _>((Excluded(key), Unbounded))
+            .next()
+            .map(|(start, _)| start.clone());
+        (below, above)
+    }
+
+    fn attached_bytes(&self) -> u64 {
+        self.index.load().values().map(|r| r.file_bytes()).sum()
+    }
+
+    /// Returns the highest read density among automatic ranges evicted to free `need` bytes,
+    /// or `None` if automatic ranges alone cannot free enough space.
+    fn victim_density(&self, need: u64) -> Option<f64> {
+        let now = self.now_ms();
+        let index = self.index.load();
+        let mut ranges: Vec<(f64, u64)> = index
+            .values()
+            .filter(|r| r.auto)
+            .map(|r| (self.density(r, now), r.file_bytes()))
+            .filter(|(_, bytes)| *bytes > 0)
+            .collect();
+        ranges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut freed = 0;
+        let mut densest: f64 = 0.0;
+        for (density, bytes) in ranges {
+            if freed >= need {
+                break;
+            }
+            freed += bytes;
+            densest = densest.max(density);
+        }
+        (freed >= need).then_some(densest)
     }
 
     /// Streams rows of a loading range into a base file, publishes it, and evicts if over budget.
@@ -979,7 +1306,8 @@ impl RangeCache {
         debug_assert_eq!(rows, file.rows());
 
         if self.attach_base(range, file, file_seq).await {
-            self.evict(None).await;
+            // Keep a newly admitted automatic range while evicting displaced ranges.
+            self.evict(range.auto.then_some(range)).await;
         }
         Ok(())
     }
@@ -1210,6 +1538,14 @@ fn run_meets(run: &Run, range: &BytesRange) -> bool {
     after_start && before_end
 }
 
+/// Returns the first key a scan of `range` can return, for promotion sampling.
+fn scan_start(range: &BytesRange) -> Bytes {
+    match RangeBounds::start_bound(range) {
+        Included(key) | Excluded(key) => key.clone(),
+        Unbounded => Bytes::new(),
+    }
+}
+
 /// Returns true if a point read with `options` can use the range cache.
 ///
 /// Traced reads bypass the cache so tests can compare cached reads against the normal path.
@@ -1229,32 +1565,52 @@ pub(crate) fn can_serve_scan(options: &ScanOptions) -> bool {
         && options.tracing_options.is_none()
 }
 
+/// Normal-path read sampled for automatic promotion, paired with its key or scan start key.
+pub(crate) struct SampledRead {
+    sample: ReadSample,
+    key: Bytes,
+}
+
+/// Routing result for [`DbInner::range_cache_get`].
+pub(crate) enum GetRoute {
+    /// Served by the range cache.
+    Served(Result<Option<KeyValue>, SlateDBError>),
+    /// Fall back to the normal read path, optionally recording a promotion sample.
+    Normal(Option<SampledRead>),
+}
+
 /// Routing result for [`DbInner::range_cache_scan`].
 pub(crate) enum ScanRoute {
     /// Served by the range cache (fully or via mixed scan).
     Served(Result<DbIterator, SlateDBError>),
     /// Fall back to the normal read path for this range.
-    Normal(BytesRange),
+    Normal(BytesRange, Option<SampledRead>),
 }
 
 impl DbInner {
-    /// Serves a point read of `key` from the range cache, or returns `None` to use the normal
-    /// read path. `at` is the snapshot/transaction sequence number, or `None` for latest state.
+    /// Serves a point read of `key` from the range cache if possible. `at` is the snapshot or
+    /// transaction sequence number, or `None` for latest state.
     pub(crate) async fn range_cache_get(
         &self,
         key: &[u8],
         options: &ReadOptions,
         at: Option<u64>,
-    ) -> Option<Result<Option<KeyValue>, SlateDBError>> {
-        let cache = self.range_cache.as_ref()?;
+    ) -> GetRoute {
+        let Some(cache) = &self.range_cache else {
+            return GetRoute::Normal(None);
+        };
         if !can_serve_get(options) {
-            return None;
+            return GetRoute::Normal(None);
         }
         cache.hits.bind_db(&self.db_stats);
         match cache.get(key, self.oracle.as_ref(), at) {
-            CacheRead::Uncovered | CacheRead::Unusable => None,
-            CacheRead::Answer(kv) => Some(Ok(kv)),
-            CacheRead::Resolve(pinned) => Some(
+            CacheRead::Uncovered => GetRoute::Normal(cache.sample().map(|sample| SampledRead {
+                sample,
+                key: Bytes::copy_from_slice(key),
+            })),
+            CacheRead::Unusable => GetRoute::Normal(None),
+            CacheRead::Answer(kv) => GetRoute::Served(Ok(kv)),
+            CacheRead::Resolve(pinned) => GetRoute::Served(
                 pinned
                     .get(key, self.reader.read_merge_operator.clone())
                     .await,
@@ -1271,10 +1627,10 @@ impl DbInner {
         at: Option<u64>,
     ) -> ScanRoute {
         let Some(cache) = &self.range_cache else {
-            return ScanRoute::Normal(range);
+            return ScanRoute::Normal(range, None);
         };
         if !can_serve_scan(options) {
-            return ScanRoute::Normal(range);
+            return ScanRoute::Normal(range, None);
         }
         cache.hits.bind_db(&self.db_stats);
         match cache.pin_scan(&range, self.oracle.as_ref(), at) {
@@ -1323,14 +1679,34 @@ impl DbInner {
                         DbIterator::new_resolved(range, Box::new(scan), ReadTrace::none()).await,
                     );
                 }
-                ScanRoute::Normal(range)
+                let sample = cache.sample().map(|sample| SampledRead {
+                    sample,
+                    key: scan_start(&range),
+                });
+                ScanRoute::Normal(range, sample)
             }
-            ScanPin::Unusable => ScanRoute::Normal(range),
+            ScanPin::Unusable => ScanRoute::Normal(range, None),
+        }
+    }
+
+    /// Records a sampled normal-path read after the read finishes.
+    pub(crate) fn range_cache_record(&self, sampled: Option<SampledRead>) {
+        if let (Some(cache), Some(sampled)) = (&self.range_cache, sampled) {
+            cache.record(sampled.sample, &sampled.key);
         }
     }
 
     /// Loads uncovered parts of `range` into the range cache.
     async fn cache_range(self: &Arc<Self>, range: BytesRange) -> Result<(), SlateDBError> {
+        self.cache_range_with(range, Origin::Explicit).await
+    }
+
+    /// Loads uncovered parts of `range` into the range cache for `origin`.
+    pub(crate) async fn cache_range_with(
+        self: &Arc<Self>,
+        range: BytesRange,
+        origin: Origin,
+    ) -> Result<(), SlateDBError> {
         let cache = self
             .range_cache
             .clone()
@@ -1354,7 +1730,7 @@ impl DbInner {
             Arc::clone(&cache.fp_registry),
             "range-cache-register-publish"
         );
-        let registered = cache.register(start, end, splits).await?;
+        let registered = cache.register(start, end, splits, origin).await?;
         debug_assert!(registered.seq >= guard.seq());
         fail_point!(
             Arc::clone(&cache.fp_registry),
@@ -1579,6 +1955,8 @@ mod tests {
                             covered_to: 0,
                             end: end.map(b),
                         },
+                        Origin::Explicit,
+                        0,
                         slot as u32,
                     )),
                 )
@@ -1663,6 +2041,7 @@ mod tests {
         use super::super::*;
         use crate::db_stats::REQUEST_COUNT;
         use crate::object_store::memory::InMemory;
+        use slatedb_common::clock::MockSystemClock;
         use slatedb_common::metrics::{lookup_metric_with_labels, DefaultMetricsRecorder};
 
         struct TestCache {
@@ -1700,19 +2079,22 @@ mod tests {
             }
         }
 
-        async fn open(tune: impl FnOnce(&mut RangeCacheOptions)) -> TestCache {
+        async fn open(
+            tune: impl FnOnce(&mut RangeCacheOptions),
+            clock: Option<Arc<MockSystemClock>>,
+        ) -> TestCache {
             let dir = tempfile::tempdir().unwrap();
             let mut options = RangeCacheOptions::new(dir.path());
             tune(&mut options);
             let recorder = Arc::new(DefaultMetricsRecorder::new());
-            let db = Db::builder("range_cache_reads", Arc::new(InMemory::new()))
+            let mut builder = Db::builder("range_cache_reads", Arc::new(InMemory::new()))
                 .with_range_cache(options)
-                .with_metrics_recorder(recorder.clone())
-                .build()
-                .await
-                .unwrap();
+                .with_metrics_recorder(recorder.clone());
+            if let Some(clock) = clock {
+                builder = builder.with_system_clock(clock);
+            }
             TestCache {
-                db,
+                db: builder.build().await.unwrap(),
                 recorder,
                 _dir: dir,
             }
@@ -1731,16 +2113,19 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn should_count_reads_only_on_their_thread_until_a_fold() {
-            let t = open(|o| {
-                o.tuning.stats_fold_events = 1_000_000;
-                o.tuning.stats_fold_interval = Duration::from_secs(3600);
-            })
+            let t = open(
+                |o| {
+                    o.tuning.stats_fold_events = 1_000_000;
+                    o.tuning.stats_fold_interval = Duration::from_secs(3600);
+                },
+                None,
+            )
             .await;
             put_even(&t.db, 200).await;
             t.db.cache_range(key(0)..key(200)).await.unwrap();
             let range = t.range(&key(0));
             let before = t.read_metrics();
-            let last_access = range.hits.last_access();
+            let last_access = range.heat.hits.last_access();
             let clock = t.cache().hits.access_clock().load(Ordering::Relaxed);
             assert!(last_access < clock);
 
@@ -1764,8 +2149,8 @@ mod tests {
                 });
                 main.wait();
                 assert_eq!(t.read_metrics(), before);
-                assert_eq!(range.hits.reads(), 0);
-                assert_eq!(range.hits.last_access(), last_access);
+                assert_eq!(range.heat.reads(), 0);
+                assert_eq!(range.heat.hits.last_access(), last_access);
                 main.go();
                 main.wait();
                 let [hits, absent, scans, gets, scan_requests] = before;
@@ -1779,13 +2164,13 @@ mod tests {
                         scan_requests + 20
                     ]
                 );
-                assert_eq!(range.hits.last_access(), clock);
+                assert_eq!(range.heat.hits.last_access(), clock);
             });
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn should_converge_to_the_true_counts_after_threads_exit() {
-            let t = open(|_| {}).await;
+            let t = open(|_| {}, None).await;
             put_even(&t.db, 200).await;
             t.db.cache_range(key(0)..key(200)).await.unwrap();
             let range = t.range(&key(0));
@@ -1818,12 +2203,12 @@ mod tests {
                     scan_requests
                 ]
             );
-            assert_eq!(range.hits.reads(), 20_000);
+            assert_eq!(range.heat.reads(), 20_000);
         }
 
         #[tokio::test]
         async fn should_count_fallbacks_by_reason() {
-            let t = open(|_| {}).await;
+            let t = open(|_| {}, None).await;
             put_even(&t.db, 200).await;
             let old = t.db.snapshot().unwrap();
             // A write after the snapshot, so that the load reads a newer state.
@@ -1886,11 +2271,14 @@ mod tests {
 
         #[tokio::test]
         async fn should_evict_the_least_recently_read_range_by_folded_reads() {
-            let t = open(|o| {
-                o.tuning.page_size = 4096;
-                o.max_disk_bytes = 9000;
-                o.tuning.stats_fold_interval = Duration::from_secs(3600);
-            })
+            let t = open(
+                |o| {
+                    o.tuning.page_size = 4096;
+                    o.max_disk_bytes = 9000;
+                    o.tuning.stats_fold_interval = Duration::from_secs(3600);
+                },
+                None,
+            )
             .await;
             for i in 0..300 {
                 t.db.put(key(i), format!("value-{i}")).await.unwrap();
@@ -1904,8 +2292,51 @@ mod tests {
             for _ in 0..fold {
                 t.db.get(key(10)).await.unwrap();
             }
-            assert_eq!(first.hits.reads(), u64::from(fold));
+            assert_eq!(first.heat.reads(), u64::from(fold));
             t.db.cache_range(key(200)..key(250)).await.unwrap();
+            let starts: Vec<_> = t.db.cached_ranges().into_iter().map(|r| r.start).collect();
+            assert_eq!(starts, vec![key(0), key(200)]);
+        }
+
+        #[tokio::test]
+        async fn should_evict_automatic_ranges_by_folded_read_density() {
+            let clock = Arc::new(MockSystemClock::new());
+            let t = open(
+                |o| {
+                    o.tuning.page_size = 4096;
+                    o.max_disk_bytes = 9000;
+                    o.tuning.stats_fold_interval = Duration::from_secs(3600);
+                    o.auto_promote = Some(AutoPromoteOptions {
+                        heat_half_life: Duration::from_secs(1),
+                        ..AutoPromoteOptions::default()
+                    });
+                },
+                Some(clock.clone()),
+            )
+            .await;
+            for i in 0..300 {
+                t.db.put(key(i), format!("value-{i}")).await.unwrap();
+            }
+            let origin = Origin::Auto {
+                read_cost_ns: 1000,
+                read_rate: 0.0,
+            };
+            let load = |start: usize| {
+                let range = BytesRange::new(Included(key(start)), Excluded(key(start + 50)));
+                t.db.inner.cache_range_with(range, origin)
+            };
+            load(0).await.unwrap();
+            load(100).await.unwrap();
+            let fold = RangeCacheTuning::default().stats_fold_events;
+            for _ in 0..fold {
+                t.db.get(key(10)).await.unwrap();
+            }
+            clock.advance(Duration::from_secs(1)).await;
+            let (first, second) = (t.range(&key(0)), t.range(&key(100)));
+            let now = t.cache().now_ms();
+            assert!(t.cache().density(&first, now) > 0.0);
+            assert_eq!(t.cache().density(&second, now), 0.0);
+            load(200).await.unwrap();
             let starts: Vec<_> = t.db.cached_ranges().into_iter().map(|r| r.start).collect();
             assert_eq!(starts, vec![key(0), key(200)]);
         }

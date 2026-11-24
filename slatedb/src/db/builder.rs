@@ -747,9 +747,15 @@ impl<P: Into<Path>> DbBuilder<P> {
                     self.merge_operator.clone(),
                     self.fp_registry.clone(),
                     system_clock.clone(),
+                    rand.clone(),
                 )?)
             }
             None => None,
+        };
+        #[cfg(feature = "range_cache")]
+        let (range_cache, range_cache_promoter_rx) = match range_cache {
+            Some((cache, rx)) => (Some(cache), rx),
+            None => (None, None),
         };
 
         // Create the database inner state
@@ -912,6 +918,19 @@ impl<P: Into<Path>> DbBuilder<P> {
             inner.status_manager.as_ref(),
         )?;
 
+        // Range cache automatic promotion task.
+        #[cfg(feature = "range_cache")]
+        if let (Some(cache), Some(rx)) = (&inner.range_cache, range_cache_promoter_rx) {
+            task_executor.add_handler(
+                crate::range_cache::RANGE_CACHE_PROMOTER_TASK_NAME.to_string(),
+                Box::new(crate::range_cache::Promoter::new(
+                    inner.clone(),
+                    cache.clone(),
+                )),
+                rx,
+                &tokio_handle,
+            )?;
+        }
         // Range cache maintenance task for flushes and major merges.
         #[cfg(feature = "range_cache")]
         if let Some(cache) = &inner.range_cache {

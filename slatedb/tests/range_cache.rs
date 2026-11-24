@@ -31,13 +31,16 @@ use slatedb::fail_parallel::{self, FailPointRegistry};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::range_cache_stats::{
-    GET_COUNT, LOAD_COUNT, MIXED_SCAN_COUNT, MIXED_SCAN_RETRY_COUNT, REBUILD_COUNT, REMOVE_COUNT,
-    SCAN_COUNT, SCAN_GAP_COUNT,
+    ADMISSION_COUNT, CANDIDATE_COUNT, GET_COUNT, LOAD_COUNT, MIXED_SCAN_COUNT,
+    MIXED_SCAN_RETRY_COUNT, PROMOTION_COUNT, REBUILD_COUNT, REJECTION_COUNT, REMOVE_COUNT,
+    SAMPLE_COUNT, SCAN_COUNT, SCAN_GAP_COUNT,
 };
 use slatedb::{
-    Db, DbIterator, DbReadOps, ErrorKind, IsolationLevel, IterationOrder, KeyValue, MergeOperator,
-    MergeOperatorError, RangeCacheOptions, RangeCachePageSource, WriteBatch,
+    AutoPromoteOptions, CachedRangeInfo, Db, DbIterator, DbReadOps, ErrorKind, IsolationLevel,
+    IterationOrder, KeyValue, MergeOperator, MergeOperatorError, RangeCacheOptions,
+    RangeCachePageSource, WriteBatch,
 };
+use slatedb_common::clock::{MockSystemClock, SystemClock};
 use slatedb_common::metrics::{lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -1760,6 +1763,39 @@ async fn should_detect_conflicts_on_cached_reads() {
     db.close().await.unwrap();
 }
 
+/// Automatic promotion samples reads in transactions and snapshots like other reads.
+#[tokio::test]
+async fn should_promote_ranges_that_transactions_read() {
+    let (t, clock) = open_auto(|_| {}).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    for _ in 0..40 {
+        let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+        for i in 500..510 {
+            txn.get(key(i)).await.unwrap();
+        }
+        collect(txn.scan(key(510)..key(520)).await.unwrap()).await;
+        txn.rollback();
+        let snapshot = db.snapshot().unwrap();
+        for i in 500..510 {
+            snapshot.get(key(i)).await.unwrap();
+        }
+        tick(&clock, 200).await;
+        if holding(db, 500, 519).is_some() {
+            break;
+        }
+    }
+    assert!(holding(db, 500, 519).is_some(), "{:?}", db.cached_ranges());
+    assert!(t.metric(SAMPLE_COUNT, &[("result", "recorded")]) >= 40);
+    let hits = t.metric(GET_COUNT, &[("result", "hit")]);
+    let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+    for i in 500..520 {
+        txn.get(key(i)).await.unwrap();
+    }
+    assert_eq!(t.metric(GET_COUNT, &[("result", "hit")]), hits + 20);
+    db.close().await.unwrap();
+}
+
 /// A merge operand applied while a load registers its range must count once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn should_apply_a_merge_that_races_registration_once() {
@@ -2340,6 +2376,29 @@ async fn should_scan_across_parts_in_snapshots_and_transactions() {
     db.close().await.unwrap();
 }
 
+/// Mixed scans sample uncovered gaps so frequently read gaps promote and become fully cached.
+#[tokio::test]
+async fn should_promote_the_gaps_of_mixed_scans() {
+    let (t, clock) = open_auto(|_| {}).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    db.cache_range(key(400)..key(500)).await.unwrap();
+    for _ in 0..60 {
+        collect(db.scan(key(480)..key(520)).await.unwrap()).await;
+        tick(&clock, 200).await;
+        if holding(db, 500, 519).is_some() {
+            break;
+        }
+    }
+    assert!(holding(db, 500, 519).is_some(), "{:?}", db.cached_ranges());
+    assert!(t.metric(SCAN_GAP_COUNT, &[]) > 0);
+    let before = scan_counts(&t);
+    let rows = collect(db.scan(key(480)..key(520)).await.unwrap()).await;
+    assert_eq!(rows.len(), 40);
+    assert_eq!(scan_counts(&t), (before.0 + 1, before.1, before.2));
+    db.close().await.unwrap();
+}
+
 /// A fail point that pauses the thread that reaches it until the test lets it go. Each arrival
 /// sends on the returned receiver, then waits for one message on the returned sender.
 fn pause_at(
@@ -2498,4 +2557,433 @@ async fn should_fall_back_when_freezes_keep_interrupting_a_mixed_scan() {
     // The normal path served it.
     assert_eq!(lookup_metric(&recorder, SCAN_COUNT).unwrap_or(0), 0);
     db.close().await.unwrap();
+}
+
+// Automatic promotion tests run on a mock clock with `sample_one_in = 1`.
+
+fn set_auto_options(opts: &mut RangeCacheOptions) {
+    let mut auto = AutoPromoteOptions::default();
+    auto.sample_one_in = 1;
+    auto.target_range_bytes = 16 * 1024;
+    auto.heat_half_life = Duration::from_secs(1);
+    opts.auto_promote = Some(auto);
+    let tuning = &mut opts.tuning;
+    tuning.evaluate_interval = Duration::from_millis(100);
+    tuning.max_candidates_per_evaluation = 4;
+    tuning.min_evidence = 4;
+    tuning.full_evidence = 16;
+    tuning.min_reuse_span = Duration::from_millis(500);
+    tuning.admission_margin = 2.0;
+    tuning.ghost_ttl = Duration::from_secs(10);
+    tuning.candidate_ttl = Duration::from_secs(10);
+    tuning.candidate_recheck = Duration::from_millis(100);
+    tuning.backoff_base = Duration::from_secs(5);
+    tuning.reservoir_capacity = 32 * 64;
+    tuning.queue_capacity = 100_000;
+    tuning.min_read_cost = Duration::from_millis(1);
+    tuning.rebuild_cost_ns_per_byte = 5.0;
+}
+
+async fn open_auto(tune: impl FnOnce(&mut RangeCacheOptions)) -> (TestDb, Arc<MockSystemClock>) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    set_auto_options(&mut opts);
+    tune(&mut opts);
+    let clock = Arc::new(MockSystemClock::new());
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let settings = Settings {
+        compactor_options: None,
+        ..Settings::default()
+    };
+    let db = Db::builder("range_cache_auto_test", Arc::new(InMemory::new()))
+        .with_settings(settings)
+        .with_range_cache(opts)
+        .with_merge_operator(Arc::new(ConcatMergeOperator))
+        .with_metrics_recorder(recorder.clone())
+        .with_system_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    (TestDb { db, recorder, dir }, clock)
+}
+
+/// 100-byte value so 16 KiB holds roughly 120 rows.
+fn padded(i: usize, round: usize) -> Bytes {
+    Bytes::from(format!("{round:04}-{i:0>95}"))
+}
+
+async fn load_padded(db: &Db, n: usize) {
+    let mut batch = WriteBatch::new();
+    for i in 0..n {
+        batch.put(key(i), padded(i, 0));
+        if i % 100 == 99 || i + 1 == n {
+            db.write(std::mem::take(&mut batch)).await.unwrap();
+        }
+    }
+}
+
+async fn read_keys(db: &Db, keys: impl IntoIterator<Item = usize>) {
+    for i in keys {
+        db.get(key(i)).await.unwrap();
+    }
+}
+
+async fn tick(clock: &MockSystemClock, ms: u64) {
+    clock.advance(Duration::from_millis(ms)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+}
+
+/// Returns the ready range covering `first..=last`, if any.
+fn holding(db: &Db, first: usize, last: usize) -> Option<CachedRangeInfo> {
+    db.cached_ranges().into_iter().find(|r| {
+        !r.loading && r.start <= key(first) && r.end.as_ref().is_none_or(|end| *end > key(last))
+    })
+}
+
+#[tokio::test]
+async fn should_be_inert_when_auto_promotion_is_off() {
+    assert!(RangeCacheOptions::new("unused").auto_promote.is_none());
+    let t = open(|_| {}).await;
+    let db = &t.db;
+    load_padded(db, 500).await;
+    for _ in 0..20 {
+        read_keys(db, 100..120).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(db.cached_ranges().is_empty());
+    let snapshot = t.recorder.snapshot();
+    assert!(
+        !snapshot
+            .all()
+            .iter()
+            .any(|m| m.name == SAMPLE_COUNT || m.name == PROMOTION_COUNT),
+        "no automatic promotion metrics without automatic promotion"
+    );
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_promote_a_repeatedly_read_range() {
+    let (t, clock) = open_auto(|_| {}).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    for _ in 0..40 {
+        read_keys(db, 500..520).await;
+        tick(&clock, 200).await;
+        if holding(db, 500, 519).is_some() {
+            break;
+        }
+    }
+    let range = holding(db, 500, 519).expect("the hot keys are cached");
+    assert!(range.automatic);
+    assert!(range.file_rows > 50 && range.file_rows < 400, "{range:?}");
+    assert_eq!(t.metric(PROMOTION_COUNT, &[]), 1);
+    assert_eq!(t.metric(ADMISSION_COUNT, &[("result", "free")]), 1);
+    assert!(t.metric(CANDIDATE_COUNT, &[("source", "scan")]) >= 1);
+    assert!(t.metric(SAMPLE_COUNT, &[("result", "recorded")]) >= 40);
+
+    let hits = t.metric(GET_COUNT, &[("result", "hit")]);
+    read_keys(db, 500..520).await;
+    assert_eq!(t.metric(GET_COUNT, &[("result", "hit")]), hits + 20);
+    db.put(key(505), padded(505, 1)).await.unwrap();
+    db.delete(key(506)).await.unwrap();
+    assert_matches_snapshot(
+        db,
+        (480..540).map(key),
+        (Included(key(400)), Excluded(key(600))),
+    )
+    .await;
+    db.close().await.unwrap();
+}
+
+/// The promoter continues draining samples while an admitted range loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn should_keep_sampling_while_a_promotion_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    set_auto_options(&mut opts);
+    opts.tuning.queue_capacity = 16;
+    let clock = Arc::new(MockSystemClock::new());
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let fp_registry = Arc::new(FailPointRegistry::new());
+    let settings = Settings {
+        compactor_options: None,
+        ..Settings::default()
+    };
+    let db = Db::builder("range_cache_auto_load", Arc::new(InMemory::new()))
+        .with_settings(settings)
+        .with_range_cache(opts)
+        .with_metrics_recorder(recorder.clone())
+        .with_system_clock(clock.clone())
+        .with_fp_registry(fp_registry.clone())
+        .build()
+        .await
+        .unwrap();
+    let t = TestDb { db, recorder, dir };
+    let db = &t.db;
+    load_padded(db, 2000).await;
+
+    fail_parallel::cfg(fp_registry.clone(), "range-cache-load", "pause").unwrap();
+    for _ in 0..40 {
+        read_keys(db, 500..510).await;
+        tick(&clock, 200).await;
+        if t.metric(ADMISSION_COUNT, &[("result", "free")]) > 0 {
+            break;
+        }
+    }
+    assert_eq!(t.metric(ADMISSION_COUNT, &[("result", "free")]), 1);
+    let recorded = t.metric(SAMPLE_COUNT, &[("result", "recorded")]);
+    let dropped = t.metric(SAMPLE_COUNT, &[("result", "dropped")]);
+    for burst in 0..20 {
+        read_keys(db, 1000 + burst * 8..1008 + burst * 8).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let dropped_during_load = t.metric(SAMPLE_COUNT, &[("result", "dropped")]) - dropped;
+    let recorded_during_load = t.metric(SAMPLE_COUNT, &[("result", "recorded")]) - recorded;
+    let admissions = t.metric(ADMISSION_COUNT, &[("result", "free")]);
+    let promotions = t.metric(PROMOTION_COUNT, &[]);
+    fail_parallel::cfg(fp_registry.clone(), "range-cache-load", "off").unwrap();
+    assert_eq!(
+        dropped_during_load, 0,
+        "the read path dropped samples while a promotion loaded"
+    );
+    assert_eq!(recorded_during_load, 160);
+    assert_eq!(admissions, 1);
+    assert_eq!(promotions, 0);
+    wait_for(|| holding(db, 500, 509).is_some()).await;
+    wait_for(|| t.metric(PROMOTION_COUNT, &[]) == 1).await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_not_promote_a_single_pass() {
+    let (t, clock) = open_auto(|o| o.max_disk_bytes = 64 * 1024).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    for i in 0..2000 {
+        db.get(key(i)).await.unwrap();
+        if i % 10 == 9 {
+            tick(&clock, 10).await;
+        }
+    }
+    for _ in 0..20 {
+        tick(&clock, 200).await;
+    }
+    assert!(t.metric(REJECTION_COUNT, &[("reason", "not_reused")]) > 0);
+    assert_eq!(t.metric(PROMOTION_COUNT, &[]), 0);
+    assert_eq!(t.metric(REMOVE_COUNT, &[("reason", "evicted")]), 0);
+    assert!(db.cached_ranges().is_empty());
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_follow_a_moving_hot_set() {
+    let (t, clock) = open_auto(|o| o.max_disk_bytes = 28 * 1024).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    for _ in 0..40 {
+        read_keys(db, 100..120).await;
+        tick(&clock, 200).await;
+        if holding(db, 100, 119).is_some() {
+            break;
+        }
+    }
+    assert!(holding(db, 100, 119).is_some(), "{:?}", db.cached_ranges());
+
+    for _ in 0..60 {
+        read_keys(db, 1500..1520).await;
+        tick(&clock, 200).await;
+        if holding(db, 1500, 1519).is_some() {
+            break;
+        }
+    }
+    assert!(
+        holding(db, 1500, 1519).is_some(),
+        "{:?}",
+        db.cached_ranges()
+    );
+    assert!(holding(db, 100, 119).is_none());
+    assert_eq!(t.metric(ADMISSION_COUNT, &[("result", "evicting")]), 1);
+    assert_eq!(t.metric(REMOVE_COUNT, &[("reason", "evicted")]), 1);
+    assert_eq!(t.metric(PROMOTION_COUNT, &[]), 2);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_remove_ranges_that_writes_make_too_costly() {
+    let (t, clock) = open_auto(|o| {
+        o.tuning.min_rebuild_delta_bytes = 1024;
+        o.tuning.range_seal_bytes = 4096;
+    })
+    .await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    for _ in 0..40 {
+        read_keys(db, 100..120).await;
+        read_keys(db, 1500..1520).await;
+        tick(&clock, 200).await;
+        if holding(db, 100, 119).is_some() && holding(db, 1500, 1519).is_some() {
+            break;
+        }
+    }
+    assert!(holding(db, 100, 119).is_some(), "{:?}", db.cached_ranges());
+    assert!(
+        holding(db, 1500, 1519).is_some(),
+        "{:?}",
+        db.cached_ranges()
+    );
+
+    for round in 1..=20 {
+        for i in 100..130 {
+            db.put(key(i), padded(i, round)).await.unwrap();
+        }
+        for i in 1500..1530 {
+            db.put(key(i), padded(i, round)).await.unwrap();
+        }
+        read_keys(db, 1500..1540).await;
+        tick(&clock, 200).await;
+    }
+    assert!(holding(db, 100, 119).is_none(), "{:?}", db.cached_ranges());
+    assert_eq!(t.metric(REMOVE_COUNT, &[("reason", "not_worth_it")]), 1);
+    assert!(
+        holding(db, 1500, 1519).is_some(),
+        "{:?}",
+        db.cached_ranges()
+    );
+    assert!(t.metric(REBUILD_COUNT, &[]) >= 2);
+    assert_eq!(t.metric(REMOVE_COUNT, &[("reason", "evicted")]), 0);
+    assert_matches_snapshot(
+        db,
+        (90..140).chain(1490..1540).map(key),
+        (Included(key(1400)), Excluded(key(1600))),
+    )
+    .await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_settle_when_the_hot_set_is_larger_than_the_budget() {
+    let (t, clock) = open_auto(|o| o.max_disk_bytes = 56 * 1024).await;
+    let db = &t.db;
+    load_padded(db, 2000).await;
+    let hot = [100, 600, 1100, 1600];
+    let mut promotions_at_half = 0;
+    let mut evictions_at_half = 0;
+    for step in 0..80 {
+        for start in hot {
+            read_keys(db, start..start + 20).await;
+        }
+        tick(&clock, 200).await;
+        if step == 39 {
+            promotions_at_half = t.metric(PROMOTION_COUNT, &[]);
+            evictions_at_half = t.metric(REMOVE_COUNT, &[("reason", "evicted")]);
+        }
+    }
+    let cached = hot
+        .iter()
+        .filter(|s| holding(db, **s, **s + 19).is_some())
+        .count();
+    assert!(cached >= 1, "{:?}", db.cached_ranges());
+    assert!(promotions_at_half >= 1);
+    assert!(t.metric(PROMOTION_COUNT, &[]) - promotions_at_half <= 1);
+    assert!(t.metric(REMOVE_COUNT, &[("reason", "evicted")]) - evictions_at_half <= 1);
+    assert!(t.metric(REJECTION_COUNT, &[("reason", "not_denser")]) > 0);
+    db.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_take_candidate_bounds_from_the_sst_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    set_auto_options(&mut opts);
+    opts.tuning.min_read_cost = Duration::from_micros(1);
+    opts.tuning.evaluate_interval = Duration::from_millis(50);
+    opts.tuning.min_reuse_span = Duration::from_millis(200);
+    let settings = Settings {
+        l0_sst_size_bytes: 64 * 1024,
+        compactor_options: Some(CompactorOptions {
+            poll_interval: Duration::from_millis(5),
+            scheduler_options: SizeTieredCompactionSchedulerOptions {
+                min_compaction_sources: 1,
+                ..Default::default()
+            }
+            .into(),
+            worker: Some(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(5),
+                ..Default::default()
+            }),
+            ..CompactorOptions::default()
+        }),
+        ..Settings::default()
+    };
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let db = Db::builder("range_cache_auto_sst", Arc::new(InMemory::new()))
+        .with_settings(settings)
+        .with_range_cache(opts)
+        .with_metrics_recorder(recorder.clone())
+        .build()
+        .await
+        .unwrap();
+    let t = TestDb { db, recorder, dir };
+    let db = &t.db;
+    load_padded(db, 4000).await;
+    flush_memtable(db).await;
+    wait_for(|| {
+        let manifest = db.manifest();
+        manifest.l0().is_empty() && !manifest.compacted().is_empty()
+    })
+    .await;
+    for _ in 0..200 {
+        read_keys(db, 2000..2020).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if holding(db, 2000, 2019).is_some() {
+            break;
+        }
+    }
+    let range = holding(db, 2000, 2019).expect("the hot keys are cached");
+    assert!(t.metric(CANDIDATE_COUNT, &[("source", "sst_index")]) >= 1);
+    assert_eq!(t.metric(CANDIDATE_COUNT, &[("source", "scan")]), 0);
+    assert!(range.file_rows > 50 && range.file_rows < 600, "{range:?}");
+    assert_matches_snapshot(
+        db,
+        (1990..2030).map(key),
+        (Included(key(1900)), Excluded(key(2100))),
+    )
+    .await;
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn should_stop_promoting_when_fenced() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(dir.path());
+    set_auto_options(&mut opts);
+    opts.tuning.min_read_cost = Duration::from_micros(1);
+    opts.tuning.evaluate_interval = Duration::from_millis(20);
+    opts.tuning.min_reuse_span = Duration::from_millis(50);
+    let db = Db::builder("range_cache_test", store.clone())
+        .with_range_cache(opts)
+        .build()
+        .await
+        .unwrap();
+    load_padded(&db, 1000).await;
+    for _ in 0..200 {
+        read_keys(&db, 300..320).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if holding(&db, 300, 319).is_some() {
+            break;
+        }
+    }
+    assert!(holding(&db, 300, 319).is_some());
+    let other = Db::open("range_cache_test", store).await.unwrap();
+    let err = match db.put(key(2), padded(2, 1)).await {
+        Ok(_) => db.flush().await.unwrap_err(),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), ErrorKind::Closed(slatedb::CloseReason::Fenced));
+    wait_for(|| db.cached_ranges().is_empty()).await;
+    assert_eq!(cache_files(dir.path()), 0);
+    assert!(db.get(key(300)).await.is_err());
+    other.close().await.unwrap();
 }

@@ -52,7 +52,7 @@ pub const FLUSH_MERGE_BYTES: &str = range_cache_stat_name!("flush_merge_bytes");
 /// Flushed runs or merged bases rejected because the range state changed concurrently.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
 /// Ranges removed from the cache. `reason` is `evicted`, `explicit`, `expiring_write`, `error`,
-/// `closed`, or `overflow`.
+/// `closed`, `not_worth_it`, or `overflow`.
 pub const REMOVE_COUNT: &str = range_cache_stat_name!("remove_count");
 /// Cached ranges currently indexed, including loading ranges.
 pub const RANGE_COUNT: &str = range_cache_stat_name!("range_count");
@@ -68,6 +68,21 @@ pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_
 /// Heap bytes of all live delta views. Also included in `meta_bytes`.
 pub const VIEW_BYTES: &str = range_cache_stat_name!("view_bytes");
 
+/// Normal-path reads sampled for automatic promotion. `result` is `recorded` or `dropped`.
+pub const SAMPLE_COUNT: &str = range_cache_stat_name!("sample_count");
+/// Candidate ranges evaluated by automatic promotion. `source` is `sst_index`, `scan`, or
+/// `remembered`.
+pub const CANDIDATE_COUNT: &str = range_cache_stat_name!("candidate_count");
+/// Candidates admitted by automatic promotion. `result` is `free` or `evicting`.
+pub const ADMISSION_COUNT: &str = range_cache_stat_name!("admission_count");
+/// Candidates rejected by automatic promotion. `reason` is `cold`, `not_reused`, `too_large`,
+/// `no_room`, `not_denser`, or `backoff`.
+pub const REJECTION_COUNT: &str = range_cache_stat_name!("rejection_count");
+/// Automatic ranges that completed loading.
+pub const PROMOTION_COUNT: &str = range_cache_stat_name!("promotion_count");
+/// Admitted candidates overlapping a recently removed range.
+pub const REPROMOTION_COUNT: &str = range_cache_stat_name!("repromotion_count");
+
 /// Why the cache removed a range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemoveReason {
@@ -81,8 +96,20 @@ pub(crate) enum RemoveReason {
     Error,
     /// Removed when the database closed or failed.
     Closed,
+    /// Removed because reads since the last base build did not pay for a major merge.
+    NotWorthIt,
     /// Removed to stay within the write buffer memory cap.
     Overflow,
+}
+
+impl RemoveReason {
+    /// Returns true if a later promotion of the range should back off.
+    pub(crate) fn is_failure(self) -> bool {
+        matches!(
+            self,
+            RemoveReason::ExpiringWrite | RemoveReason::Error | RemoveReason::NotWorthIt
+        )
+    }
 }
 
 /// Why a ready cached range failed sequence number checks.
@@ -221,6 +248,87 @@ pub(crate) fn read_counters(recorder: &MetricsRecorderHelper) -> [Arc<dyn Counte
     })
 }
 
+/// Why automatic promotion rejected a candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RejectReason {
+    Cold,
+    NotReused,
+    TooLarge,
+    NoRoom,
+    NotDenser,
+    Backoff,
+}
+
+/// Source of a candidate's key bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateSource {
+    SstIndex,
+    Scan,
+    Remembered,
+}
+
+/// Automatic promotion metrics.
+pub(crate) struct AutoStats {
+    pub(crate) samples_recorded: Arc<dyn CounterFn>,
+    pub(crate) samples_dropped: Arc<dyn CounterFn>,
+    candidates_sst_index: Arc<dyn CounterFn>,
+    candidates_scan: Arc<dyn CounterFn>,
+    candidates_remembered: Arc<dyn CounterFn>,
+    pub(crate) admissions_free: Arc<dyn CounterFn>,
+    pub(crate) admissions_evicting: Arc<dyn CounterFn>,
+    rejected: [Arc<dyn CounterFn>; 6],
+    pub(crate) promotions: Arc<dyn CounterFn>,
+    pub(crate) repromotions: Arc<dyn CounterFn>,
+}
+
+impl AutoStats {
+    pub(crate) fn new(recorder: &MetricsRecorderHelper) -> Self {
+        let labeled =
+            |name, label, value| recorder.counter(name).labels(&[(label, value)]).register();
+        let rejected = |reason| labeled(REJECTION_COUNT, "reason", reason);
+        Self {
+            samples_recorded: labeled(SAMPLE_COUNT, "result", "recorded"),
+            samples_dropped: labeled(SAMPLE_COUNT, "result", "dropped"),
+            candidates_sst_index: labeled(CANDIDATE_COUNT, "source", "sst_index"),
+            candidates_scan: labeled(CANDIDATE_COUNT, "source", "scan"),
+            candidates_remembered: labeled(CANDIDATE_COUNT, "source", "remembered"),
+            admissions_free: labeled(ADMISSION_COUNT, "result", "free"),
+            admissions_evicting: labeled(ADMISSION_COUNT, "result", "evicting"),
+            rejected: [
+                rejected("cold"),
+                rejected("not_reused"),
+                rejected("too_large"),
+                rejected("no_room"),
+                rejected("not_denser"),
+                rejected("backoff"),
+            ],
+            promotions: recorder.counter(PROMOTION_COUNT).register(),
+            repromotions: recorder.counter(REPROMOTION_COUNT).register(),
+        }
+    }
+
+    pub(crate) fn rejected(&self, reason: RejectReason) {
+        let index = match reason {
+            RejectReason::Cold => 0,
+            RejectReason::NotReused => 1,
+            RejectReason::TooLarge => 2,
+            RejectReason::NoRoom => 3,
+            RejectReason::NotDenser => 4,
+            RejectReason::Backoff => 5,
+        };
+        self.rejected[index].increment(1);
+    }
+
+    pub(crate) fn candidate(&self, source: CandidateSource) {
+        match source {
+            CandidateSource::SstIndex => &self.candidates_sst_index,
+            CandidateSource::Scan => &self.candidates_scan,
+            CandidateSource::Remembered => &self.candidates_remembered,
+        }
+        .increment(1);
+    }
+}
+
 /// Range cache metrics outside the per-thread read counters.
 pub(crate) struct RangeCacheStats {
     pub(crate) loads: Arc<dyn CounterFn>,
@@ -240,6 +348,7 @@ pub(crate) struct RangeCacheStats {
     removed_expiring_write: Arc<dyn CounterFn>,
     removed_error: Arc<dyn CounterFn>,
     removed_closed: Arc<dyn CounterFn>,
+    removed_not_worth_it: Arc<dyn CounterFn>,
     removed_overflow: Arc<dyn CounterFn>,
     pub(crate) ranges: Arc<dyn GaugeFn>,
     pub(crate) file_bytes: Arc<dyn GaugeFn>,
@@ -271,6 +380,7 @@ impl RangeCacheStats {
             removed_expiring_write: removed("expiring_write"),
             removed_error: removed("error"),
             removed_closed: removed("closed"),
+            removed_not_worth_it: removed("not_worth_it"),
             removed_overflow: removed("overflow"),
             ranges: recorder.gauge(RANGE_COUNT).register(),
             file_bytes: recorder.gauge(FILE_BYTES).register(),
@@ -287,6 +397,7 @@ impl RangeCacheStats {
             RemoveReason::ExpiringWrite => &self.removed_expiring_write,
             RemoveReason::Error => &self.removed_error,
             RemoveReason::Closed => &self.removed_closed,
+            RemoveReason::NotWorthIt => &self.removed_not_worth_it,
             RemoveReason::Overflow => &self.removed_overflow,
         };
         counter.increment(1);

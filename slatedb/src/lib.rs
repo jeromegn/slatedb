@@ -76,7 +76,9 @@ pub use range_cache::stats as range_cache_stats;
 #[doc(hidden)]
 pub use range_cache::RangeCacheTuning;
 #[cfg(feature = "range_cache")]
-pub use range_cache::{CachedRangeInfo, RangeCacheOptions, RangeCachePageSource};
+pub use range_cache::{
+    AutoPromoteOptions, CachedRangeInfo, RangeCacheOptions, RangeCachePageSource,
+};
 pub use slatedb_common::{DbRand, IdentifiedObjectMetadata, ObjectMetadata};
 #[cfg(test)]
 pub use sst_builder::BlockFormat;

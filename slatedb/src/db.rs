@@ -224,13 +224,18 @@ impl DbInner {
     ) -> Result<Option<KeyValue>, SlateDBError> {
         self.check_closed()?;
         #[cfg(feature = "range_cache")]
-        if let Some(result) = self.range_cache_get(key.as_ref(), options, None).await {
-            return result;
-        }
+        let sample = match self.range_cache_get(key.as_ref(), options, None).await {
+            crate::range_cache::GetRoute::Served(result) => return result,
+            crate::range_cache::GetRoute::Normal(sample) => sample,
+        };
         let db_state = self.state.read().view();
-        self.reader
+        let result = self
+            .reader
             .get_key_value_with_options(key.as_ref(), options, &db_state, None, None)
-            .await
+            .await;
+        #[cfg(feature = "range_cache")]
+        self.range_cache_record(sample);
+        result
     }
 
     /// Shared scan path for plain range scans and prefix scans. When
@@ -244,15 +249,16 @@ impl DbInner {
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
         #[cfg(feature = "range_cache")]
-        let range = match self
+        let (range, sample) = match self
             .range_cache_scan(range, options, prefix.as_ref(), None)
             .await
         {
             crate::range_cache::ScanRoute::Served(result) => return result,
-            crate::range_cache::ScanRoute::Normal(range) => range,
+            crate::range_cache::ScanRoute::Normal(range, sample) => (range, sample),
         };
         let db_state = self.state.read().view();
-        self.reader
+        let result = self
+            .reader
             .scan_with_options(
                 range,
                 options,
@@ -263,7 +269,10 @@ impl DbInner {
                     prefix,
                 },
             )
-            .await
+            .await;
+        #[cfg(feature = "range_cache")]
+        self.range_cache_record(sample);
+        result
     }
 
     pub(crate) async fn scan_prefix_by_recency_with_options(
@@ -714,6 +723,17 @@ impl Db {
 
         MemtableFlusher::shutdown(&self.task_executor).await;
 
+        #[cfg(feature = "range_cache")]
+        if let Err(e) = self
+            .task_executor
+            .shutdown_task(crate::range_cache::RANGE_CACHE_PROMOTER_TASK_NAME)
+            .await
+        {
+            warn!(
+                "failed to shutdown range cache promoter task [error={:?}]",
+                e
+            );
+        }
         #[cfg(feature = "range_cache")]
         if let Err(e) = self
             .task_executor

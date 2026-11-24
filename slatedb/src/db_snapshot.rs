@@ -80,19 +80,23 @@ impl DbSnapshot {
     ) -> Result<Option<KeyValue>, crate::Error> {
         self.db_inner.check_closed()?;
         #[cfg(feature = "range_cache")]
-        if let Some(result) = self
+        let sample = match self
             .db_inner
             .range_cache_get(key.as_ref(), options, Some(self.started_seq))
             .await
         {
-            return result.map_err(Into::into);
-        }
+            crate::range_cache::GetRoute::Served(result) => return result.map_err(Into::into),
+            crate::range_cache::GetRoute::Normal(sample) => sample,
+        };
         let db_state = self.db_inner.state.read().view();
-        self.db_inner
+        let kv = self
+            .db_inner
             .reader
             .get_key_value_with_options(key, options, &db_state, None, Some(self.started_seq))
-            .await
-            .map_err(crate::Error::from)
+            .await;
+        #[cfg(feature = "range_cache")]
+        self.db_inner.range_cache_record(sample);
+        kv.map_err(crate::Error::from)
     }
 
     /// Scan a range of keys using the default scan options.
@@ -194,16 +198,17 @@ impl DbSnapshot {
     ) -> Result<DbIterator, crate::Error> {
         self.db_inner.check_closed()?;
         #[cfg(feature = "range_cache")]
-        let range = match self
+        let (range, sample) = match self
             .db_inner
             .range_cache_scan(range, options, prefix.as_ref(), Some(self.started_seq))
             .await
         {
             crate::range_cache::ScanRoute::Served(result) => return result.map_err(Into::into),
-            crate::range_cache::ScanRoute::Normal(range) => range,
+            crate::range_cache::ScanRoute::Normal(range, sample) => (range, sample),
         };
         let db_state = self.db_inner.state.read().view();
-        self.db_inner
+        let result = self
+            .db_inner
             .reader
             .scan_with_options(
                 range,
@@ -215,8 +220,10 @@ impl DbSnapshot {
                     prefix,
                 },
             )
-            .await
-            .map_err(Into::into)
+            .await;
+        #[cfg(feature = "range_cache")]
+        self.db_inner.range_cache_record(sample);
+        result.map_err(Into::into)
     }
 }
 

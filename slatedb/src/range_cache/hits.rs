@@ -34,7 +34,6 @@ pub(crate) struct RangeHits {
 }
 
 impl RangeHits {
-    #[cfg(test)]
     pub(crate) fn reads(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
     }

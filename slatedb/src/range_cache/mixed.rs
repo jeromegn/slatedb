@@ -13,7 +13,7 @@ use bytes::Bytes;
 
 use super::scan::CachedScan;
 use super::stats::ReadCount;
-use super::{Layers, RangeCache};
+use super::{scan_start, Layers, RangeCache};
 use crate::bytes_range::BytesRange;
 use crate::config::ScanOptions;
 use crate::db_iter::DbIterator;
@@ -27,7 +27,11 @@ use crate::types::RowEntry;
 /// Source of one part of a mixed scan.
 pub(crate) enum PartKind {
     Cached(Arc<Layers>),
-    Gap,
+    /// Normal read path. `sample` is false when a cached range covers the part but cannot serve
+    /// at the scan sequence number.
+    Gap {
+        sample: bool,
+    },
 }
 
 /// A non-empty key range inside a mixed scan.
@@ -136,18 +140,19 @@ impl MixedScan {
         let Some(part) = self.parts.pop_front() else {
             return Ok(false);
         };
-        let PartKind::Gap = part.kind else {
+        let PartKind::Gap { sample } = part.kind else {
             return Ok(true);
         };
         let Some(range) = BytesRange::try_new(part.start.clone(), part.end.clone()) else {
             return Ok(true);
         };
         let gaps = &self.gaps;
+        let sampled = if sample { gaps.cache.sample() } else { None };
         gaps.cache.hits.count(ReadCount::ScanGap);
         let iter = gaps
             .reader
             .scan_with_options(
-                range,
+                range.clone(),
                 &gaps.options,
                 ScanContext {
                     db_state: &gaps.view,
@@ -157,6 +162,9 @@ impl MixedScan {
                 },
             )
             .await?;
+        if let Some(sampled) = sampled {
+            gaps.cache.record(sampled, &scan_start(&range));
+        }
         self.current = Open::Gap(Box::new(iter));
         self.current_start = part.start;
         self.current_end = part.end;

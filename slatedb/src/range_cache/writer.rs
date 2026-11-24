@@ -13,10 +13,11 @@ use std::sync::{Arc, OnceLock};
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
+use super::auto::Removal;
 use super::file::RangeFile;
 use super::stats::RemoveReason;
 use super::{
-    covering, uncovered, CachedRange, Delta, DeltaView, Layers, RangeCache, RangeIndex, Run,
+    covering, uncovered, CachedRange, Delta, DeltaView, Layers, Origin, RangeCache, RangeIndex, Run,
 };
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
@@ -38,6 +39,7 @@ pub(super) enum Request {
         start: Bytes,
         end: Option<Bytes>,
         splits: Vec<Bytes>,
+        origin: Origin,
         reply: oneshot::Sender<Result<Registered, SlateDBError>>,
     },
     /// Publish the base of a loading range. The base holds the state at `base_seq`.
@@ -278,12 +280,14 @@ impl RangeCache {
         start: Bytes,
         end: Option<Bytes>,
         splits: Vec<Bytes>,
+        origin: Origin,
     ) -> Result<Registered, SlateDBError> {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::Register {
             start,
             end,
             splits,
+            origin,
             reply,
         });
         answer.await.unwrap_or(Err(SlateDBError::Closed))
@@ -598,6 +602,7 @@ impl RangeCache {
                 start,
                 end,
                 splits,
+                origin,
                 reply,
             } => {
                 // Reject loads above the high-water mark to avoid filling nearly full buffers.
@@ -607,7 +612,7 @@ impl RangeCache {
                         "the range cache's write buffers are nearly full",
                     ))
                 } else {
-                    Ok(self.register_at(start, end, &splits, w))
+                    Ok(self.register_at(start, end, &splits, origin, w))
                 };
                 let _ = reply.send(answer);
             }
@@ -684,8 +689,10 @@ impl RangeCache {
         start: Bytes,
         end: Option<Bytes>,
         splits: &[Bytes],
+        origin: Origin,
         w: u64,
     ) -> Registered {
+        let now = self.now_ms();
         let mut index = RangeIndex::clone(&self.index.load());
         let parts = split_parts(uncovered(&index, &start, end.as_ref()), splits);
         let mut ranges = Vec::with_capacity(parts.len());
@@ -705,6 +712,8 @@ impl RangeCache {
                 part_start.clone(),
                 part_end,
                 layers,
+                origin,
+                now,
                 self.writer.take_slot(),
             ));
             index.insert(part_start, range.clone());
@@ -729,7 +738,7 @@ impl RangeCache {
         self.stats.loads.increment(1);
         self.stats.load_bytes.increment(base.file_len());
         let now = self.hits.access_clock().fetch_add(2, Ordering::Relaxed) + 2;
-        range.hits.set_last_access(now - 1);
+        range.heat.hits.set_last_access(now - 1);
         self.store_layers(
             range,
             Layers {
@@ -917,7 +926,25 @@ impl RangeCache {
         self.writer.give_back_slot(range.slot);
         self.stats.removed(reason);
         self.update_gauges();
+        self.notify_removal(range, reason);
         true
+    }
+
+    /// Notifies automatic promotion when an automatic range leaves so it updates ghosts and
+    /// failure backoff.
+    fn notify_removal(&self, range: &CachedRange, reason: RemoveReason) {
+        let Some(auto) = &self.auto else {
+            return;
+        };
+        if !range.auto || reason == RemoveReason::Closed {
+            return;
+        }
+        let _ = auto.removals.0.try_send(Removal {
+            start: range.start.clone(),
+            end: range.end.clone(),
+            failure: reason.is_failure(),
+            at_ms: self.now_ms(),
+        });
     }
 
     /// Removes every range and refuses all queued and future requests when the writer stops.
