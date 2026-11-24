@@ -6,11 +6,13 @@
 //! [`RangeCacheTuning::max_runs`] run files (indexed by one sorted delta view for scans and
 //! Bloom filters for point reads), and a base file holding live rows at `base_seq`.
 //!
-//! Only the batch writer mutates the range index and layer sets; loads, flushes, merges, and
-//! removals apply at writer boundaries. A range's base is a sorted list of [`Chunks`] tiling its
-//! span, each holding live rows at its own `base_seq`. Reads pin layers without locking and verify
-//! `seq >= chunk.base_seq` for each touched chunk and `seq <= layers.active.sealed_at`. Read and
-//! fallback counts accumulate per thread and fold periodically into shared metrics and range hits.
+//! Only the batch writer mutates the range index and layer sets; loads, flushes, merges, splits,
+//! and removals apply at writer boundaries. A range's base is a sorted list of [`Chunks`] tiling
+//! its span, each holding live rows at its own `base_seq`. Ranges larger than twice
+//! [`RangeCacheTuning::range_target_bytes`] split without copying files (see `split`). Reads pin
+//! layers without locking and verify `seq >= chunk.base_seq` for each touched chunk and
+//! `seq <= layers.active.sealed_at`. Read and fallback counts accumulate per thread and fold
+//! periodically into shared metrics and range hits.
 
 mod auto;
 mod buffer;
@@ -22,6 +24,7 @@ mod maintain;
 mod merge;
 mod mixed;
 mod scan;
+mod split;
 pub mod stats;
 mod view;
 mod writer;
@@ -144,8 +147,9 @@ pub struct RangeCacheTuning {
     /// Chunk bytes threshold at which a write buffer allocates a Bloom filter. `usize::MAX`
     /// disables buffer filters.
     pub buffer_filter_bytes: usize,
-    /// Target size for splitting large `cache_range` requests at sorted-run block boundaries. `0`
-    /// disables splitting.
+    /// Target size per cached range. `cache_range` cuts larger requests at sorted-run block
+    /// boundaries, and bases exceeding twice this size split without copying on attach or after
+    /// major merges. `0` disables splitting.
     pub range_target_bytes: u64,
     /// Heap metadata budget for fence indexes, filters, delta views, and layer sets. `None` uses
     /// `max(max_disk_bytes / 16, 64 MiB)`.
@@ -264,6 +268,9 @@ impl RangeCacheTuning {
 }
 
 /// Snapshot of one cached range's state. See [`Db::cached_ranges`].
+///
+/// Ranges created by a split share base files, runs, and sealed write buffers. Base and run sizes
+/// report only this range's pages; buffer memory counts shared sealed buffers whole until flushed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CachedRangeInfo {
@@ -273,11 +280,12 @@ pub struct CachedRangeInfo {
     pub end: Option<Bytes>,
     /// True while the initial load is still in progress.
     pub loading: bool,
-    /// True while sealed buffers await flush or a major merge is due or running.
+    /// True while sealed buffers await flush or a major merge or split is due or running.
+    /// Deferred unpaid automatic merges do not count until the range reaches its run limit.
     pub rebuilding: bool,
-    /// Size of the base chunk files on disk in bytes.
+    /// Size of the range's base chunk pages on disk in bytes.
     pub file_bytes: u64,
-    /// Number of rows across the base chunk files.
+    /// Row count across base chunks (estimated by page bytes when sharing a split base file).
     pub file_rows: u64,
     /// Number of base chunks (`0` while loading, `1` after).
     pub chunks: usize,
@@ -287,25 +295,21 @@ pub struct CachedRangeInfo {
     pub automatic: bool,
     /// Number of run files above the base.
     pub runs: usize,
-    /// Total size of run files on disk in bytes.
+    /// Disk bytes of the range's pages across its run files.
     pub run_bytes: u64,
     /// Number of sealed write buffers awaiting flush.
     pub sealed_buffers: usize,
-    /// Exact heap memory of active and sealed write buffers in bytes.
+    /// Heap memory of active and sealed write buffers in bytes, counting shared buffers whole.
     pub buffer_bytes: u64,
-    /// The bytes of the run files that flushes of the range installed since its registration,
-    /// flushes at the run cap included.
+    /// Run bytes flushed since registration or split, including run-cap flush merges.
     pub flushed_bytes: u64,
-    /// The bytes of the base files that major merges of the range installed since its
-    /// registration.
+    /// Base bytes written by major merges since registration or split.
     pub major_merge_bytes: u64,
-    /// The major merges of the range that installed since its registration.
+    /// Major merges installed since registration or split.
     pub major_merges: u64,
-    /// The point reads that the range served, as of the last fold of each reading thread (see
-    /// [`RangeCacheTuning::stats_fold_events`]).
+    /// Point reads served since registration or split, as of the last thread fold.
     pub gets: u64,
-    /// The scans that started in the range and that the cache served, completely or in part, as
-    /// of the last fold of each reading thread. A scan over several ranges counts in the first.
+    /// Scans starting in this range served since registration or split, as of the last fold.
     pub scans: u64,
 }
 
@@ -415,7 +419,7 @@ impl ChunkList {
         self.chunks.get(self.index_of(key))
     }
 
-    #[cfg(test)]
+    /// Creates a chunk list where chunk `i + 1` starts at `starts[i]`.
     fn new(chunks: Vec<Chunk>, starts: Vec<Bytes>) -> Self {
         assert_eq!(
             chunks.len(),
@@ -580,11 +584,28 @@ impl Layers {
         self.chunks.span(i, None, self.end.as_ref())
     }
 
-    /// Total base file bytes and rows across all chunks.
-    fn base_size(&self) -> (u64, u64) {
-        self.chunks.iter().fold((0, 0), |(bytes, rows), c| {
-            (bytes + c.file.file_len(), rows + c.file.rows())
-        })
+    /// Base bytes and estimated rows within this range's key span (exact unless sharing a split
+    /// base file).
+    fn base_share(&self, start: &Bytes) -> (u64, u64) {
+        split::base_share(&self.chunks, start, self.end.as_ref())
+    }
+
+    /// Run file bytes within this range's key span. Searches the fence index only for runs shared
+    /// across a split.
+    fn run_share(&self, start: &[u8]) -> u64 {
+        self.runs
+            .iter()
+            .map(|run| {
+                let within = run.file.rows() == 0
+                    || (run.min_key.as_ref() >= start
+                        && self.end.as_ref().is_none_or(|end| run.max_key < end));
+                if within {
+                    run.file_bytes()
+                } else {
+                    run.file.span_share(Some(start), self.end.as_deref()).0
+                }
+            })
+            .sum()
     }
 
     #[cfg(test)]
@@ -595,7 +616,7 @@ impl Layers {
         }
     }
 
-    /// Validates layer invariants in debug builds.
+    /// Validates layer invariants in debug builds within the range's key span.
     fn check(&self, start: &[u8], max_runs: usize) {
         if !cfg!(debug_assertions) {
             return;
@@ -678,7 +699,8 @@ impl Layers {
                 self.runs.iter().all(|r| view.holds(r)),
                 "the view holds other runs"
             );
-            // I12: the view lists each run's versions in the chunks that have not absorbed it.
+            // I12: the view lists each run's versions in the range's keys, in the chunks that have
+            // not absorbed it.
             let rows: u64 = self
                 .runs
                 .iter()
@@ -687,7 +709,7 @@ impl Layers {
             assert_eq!(
                 view.len() as u64,
                 rows,
-                "the view does not list the runs' rows that no chunk absorbed"
+                "the view does not list the runs' rows in the range that no chunk absorbed"
             );
         }
         let mut lo = self.covered_to;
@@ -702,12 +724,29 @@ impl Layers {
         );
     }
 
-    /// The rows of `run` in the chunks that have not absorbed it, in a range that starts at
-    /// `start`: all of them unless a chunk has. Counts the rows by key for a run that some chunks
-    /// have absorbed, for [`Layers::check`].
+    /// The rows of `run` in the keys of the chunks that have not absorbed it, in a range that
+    /// starts at `start`: all of them unless a chunk has, or the run holds keys outside the range
+    /// (a run that a split shares). Counts the rows by key in those cases, for [`Layers::check`].
     fn unabsorbed_rows(&self, run: &Run, start: &[u8]) -> u64 {
-        if !self.chunks.iter().any(|c| c.absorbed(run)) {
+        let within = run.file.rows() == 0
+            || (run.min_key.as_ref() >= start
+                && self.end.as_ref().is_none_or(|end| run.max_key < end));
+        if within && !self.chunks.iter().any(|c| c.absorbed(run)) {
             return run.file.rows();
+        }
+        if self.chunks.loading() {
+            // A loading range's runs: within its keys.
+            let span = BytesRange::new(
+                Included(Bytes::copy_from_slice(start)),
+                self.end.clone().map_or(Unbounded, Excluded),
+            );
+            let mut cursor = RangeFileCursor::new(&run.file, &span).expect("a run cursor");
+            let mut rows = 0;
+            while cursor.key().is_some() {
+                rows += 1;
+                cursor.skip(&run.file).expect("a run cursor");
+            }
+            return rows;
         }
         let start = Bytes::copy_from_slice(start);
         let mut rows = 0;
@@ -740,6 +779,13 @@ pub(crate) enum Origin {
     },
 }
 
+/// Parent heat share inherited by a split child (by base bytes). See [`CachedRange::split_from`].
+struct Inherited {
+    share: f64,
+    rate: f64,
+    now_ms: i64,
+}
+
 /// Folded read count, access timestamp, and decayed read rate of a cached range.
 struct Heat {
     hits: Arc<RangeHits>,
@@ -762,6 +808,26 @@ impl Heat {
                 rate,
             }),
         }
+    }
+
+    /// The heat of a range that a split cut from this one: the read rate `rate` (its share of
+    /// this range's), this range's last access, and no reads yet. No lock: the writer calls it.
+    fn split(&self, rate: f64, now_ms: i64) -> Self {
+        let hits = RangeHits::default();
+        hits.set_last_access(self.hits.last_access());
+        Self {
+            hits: Arc::new(hits),
+            rate: Mutex::new(HeatRate {
+                reads: 0,
+                at_ms: now_ms,
+                rate,
+            }),
+        }
+    }
+
+    /// The decayed read rate as of the last time anyone computed it.
+    fn last_rate(&self) -> f64 {
+        self.rate.lock().rate
     }
 
     fn reads(&self) -> u64 {
@@ -797,7 +863,9 @@ struct CachedRange {
     heat: Heat,
     /// Estimated normal-path cost per read in nanoseconds (`0` for explicit ranges).
     read_cost_ns: u64,
-    /// Read count when the current base was built, for major-merge payback checks.
+    /// Share of parent base reads inherited on split for major-merge payback checks.
+    reads_carried: u64,
+    /// `heat.reads + reads_carried` when the current base was built, for payback checks.
     reads_at_build: AtomicU64,
     /// Sequence number of the last batch that wrote to this range.
     last_write_seq: Padded<AtomicU64>,
@@ -829,10 +897,60 @@ impl CachedRange {
             auto,
             heat: Heat::new(rate, now_ms),
             read_cost_ns,
+            reads_carried: 0,
             reads_at_build: AtomicU64::new(0),
             last_write_seq: Padded(AtomicU64::new(0)),
             jobs: maintain::RangeJobs::default(),
         }
+    }
+
+    /// A range from `start` to `end` with `layers` that a split cut from `parent` and that holds
+    /// `share` of its base: it keeps the parent's origin, read cost, last write and last access, a
+    /// read rate of `rate`, `share` times the parent's rate (see [`Heat::split`]), `share` of the
+    /// reads that the parent's base served since it was written (see
+    /// [`CachedRange::reads_since_build`]), and its jobs' headroom. Its counts of reads, flushes
+    /// and merges start at zero.
+    fn split_from(
+        parent: &CachedRange,
+        start: Bytes,
+        end: Option<Bytes>,
+        layers: Layers,
+        inherited: Inherited,
+        slot: u32,
+    ) -> Self {
+        let reads_carried = (parent.reads_since_build() as f64 * inherited.share).round() as u64;
+        Self {
+            start,
+            end,
+            layers: ArcSwap::from_pointee(layers),
+            slot,
+            auto: parent.auto,
+            heat: parent
+                .heat
+                .split(inherited.rate * inherited.share, inherited.now_ms),
+            read_cost_ns: parent.read_cost_ns,
+            reads_carried,
+            reads_at_build: AtomicU64::new(0),
+            last_write_seq: Padded(AtomicU64::new(
+                parent.last_write_seq.0.load(Ordering::Acquire),
+            )),
+            jobs: maintain::RangeJobs::inherit(&parent.jobs),
+        }
+    }
+
+    /// The reads that the range's base served since it was written: since its load or its last
+    /// major merge, or for a range that a split made before its first major merge, since the split
+    /// with its share of the parent's (`reads_carried`). Exact as of the last fold of each reading
+    /// thread.
+    fn reads_since_build(&self) -> u64 {
+        (self.heat.reads() + self.reads_carried)
+            .saturating_sub(self.reads_at_build.load(Ordering::Relaxed))
+    }
+
+    /// Notes that a new base is being written now, for [`CachedRange::reads_since_build`].
+    fn mark_build(&self) {
+        self.reads_at_build
+            .store(self.heat.reads() + self.reads_carried, Ordering::Relaxed);
     }
 
     fn contains(&self, key: &[u8]) -> bool {
@@ -856,23 +974,31 @@ impl CachedRange {
         BytesRange::new(Included(self.start.clone()), end)
     }
 
-    fn info(&self, tuning: &RangeCacheTuning) -> CachedRangeInfo {
+    fn info(&self, cache: &RangeCache) -> CachedRangeInfo {
+        let tuning = &cache.options.tuning;
         let layers = self.layers.load();
-        let (file_bytes, file_rows) = layers.base_size();
+        let (file_bytes, file_rows) = layers.base_share(&self.start);
+        // An unpaid due merge on an automatic range waits until reads justify it or it hits the
+        // run limit.
+        let merge_due = maintain::major_due(self, &layers, tuning).is_some_and(|trigger| {
+            cache.rebuild_pays(self, file_bytes) || maintain::at_run_limit(self, &layers, trigger)
+        });
         CachedRangeInfo {
             start: self.start.clone(),
             end: self.end.clone(),
             loading: layers.chunks.loading(),
             rebuilding: !layers.sealed.is_empty()
                 || self.jobs.merging()
-                || maintain::major_due(self, &layers, tuning).is_some(),
+                || self.jobs.splitting()
+                || merge_due
+                || maintain::split_cuts(self, &layers, tuning).is_some(),
             file_bytes,
             file_rows,
             chunks: layers.chunks.len(),
             delta_bytes: self.delta_bytes(&layers),
             automatic: self.auto,
             runs: layers.runs.len(),
-            run_bytes: layers.runs.iter().map(|r| r.file_bytes()).sum(),
+            run_bytes: layers.run_share(&self.start),
             sealed_buffers: layers.sealed.len(),
             buffer_bytes: layers.buffers().map(|b| b.memory_bytes()).sum(),
             flushed_bytes: self.jobs.flushed_bytes(),
@@ -893,40 +1019,79 @@ impl CachedRange {
         self.layers.load().buffers().map(|b| b.memory_bytes()).sum()
     }
 
-    /// The bytes of the range's base and runs, which count against the disk budget.
+    /// The bytes of the range's share of its base and of its runs (see [`Layers::base_share`] and
+    /// [`Layers::run_share`]), which read densities divide by. The disk budget counts each file
+    /// once instead (see [`Footprint`]).
     fn file_bytes(&self) -> u64 {
         let layers = self.layers.load();
-        layers.base_size().0 + layers.runs.iter().map(|r| r.file_bytes()).sum::<u64>()
+        layers.base_share(&self.start).0 + layers.run_share(&self.start)
     }
 
-    /// The heap metadata of the range's files: the fence indexes and filters of its base's chunks
-    /// and its runs.
-    fn files_meta_bytes(&self) -> u64 {
+    /// The heap metadata of the range, its files' and view's included, each counted whole: what
+    /// it adds to the metadata budget when it shares nothing (see [`Footprint`]).
+    #[cfg(test)]
+    fn meta_bytes(&self) -> u64 {
         let layers = self.layers.load();
-        layers
+        let files = layers
             .chunks
             .iter()
             .map(|c| c.file.meta_bytes())
-            .sum::<u64>()
-            + layers.runs.iter().map(|r| r.file.meta_bytes()).sum::<u64>()
+            .chain(layers.runs.iter().map(|r| r.file.meta_bytes()))
+            .sum::<u64>();
+        files + Self::handle_bytes(&layers) + layers.view.as_ref().map_or(0, |v| v.bytes())
     }
 
-    /// The heap metadata of the range, which counts against the metadata budget: the fence
-    /// indexes and filters of its base and runs, and its layer set with its run and chunk handles.
-    fn meta_bytes(&self) -> u64 {
-        let files = self.files_meta_bytes();
-        let layers = self.layers.load();
-        let handles = size_of::<CachedRange>()
+    /// The heap bytes of the range's own metadata: its `CachedRange`, its layer set, and its run
+    /// and chunk handles, not the files and views that they point to.
+    fn handle_bytes(layers: &Layers) -> u64 {
+        (size_of::<CachedRange>()
             + size_of::<Layers>()
             + (layers.sealed.capacity() + layers.runs.capacity()) * size_of::<usize>()
             + layers.runs.len() * size_of::<Run>()
-            + layers.chunks.handle_bytes();
-        files + handles as u64 + self.view_bytes()
+            + layers.chunks.handle_bytes()) as u64
     }
+}
 
-    /// The heap bytes of the range's delta view, which are part of its metadata.
-    fn view_bytes(&self) -> u64 {
-        self.layers.load().view.as_ref().map_or(0, |v| v.bytes())
+/// Disk and heap metadata footprint across a set of ranges, counting shared files and views once.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Footprint {
+    /// The bytes of the base files and run files.
+    disk: u64,
+    /// Of `disk`, the bytes of the base files.
+    base_disk: u64,
+    /// The fence indexes and filters of those files, the views, and each range's own handles.
+    meta: u64,
+}
+
+impl Footprint {
+    fn of<'a>(ranges: impl Iterator<Item = &'a Arc<CachedRange>>) -> Self {
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut once = |ptr: usize| seen.insert(ptr);
+        let mut total = Footprint::default();
+        for range in ranges {
+            let layers = range.layers.load();
+            let files = layers
+                .chunks
+                .iter()
+                .map(|c| (&c.file, true))
+                .chain(layers.runs.iter().map(|r| (&r.file, false)));
+            for (file, base) in files {
+                if once(Arc::as_ptr(file).addr()) {
+                    total.disk += file.file_len();
+                    total.meta += file.meta_bytes();
+                    if base {
+                        total.base_disk += file.file_len();
+                    }
+                }
+            }
+            if let Some(view) = &layers.view {
+                if once(Arc::as_ptr(view).addr()) {
+                    total.meta += view.bytes();
+                }
+            }
+            total.meta += CachedRange::handle_bytes(&layers);
+        }
+        total
     }
 }
 
@@ -1153,7 +1318,8 @@ impl RangeCache {
         self.clock.now().timestamp_millis()
     }
 
-    /// Returns true if reads served since the current base was built justify rewriting `file_bytes`.
+    /// Returns true if reads served since the current base was built (including a split child's
+    /// inherited share) justify rewriting `file_bytes`.
     fn rebuild_pays(&self, range: &CachedRange, file_bytes: u64) -> bool {
         let Some(auto) = &self.auto else {
             return true;
@@ -1161,10 +1327,7 @@ impl RangeCache {
         if !range.auto || file_bytes < 4 * self.options.tuning.min_rebuild_delta_bytes as u64 {
             return true;
         }
-        let reads = range
-            .heat
-            .reads()
-            .saturating_sub(range.reads_at_build.load(Ordering::Relaxed));
+        let reads = range.reads_since_build();
         let saved_ns = reads as f64 * range.read_cost_ns as f64;
         let cost_ns = file_bytes as f64 * auto.options.rebuild_cost_ns_per_byte;
         saved_ns >= cost_ns
@@ -1190,9 +1353,10 @@ impl RangeCache {
             .is_some_and(|r| Arc::ptr_eq(r, range))
     }
 
-    /// Returns eviction candidates when budgets are exceeded. Evicts automatic ranges by lowest
-    /// read density first when automatic promotion is on, then explicit ranges in LRU order.
-    fn eviction_order(&self, skip: Option<&Arc<CachedRange>>) -> Vec<Arc<CachedRange>> {
+    /// Returns eviction candidates when budgets are exceeded, excluding `skip`. Evicts automatic
+    /// ranges by lowest read density first when automatic promotion is on, then explicit ranges
+    /// in LRU order.
+    fn eviction_order(&self, skip: &[Arc<CachedRange>]) -> Vec<Arc<CachedRange>> {
         if self.within_budgets() {
             return Vec::new();
         }
@@ -1202,7 +1366,7 @@ impl RangeCache {
             .load()
             .values()
             .filter(|r| !r.layers.load().chunks.loading())
-            .filter(|r| skip.is_none_or(|skip| !Arc::ptr_eq(skip, r)))
+            .filter(|r| !skip.iter().any(|skip| Arc::ptr_eq(skip, r)))
             .cloned()
             .collect::<Vec<_>>();
         match &self.auto {
@@ -1248,23 +1412,35 @@ impl RangeCache {
             / range.file_bytes().max(1) as f64
     }
 
+    /// Sets the gauges. After a split, `delta_bytes` counts a buffer that ranges share once,
+    /// `file_bytes`, `meta_bytes` and `view_bytes` count each object that anything holds once (they
+    /// follow allocations), and `range_count` counts each range of the split.
     fn update_gauges(&self) {
         let index = self.index.load();
         self.stats.ranges.set(index.len() as i64);
-        let delta_bytes: u64 = index
-            .values()
-            .map(|r| r.delta_bytes(&r.layers.load()))
-            .sum();
+        // A sealed buffer that a split shares counts once. Only buffers, which few layer sets or
+        // jobs share: the writer calls this.
+        let mut shared: Vec<usize> = Vec::new();
+        let mut delta_bytes = 0u64;
+        for range in index.values() {
+            for buffer in range.layers.load().buffers() {
+                if Arc::strong_count(buffer) > 1 {
+                    let ptr = Arc::as_ptr(buffer).addr();
+                    if shared.contains(&ptr) {
+                        continue;
+                    }
+                    shared.push(ptr);
+                }
+                delta_bytes += buffer.size() as u64;
+            }
+        }
         self.stats.delta_bytes.set(delta_bytes as i64);
         self.delta_memory.publish();
         self.stats.file_bytes.set(self.files.disk() as i64);
         // Files and views count while anything holds them; layer sets while they are indexed.
         let layers: u64 = index
             .values()
-            .map(|r| {
-                r.meta_bytes()
-                    .saturating_sub(r.files_meta_bytes() + r.view_bytes())
-            })
+            .map(|r| CachedRange::handle_bytes(&r.layers.load()))
             .sum();
         let views = self.views.bytes();
         self.stats.view_bytes.set(views as i64);
@@ -1273,16 +1449,24 @@ impl RangeCache {
             .set((self.files.meta() + views + layers) as i64);
     }
 
+    /// Sets the gauges of the base files and run files of the indexed ranges, each file once (see
+    /// [`Footprint`]). It walks every file of every range, so only the maintenance task calls it,
+    /// about once a second.
+    fn update_file_gauges(&self) {
+        let indexed = Footprint::of(self.index.load().values());
+        self.stats.base_file_bytes.set(indexed.base_disk as i64);
+        self.stats
+            .run_file_bytes
+            .set((indexed.disk - indexed.base_disk) as i64);
+    }
+
     /// Returns true if the cached ranges fit the disk budget and the metadata budget. Only
-    /// indexed ranges count: files that only a reader holds go when the reader drops them.
+    /// indexed ranges count: files that only a reader holds go when the reader drops them. A file,
+    /// run or view that ranges share after a split counts once.
     fn within_budgets(&self) -> bool {
-        let index = self.index.load();
-        let disk: u64 = index.values().map(|r| r.file_bytes()).sum();
-        if disk > self.options.max_disk_bytes {
-            return false;
-        }
-        let meta: u64 = index.values().map(|r| r.meta_bytes()).sum();
-        meta <= self.options.tuning.meta_limit(self.options.max_disk_bytes)
+        let indexed = Footprint::of(self.index.load().values());
+        indexed.disk <= self.options.max_disk_bytes
+            && indexed.meta <= self.options.tuning.meta_limit(self.options.max_disk_bytes)
     }
 
     /// Checks whether a read at `seq` can use `layers` when the chunks that it needs hold the
@@ -1572,8 +1756,7 @@ impl RangeCache {
     }
 
     pub(crate) fn ranges(&self) -> Vec<CachedRangeInfo> {
-        let tuning = &self.options.tuning;
-        self.index.load().values().map(|r| r.info(tuning)).collect()
+        self.index.load().values().map(|r| r.info(self)).collect()
     }
 
     pub(crate) fn buffer_memory(&self) -> u64 {
@@ -1631,8 +1814,9 @@ impl RangeCache {
         (below, above)
     }
 
+    /// Total disk bytes of cached range files, counting shared files once.
     fn attached_bytes(&self) -> u64 {
-        self.index.load().values().map(|r| r.file_bytes()).sum()
+        Footprint::of(self.index.load().values()).disk
     }
 
     /// Returns the highest read density among automatic ranges evicted to free `need` bytes,
@@ -1698,11 +1882,46 @@ impl RangeCache {
         )?);
         debug_assert_eq!(rows, file.rows());
 
-        if self.attach_base(range, file, file_seq).await {
-            // Keep a newly admitted automatic range while evicting displaced ranges.
-            self.evict(range.auto.then_some(range)).await;
+        let split = self.attach_split(range, &file, file_seq).await?;
+        fail_point!(Arc::clone(&self.fp_registry), "range-cache-attach");
+        let attached = self.attach_base(range, file, file_seq, split).await;
+        if !attached.is_empty() {
+            // Keep newly admitted automatic range(s) while evicting displaced ranges.
+            let skip = if range.auto { attached } else { Vec::new() };
+            self.evict(&skip).await;
         }
         Ok(())
+    }
+
+    /// Plans a zero-copy attach split if the loaded base exceeds twice `range_target_bytes`.
+    async fn attach_split(
+        &self,
+        range: &Arc<CachedRange>,
+        file: &Arc<RangeFile>,
+        base_seq: u64,
+    ) -> Result<Option<split::SplitPlan>, SlateDBError> {
+        let target = self.options.tuning.range_target_bytes;
+        if target == 0 {
+            return Ok(None);
+        }
+        let chunks = one_chunk(file.clone(), base_seq);
+        let (bytes, _) = split::base_share(&chunks, &range.start, range.end.as_ref());
+        if bytes <= target.saturating_mul(2) {
+            return Ok(None);
+        }
+        let pieces = split::attach_pieces(bytes, target);
+        let cuts = split::cut_keys(&chunks, &range.start, range.end.as_ref(), pieces);
+        if cuts.is_empty() {
+            return Ok(None);
+        }
+        let layers = range.layers.load_full();
+        let (start, end) = (range.start.clone(), range.end.clone());
+        let rate = range.heat.last_rate();
+        let plan = maintain::off_workers(move || {
+            Ok(split::plan(&layers, &chunks, &start, end.as_ref(), &cuts)?)
+        })
+        .await?;
+        Ok(plan.map(|plan| split::SplitPlan { rate, ..plan }))
     }
 }
 

@@ -4,11 +4,14 @@
 //! - **Flush**: writes all sealed buffers of a range into one run file, builds the updated delta
 //!   view incrementally, and sends `InstallRun`. When a range holds `max_runs`, the flush merges
 //!   up to [`FLUSH_MERGE_RUNS`] newest free runs into the new run so flushes never block on a
-//!   major merge.
+//!   major merge. Flushes only write keys belonging to the range.
 //! - **Major merge**: merges each chunk of a range's base with the oldest unabsorbed runs (at most
 //!   `max_runs - 1`, none held by an in-flight flush) into a single new chunk when run bytes reach
 //!   `min_rebuild_delta_bytes` and either `major_merge_factor * base` or `max_runs - headroom`
-//!   runs. Adaptive headroom tracks flushes that land while a merge runs.
+//!   runs. Adaptive headroom tracks flushes that land while a merge runs. Unpaid automatic merges
+//!   defer until reads pay for them or the range reaches its run limit.
+//! - **Split**: divides a range whose base exceeds `2 * range_target_bytes` in two without copying
+//!   when no flush or major merge runs for it. Splits take priority over major merges.
 //! - **View races**: flushes and major merges run concurrently on blocking threads. If one
 //!   changes the view before the other installs, the second rebuilds its view on the new state
 //!   (up to [`VIEW_ATTEMPTS`] times) without rewriting its file.
@@ -30,13 +33,15 @@ use tokio::task::JoinHandle;
 
 use super::delta::Delta;
 use super::file::{RangeFile, RangeFileIterator, RangeFileWriter, RowLocators};
-use super::merge::merge_versions;
+use super::merge::merge_versions_in;
+use super::split;
 use super::stats::RemoveReason;
 use super::writer::{same_view, Target, ViewSwap};
 use super::{
     CachedRange, Chunks, DeltaView, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run,
     MAX_RUNS_RANGE,
 };
+use crate::bytes_range::BytesRange;
 use crate::db::DbInner;
 use crate::db_iter::DbIterator;
 use crate::dispatcher::{MessageHandler, MessageTickerDef};
@@ -54,6 +59,11 @@ const TICK: Duration = Duration::from_millis(20);
 const MAX_FLUSHES: usize = 2;
 /// The most major merges in flight.
 const MAX_MERGES: usize = 2;
+/// The most splits in flight. A split builds views and writes no file.
+const MAX_SPLITS: usize = 2;
+/// The ticks between two updates of the gauges of base and run files, which walk every file:
+/// about a second.
+const FILE_GAUGE_TICKS: u64 = 50;
 /// The most early seals that one pass asks for.
 const PRESSURE_SEALS: usize = 4;
 /// Max newest runs merged into a flush when the range is already at `max_runs`.
@@ -97,6 +107,8 @@ pub(super) struct MaintenanceQueue {
     flushes: AtomicUsize,
     /// The major merges in flight.
     merges: AtomicUsize,
+    /// The splits in flight.
+    splits: AtomicUsize,
 }
 
 impl MaintenanceQueue {
@@ -107,6 +119,7 @@ impl MaintenanceQueue {
             rx,
             flushes: AtomicUsize::new(0),
             merges: AtomicUsize::new(0),
+            splits: AtomicUsize::new(0),
         }
     }
 
@@ -126,6 +139,8 @@ impl MaintenanceQueue {
 pub(super) struct RangeJobs {
     flushing: AtomicBool,
     merging: AtomicBool,
+    /// True while a split of the range runs. No flush or major merge starts meanwhile.
+    splitting: AtomicBool,
     /// True while a message about the range is on its way to the task.
     notified: AtomicBool,
     /// True while the range waits in the task's flush queue, or in its merge queue. Only the task
@@ -156,13 +171,28 @@ pub(super) struct RangeJobs {
 }
 
 impl RangeJobs {
+    /// The jobs of a range that a split cut from a range with `parent`: none in flight, no counts,
+    /// and the parent's headroom.
+    pub(super) fn inherit(parent: &RangeJobs) -> Self {
+        let jobs = Self::default();
+        jobs.headroom
+            .store(parent.headroom.load(Ordering::Relaxed), Ordering::Relaxed);
+        jobs
+    }
+
     /// True while a major merge of the range runs.
     pub(super) fn merging(&self) -> bool {
         self.merging.load(Ordering::Acquire)
     }
 
-    fn flushing(&self) -> bool {
+    /// True while a flush of the range runs.
+    pub(super) fn flushing(&self) -> bool {
         self.flushing.load(Ordering::Acquire)
+    }
+
+    /// True while a split of the range runs.
+    pub(super) fn splitting(&self) -> bool {
+        self.splitting.load(Ordering::Acquire)
     }
 
     /// The newest runs that the flush in flight replaces, which a major merge must leave alone.
@@ -241,7 +271,7 @@ impl RangeJobs {
 }
 
 /// Runs file I/O or view builds on a blocking thread to keep async read workers free.
-async fn off_workers<T: Send + 'static>(
+pub(super) async fn off_workers<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, SlateDBError> + Send + 'static,
 ) -> Result<T, SlateDBError> {
     #[allow(clippy::disallowed_methods)]
@@ -278,9 +308,8 @@ pub(super) fn major_threshold(base_bytes: u64, tuning: &RangeCacheTuning) -> u64
         .max(tuning.min_rebuild_delta_bytes as u64)
 }
 
-/// Whether `layers`, the layers of `range`, call for a major merge, and why. One needs a base and
-/// at least `min_rebuild_delta_bytes` of runs; then the bytes trigger or the count trigger starts
-/// it (see the module documentation).
+/// Returns whether `layers` call for a major merge, and why. Uses the range's own share of shared
+/// base and run files so splitting does not trigger merges early.
 pub(super) fn major_due(
     range: &CachedRange,
     layers: &Layers,
@@ -290,14 +319,37 @@ pub(super) fn major_due(
         return None;
     }
     let runs = layers.runs.len();
-    let run_bytes: u64 = layers.runs.iter().map(|r| r.file_bytes()).sum();
+    let run_bytes = layers.run_share(&range.start);
     if runs == 0 || run_bytes < tuning.min_rebuild_delta_bytes as u64 {
         return None;
     }
-    if run_bytes >= major_threshold(layers.base_size().0, tuning) {
+    if run_bytes >= major_threshold(layers.base_share(&range.start).0, tuning) {
         return Some(Trigger::Bytes);
     }
     (runs + range.jobs.headroom(tuning.max_runs) >= tuning.max_runs).then_some(Trigger::Runs)
+}
+
+/// Returns true when a range's delta reaches its run limit (count trigger or runs as large as its
+/// base). Unpaid automatic ranges are evicted at this point.
+pub(super) fn at_run_limit(range: &CachedRange, layers: &Layers, trigger: Trigger) -> bool {
+    trigger == Trigger::Runs || layers.run_share(&range.start) >= layers.base_share(&range.start).0
+}
+
+/// Returns cut keys to split `range` in two when its base exceeds `2 * range_target_bytes`.
+pub(super) fn split_cuts(
+    range: &CachedRange,
+    layers: &Layers,
+    tuning: &RangeCacheTuning,
+) -> Option<Vec<Bytes>> {
+    let target = tuning.range_target_bytes;
+    if target == 0 || layers.chunks.loading() {
+        return None;
+    }
+    if layers.base_share(&range.start).0 <= target.saturating_mul(2) {
+        return None;
+    }
+    let cuts = split::cut_keys(&layers.chunks, &range.start, range.end.as_ref(), 2);
+    (!cuts.is_empty()).then_some(cuts)
 }
 
 /// First newest-first run index a major merge may absorb, leaving `flush_held` runs and at least
@@ -320,17 +372,18 @@ pub(super) fn flush_replaces(runs: usize, free: usize, max_runs: usize) -> Optio
     }
 }
 
-/// Returns the oldest runs (newest-first indices) to absorb in a major merge, if one is due.
+/// Returns the oldest runs (newest-first indices) to absorb and the trigger, if a major merge is
+/// due.
 pub(super) fn plan_major(
     range: &CachedRange,
     layers: &Layers,
     tuning: &RangeCacheTuning,
     flush_held: usize,
-) -> Option<Range<usize>> {
-    major_due(range, layers, tuning)?;
+) -> Option<(Range<usize>, Trigger)> {
+    let trigger = major_due(range, layers, tuning)?;
     let runs = layers.runs.len();
     let first = mergeable_from(runs, flush_held, tuning.max_runs);
-    (first < runs).then_some(first..runs)
+    (first < runs).then_some((first..runs, trigger))
 }
 
 impl RangeCache {
@@ -354,7 +407,8 @@ impl RangeCache {
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-flush");
         let (run, rows) = {
             let (cache, buffers, replaces) = (self.clone(), buffers.clone(), replaces.clone());
-            off_workers(move || cache.write_run(&buffers, &replaces, lo, hi)).await?
+            let keys = range.bounds();
+            off_workers(move || cache.write_run(&buffers, &replaces, lo, hi, &keys)).await?
         };
         // Checkers keep the sealed buffers pinned by this job across many batches.
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-install-run");
@@ -362,7 +416,7 @@ impl RangeCache {
             .install_run_with_view(range, Arc::new(run), Arc::new(rows), buffers, replaces)
             .await?;
         if installed {
-            self.evict(None).await;
+            self.evict(&[]).await;
         }
         Ok(())
     }
@@ -427,15 +481,16 @@ impl RangeCache {
         Ok(false)
     }
 
-    /// Writes the versions of `buffers` (newest first, each up to its seal) and of `runs`
-    /// (newest first) to a run of `(lo, hi]`, and returns it with the keys and offsets of its
-    /// rows.
+    /// Writes versions in `keys` from `buffers` and `runs` (both newest first) to a run of
+    /// `(lo, hi]` and returns the run with its row locators. Restricting to `keys` drops versions
+    /// for sibling ranges from buffers and runs shared after a split.
     pub(super) fn write_run(
         &self,
         buffers: &[Arc<Delta>],
         runs: &[Arc<Run>],
         lo: u64,
         hi: u64,
+        keys: &BytesRange,
     ) -> Result<(Run, RowLocators), SlateDBError> {
         let mut writer = RangeFileWriter::create_run(
             &self.options.root_folder,
@@ -453,7 +508,7 @@ impl RangeCache {
                 && runs.iter().all(|r| r.lo >= lo && r.hi <= hi),
             "a merge input outside ({lo}, {hi}]"
         );
-        merge_versions(&mut writer, &sealed, &runs)?;
+        merge_versions_in(&mut writer, &sealed, &runs, keys)?;
         let (path, rows) = writer.finish_with_locators()?;
         let file = RangeFile::open(path, self.options.page_source, self.files.clone())?;
         Ok((Run::new(file, lo, hi)?, rows))
@@ -470,9 +525,7 @@ impl RangeCache {
         let Some(base_seq) = absorbed.first().map(|r| r.hi) else {
             return Ok(());
         };
-        range
-            .reads_at_build
-            .store(range.heat.reads(), Ordering::Relaxed);
+        range.mark_build();
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-rebuild");
         let new_base = {
             let (cache, absorbed, chunks) = (self.clone(), absorbed.clone(), chunks.clone());
@@ -489,7 +542,7 @@ impl RangeCache {
             .install_major_with_view(range, &chunks, absorbed, new_base, base_seq)
             .await?
         {
-            self.evict(None).await;
+            self.evict(&[]).await;
         }
         Ok(())
     }
@@ -543,6 +596,36 @@ impl RangeCache {
             }
         }
         Ok(false)
+    }
+
+    /// Plans a zero-copy split of `range` at `cuts` on a blocking thread and asks the writer to
+    /// install it. Runs only when no flush or major merge is active for `range`.
+    pub(super) async fn split(
+        self: &Arc<Self>,
+        range: &Arc<CachedRange>,
+        cuts: Vec<Bytes>,
+    ) -> Result<bool, SlateDBError> {
+        fail_point!(Arc::clone(&self.fp_registry), "range-cache-split");
+        let layers = range.layers.load_full();
+        let plan = {
+            let (start, end) = (range.start.clone(), range.end.clone());
+            off_workers(move || {
+                Ok(split::plan(
+                    &layers,
+                    &layers.chunks,
+                    &start,
+                    end.as_ref(),
+                    &cuts,
+                )?)
+            })
+            .await?
+        };
+        let Some(mut plan) = plan else {
+            return Ok(false);
+        };
+        plan.rate = range.heat.last_rate();
+        fail_point!(Arc::clone(&self.fp_registry), "range-cache-split-install");
+        Ok(self.install_split(range, plan).await)
     }
 
     /// Writes the state at `base_seq` of `chunks` and `runs` (newest first) into a new base file.
@@ -607,6 +690,8 @@ pub(crate) struct Maintainer {
     flush_queue: VecDeque<Weak<CachedRange>>,
     /// Ranges whose major merge waits for a merge slot.
     merge_queue: VecDeque<Weak<CachedRange>>,
+    /// The ticks handled, for the gauges that the task sets every [`FILE_GAUGE_TICKS`] ticks.
+    ticks: u64,
 }
 
 /// A job of the maintenance task, with the inputs that the task chose when it started it (see
@@ -625,6 +710,31 @@ enum Job {
         chunks: Chunks,
         absorbed: Vec<Arc<Run>>,
     },
+    /// Split the range at `cuts` (see [`split_cuts`]).
+    Split { cuts: Vec<Bytes> },
+}
+
+/// The kind of a job: which flag of its range and which count of jobs in flight it holds.
+#[derive(Clone, Copy)]
+enum JobKind {
+    Flush,
+    Major,
+    Split,
+}
+
+impl JobKind {
+    /// The range's flag of this kind of job, and the count of these jobs in flight.
+    fn slots<'a>(
+        self,
+        range: &'a CachedRange,
+        queue: &'a MaintenanceQueue,
+    ) -> (&'a AtomicBool, &'a AtomicUsize) {
+        match self {
+            JobKind::Flush => (&range.jobs.flushing, &queue.flushes),
+            JobKind::Major => (&range.jobs.merging, &queue.merges),
+            JobKind::Split => (&range.jobs.splitting, &queue.splits),
+        }
+    }
 }
 
 impl Job {
@@ -632,6 +742,7 @@ impl Job {
         match self {
             Job::Flush { .. } => "range_cache_flush",
             Job::Major { .. } => "range_cache_major_merge",
+            Job::Split { .. } => "range_cache_split",
         }
     }
 }
@@ -646,6 +757,7 @@ impl Maintainer {
             jobs: Vec::new(),
             flush_queue: VecDeque::new(),
             merge_queue: VecDeque::new(),
+            ticks: 0,
         }
     }
 
@@ -676,16 +788,44 @@ impl Maintainer {
                 // The file and metadata gauges change with every install; the writer updates
                 // them only when the index changes.
                 self.cache.update_gauges();
+                if self.ticks.is_multiple_of(FILE_GAUGE_TICKS) {
+                    self.cache.update_file_gauges();
+                }
+                self.ticks += 1;
             }
         }
         self.start_queued();
         self.seal_under_pressure(&index);
     }
 
-    /// Queues the jobs that `range`, an indexed range, calls for, unless they run or wait.
+    /// Queues the jobs that `range`, an indexed range, calls for, unless they run or wait. A split
+    /// that is due starts at once if no job runs for the range and a split slot is free, and goes
+    /// before a major merge, which would rewrite the whole range: until it is done, the range's
+    /// major merge waits (a tick looks again), and only a flush can start.
     fn look(&mut self, range: &Arc<CachedRange>) {
         let layers = range.layers.load();
         let jobs = &range.jobs;
+        if jobs.splitting() {
+            return;
+        }
+        let tuning = &self.cache.options.tuning;
+        if let Some(cuts) = split_cuts(range, &layers, tuning) {
+            if !jobs.flushing()
+                && !jobs.merging()
+                && self.cache.maintenance.splits.load(Ordering::Acquire) < MAX_SPLITS
+            {
+                drop(layers);
+                self.start(range, Job::Split { cuts });
+                return;
+            }
+            if !layers.sealed.is_empty()
+                && !jobs.flushing()
+                && !jobs.flush_queued.swap(true, Ordering::Relaxed)
+            {
+                self.flush_queue.push_back(Arc::downgrade(range));
+            }
+            return;
+        }
         if !layers.sealed.is_empty()
             && !jobs.flushing()
             && !jobs.flush_queued.swap(true, Ordering::Relaxed)
@@ -695,7 +835,6 @@ impl Maintainer {
         if jobs.merging() || jobs.merge_queued.load(Ordering::Relaxed) {
             return;
         }
-        let tuning = &self.cache.options.tuning;
         // A flush in flight may defer the merge: its end notifies the task.
         if plan_major(range, &layers, tuning, jobs.flush_held()).is_none() {
             return;
@@ -745,7 +884,9 @@ impl Maintainer {
                 continue;
             };
             range.jobs.flush_queued.store(false, Ordering::Relaxed);
-            if range.jobs.flushing() || !cache.is_indexed(&range) {
+            // A split in flight leaves the flush to the ranges that it makes, or to the look
+            // that its end makes if the writer rejects it.
+            if range.jobs.flushing() || range.jobs.splitting() || !cache.is_indexed(&range) {
                 continue;
             }
             if let Some(job) = self.plan_flush(&range) {
@@ -760,19 +901,29 @@ impl Maintainer {
                 continue;
             };
             range.jobs.merge_queued.store(false, Ordering::Relaxed);
-            if range.jobs.merging() || !cache.is_indexed(&range) {
+            if range.jobs.merging() || range.jobs.splitting() || !cache.is_indexed(&range) {
                 continue;
             }
             let layers = range.layers.load();
             let tuning = &cache.options.tuning;
-            let Some(runs) = plan_major(&range, &layers, tuning, range.jobs.flush_held()) else {
+            // A split that became due while the merge waited goes first.
+            if split_cuts(&range, &layers, tuning).is_some() {
+                continue;
+            }
+            let Some((runs, trigger)) =
+                plan_major(&range, &layers, tuning, range.jobs.flush_held())
+            else {
                 continue;
             };
             if layers.chunks.loading() {
                 continue;
             }
-            if !cache.rebuild_pays(&range, layers.base_size().0) {
-                cache.request_removal(Target::Range(range.clone()), RemoveReason::NotWorthIt);
+            if !cache.rebuild_pays(&range, layers.base_share(&range.start).0) {
+                // Defer unpaid automatic merges until reads justify them or the range hits its run
+                // limit, at which point it is evicted.
+                if at_run_limit(&range, &layers, trigger) {
+                    cache.request_removal(Target::Range(range.clone()), RemoveReason::NotWorthIt);
+                }
                 continue;
             }
             let job = Job::Major {
@@ -811,22 +962,19 @@ impl Maintainer {
     /// Starts `job` on `range` as its own task, after it notes what the job holds.
     fn start(&mut self, range: &Arc<CachedRange>, job: Job) {
         let jobs = &range.jobs;
-        let flush = match &job {
+        let kind = match &job {
             Job::Flush { replaces, .. } => {
                 jobs.flush_replaces.store(replaces.len(), Ordering::Relaxed);
-                true
+                JobKind::Flush
             }
             Job::Major { absorbed, .. } => {
                 jobs.merge_hi
                     .store(absorbed.first().map_or(0, |r| r.hi), Ordering::Relaxed);
-                false
+                JobKind::Major
             }
+            Job::Split { .. } => JobKind::Split,
         };
-        let (flag, running) = if flush {
-            (&jobs.flushing, &self.cache.maintenance.flushes)
-        } else {
-            (&jobs.merging, &self.cache.maintenance.merges)
-        };
+        let (flag, running) = kind.slots(range, &self.cache.maintenance);
         flag.store(true, Ordering::Release);
         running.fetch_add(1, Ordering::AcqRel);
         let (cache, range) = (self.cache.clone(), range.clone());
@@ -837,11 +985,7 @@ impl Maintainer {
             &self.cache.handle,
             move |result: &Result<(), SlateDBError>| {
                 // Runs after the job, also if it failed or panicked.
-                let (flag, running) = if flush {
-                    (&done_range.jobs.flushing, &done_cache.maintenance.flushes)
-                } else {
-                    (&done_range.jobs.merging, &done_cache.maintenance.merges)
-                };
+                let (flag, running) = kind.slots(&done_range, &done_cache.maintenance);
                 flag.store(false, Ordering::Release);
                 running.fetch_sub(1, Ordering::AcqRel);
                 if let Err(e) = result {
@@ -863,6 +1007,7 @@ impl Maintainer {
                     Job::Major { chunks, absorbed } => {
                         cache.major_merge(&range, chunks, absorbed).await
                     }
+                    Job::Split { cuts } => cache.split(&range, cuts).await.map(|_| ()),
                 }
             },
         );
@@ -1624,7 +1769,9 @@ mod tests {
         let (newer, oldest) = (layers.sealed[0].clone(), layers.sealed[1].clone());
         let seal = |b: &Arc<Delta>| b.sealed_at().load(Ordering::SeqCst);
         let run = |buffers: &[Arc<Delta>], lo: u64, hi: u64| {
-            let (run, rows) = cache.write_run(buffers, &[], lo, hi).unwrap();
+            let (run, rows) = cache
+                .write_run(buffers, &[], lo, hi, &BytesRange::unbounded())
+                .unwrap();
             (Arc::new(run), rows)
         };
         let both = vec![newer.clone(), oldest.clone()];

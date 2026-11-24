@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 
 use super::auto::Removal;
 use super::file::RangeFile;
+use super::split::{SplitChild, SplitPlan};
 use super::stats::RemoveReason;
 use super::{
     covering, one_chunk, uncovered, CachedRange, Chunks, Delta, DeltaView, Layers, Origin,
@@ -43,13 +44,14 @@ pub(super) enum Request {
         origin: Origin,
         reply: oneshot::Sender<Result<Registered, SlateDBError>>,
     },
-    /// Publish the base of a loading range, one chunk over the range that holds the state at
-    /// `base_seq`.
+    /// Publish the base of a loading range at `base_seq`, optionally splitting it into children
+    /// in the same store. The reply lists the resulting range(s), or is empty if removed meanwhile.
     AttachBase {
         range: Arc<CachedRange>,
         base: Arc<RangeFile>,
         base_seq: u64,
-        reply: oneshot::Sender<bool>,
+        split: Option<SplitPlan>,
+        reply: oneshot::Sender<Vec<Arc<CachedRange>>>,
     },
     /// Install `run`, which a flush wrote from `buffers`, the oldest sealed buffers of `range`
     /// (newest first), and from `replaces`, its newest runs (newest first, empty for a plain
@@ -73,6 +75,13 @@ pub(super) enum Request {
         base_seq: u64,
         /// The view without the absorbed runs, and the view it was built on.
         view: ViewSwap,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Replace `range` by the children of `plan`, sharing files, runs, and buffers if the range
+    /// still holds the planned base, runs, and view.
+    Split {
+        range: Arc<CachedRange>,
+        plan: SplitPlan,
         reply: oneshot::Sender<bool>,
     },
     /// Seal `buffer` if it is still the active buffer of `range` and holds a version.
@@ -103,9 +112,12 @@ impl Request {
             Request::Register { reply, .. } => {
                 let _ = reply.send(Err(SlateDBError::Closed));
             }
-            Request::AttachBase { reply, .. }
-            | Request::InstallRun { reply, .. }
-            | Request::InstallMajor { reply, .. } => {
+            Request::AttachBase { reply, .. } => {
+                let _ = reply.send(Vec::new());
+            }
+            Request::InstallRun { reply, .. }
+            | Request::InstallMajor { reply, .. }
+            | Request::Split { reply, .. } => {
                 let _ = reply.send(false);
             }
             Request::Seal { .. } => {}
@@ -295,19 +307,34 @@ impl RangeCache {
         answer.await.unwrap_or(Err(SlateDBError::Closed))
     }
 
-    /// Publishes the base of a loading range. Returns false if the range is no longer indexed
-    /// or no longer loading at `base_seq`: then the file is deleted when it drops.
+    /// Publishes the base of a loading range, split as `split` says if the range has not moved
+    /// on. Returns the ranges that hold it, or none if the range is no longer indexed or no longer
+    /// loading at `base_seq`: then the file is deleted when it drops.
     pub(super) async fn attach_base(
         &self,
         range: &Arc<CachedRange>,
         base: Arc<RangeFile>,
         base_seq: u64,
-    ) -> bool {
+        split: Option<SplitPlan>,
+    ) -> Vec<Arc<CachedRange>> {
         let (reply, answer) = oneshot::channel();
         self.submit(Request::AttachBase {
             range: range.clone(),
             base,
             base_seq,
+            split,
+            reply,
+        });
+        answer.await.unwrap_or_default()
+    }
+
+    /// Splits `range` as `plan` says. Returns false if the range moved on (see
+    /// [`RangeCache::split_request_at`]).
+    pub(super) async fn install_split(&self, range: &Arc<CachedRange>, plan: SplitPlan) -> bool {
+        let (reply, answer) = oneshot::channel();
+        self.submit(Request::Split {
+            range: range.clone(),
+            plan,
             reply,
         });
         answer.await.unwrap_or(false)
@@ -390,8 +417,8 @@ impl RangeCache {
         let _ = answer.await;
     }
 
-    /// Evicts ranges in LRU order off the writer until disk and metadata budgets hold.
-    pub(super) async fn evict(&self, skip: Option<&Arc<CachedRange>>) {
+    /// Evicts ranges off the writer until disk and metadata budgets hold, skipping `skip`.
+    pub(super) async fn evict(&self, skip: &[Arc<CachedRange>]) {
         let victims = self.eviction_order(skip);
         if victims.is_empty() {
             return;
@@ -621,9 +648,13 @@ impl RangeCache {
                 range,
                 base,
                 base_seq,
+                split,
                 reply,
             } => {
-                let _ = reply.send(self.attach_at(&range, base, base_seq));
+                let _ = reply.send(self.attach_at(&range, base, base_seq, split, w));
+            }
+            Request::Split { range, plan, reply } => {
+                let _ = reply.send(self.split_request_at(&range, plan, w));
             }
             Request::InstallRun {
                 range,
@@ -726,19 +757,45 @@ impl RangeCache {
         Registered { seq: w, ranges }
     }
 
-    /// Publishes the base of a loading range as one chunk while preserving buffers and runs.
-    fn attach_at(&self, range: &Arc<CachedRange>, base: Arc<RangeFile>, base_seq: u64) -> bool {
+    /// Publishes the base of a loading range while preserving buffers and runs, splitting
+    /// immediately at `w` when `split` matches the current layers.
+    fn attach_at(
+        &self,
+        range: &Arc<CachedRange>,
+        base: Arc<RangeFile>,
+        base_seq: u64,
+        split: Option<SplitPlan>,
+        w: u64,
+    ) -> Vec<Arc<CachedRange>> {
         if !self.is_indexed(range) {
-            return false;
+            return Vec::new();
         }
         let layers = range.layers.load_full();
         if !layers.chunks.loading() || layers.floor() != base_seq {
-            return false;
+            return Vec::new();
         }
         self.stats.loads.increment(1);
         self.stats.load_bytes.increment(base.file_len());
         let now = self.hits.access_clock().fetch_add(2, Ordering::Relaxed) + 2;
         range.heat.hits.set_last_access(now - 1);
+        if let Some(plan) = split {
+            let fits = plan.children.len() > 1
+                && plan.children.iter().all(|c| {
+                    c.chunks
+                        .iter()
+                        .all(|chunk| Arc::ptr_eq(&chunk.file, &base) && chunk.base_seq == base_seq)
+                })
+                && same_arcs(&layers.runs, &plan.runs_was)
+                && same_view(&layers.view, &plan.view_was)
+                && !range.jobs.flushing()
+                && !range.jobs.merging();
+            if fits {
+                let children = self.split_at(range, &layers, plan.children, plan.rate, w);
+                self.stats.splits_attach.increment(1);
+                return children;
+            }
+            self.stats.splits_rejected.increment(1);
+        }
         self.store_layers(
             range,
             Layers {
@@ -752,7 +809,86 @@ impl RangeCache {
             },
         );
         self.maintenance.notify(range);
+        vec![range.clone()]
+    }
+
+    /// Applies a planned zero-copy split if the range is still indexed, loaded, holds the planned
+    /// base, runs, and view, has no active flush or major merge, and has at least two children.
+    fn split_request_at(&self, range: &Arc<CachedRange>, plan: SplitPlan, w: u64) -> bool {
+        let layers = range.layers.load_full();
+        let fits = self.is_indexed(range)
+            && !layers.chunks.loading()
+            && layers.chunks.same(&plan.chunks_was)
+            && same_arcs(&layers.runs, &plan.runs_was)
+            && same_view(&layers.view, &plan.view_was)
+            && plan.children.len() > 1
+            && !range.jobs.flushing()
+            && !range.jobs.merging();
+        if !fits {
+            self.stats.splits_rejected.increment(1);
+            return false;
+        }
+        self.split_at(range, &layers, plan.children, plan.rate, w);
+        self.stats.splits_maintenance.increment(1);
         true
+    }
+
+    /// Replaces `range` with `children` at writer boundary `w` without copying data.
+    fn split_at(
+        &self,
+        range: &Arc<CachedRange>,
+        layers: &Layers,
+        children: Vec<SplitChild>,
+        rate: f64,
+        w: u64,
+    ) -> Vec<Arc<CachedRange>> {
+        let shares: Vec<u64> = children
+            .iter()
+            .map(|c| super::split::base_share(&c.chunks, &c.start, c.end.as_ref()).0)
+            .collect();
+        let total: u64 = shares.iter().sum();
+        let count = children.len();
+        let now_ms = self.now_ms();
+        let built = super::split::children_layers(
+            layers,
+            children,
+            w,
+            self.options.tuning.max_runs,
+            |lo| self.new_buffer(lo),
+        );
+        let mut index = RangeIndex::clone(&self.index.load());
+        index.remove(&range.start);
+        let mut made = Vec::with_capacity(count);
+        for ((start, end, child_layers), bytes) in built.into_iter().zip(shares) {
+            let share = if total == 0 {
+                1.0 / count as f64
+            } else {
+                bytes as f64 / total as f64
+            };
+            let inherited = super::Inherited {
+                share,
+                rate,
+                now_ms,
+            };
+            let child = Arc::new(CachedRange::split_from(
+                range,
+                start.clone(),
+                end,
+                child_layers,
+                inherited,
+                self.writer.take_slot(),
+            ));
+            index.insert(start, child.clone());
+            made.push(child);
+        }
+        self.index.store(Arc::new(index));
+        self.writer.give_back_slot(range.slot);
+        self.stats.split_ranges.increment(count as u64);
+        self.update_gauges();
+        for child in &made {
+            self.maintenance.notify(child);
+        }
+        made
     }
 
     /// Installs a flushed run, removes its sealed buffers, updates `covered_to`, and swaps the

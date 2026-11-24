@@ -56,6 +56,12 @@ pub const FLUSH_MERGE_COUNT: &str = range_cache_stat_name!("flush_merge_count");
 pub const FLUSH_MERGE_BYTES: &str = range_cache_stat_name!("flush_merge_bytes");
 /// Flushed runs or merged bases rejected because the range state changed concurrently.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
+/// Zero-copy range splits. `when` is `maintenance` or `attach`.
+pub const SPLIT_COUNT: &str = range_cache_stat_name!("split_count");
+/// Total child ranges created by splits.
+pub const SPLIT_RANGE_COUNT: &str = range_cache_stat_name!("split_range_count");
+/// Splits rejected because the range state changed before install.
+pub const SPLIT_REJECTED_COUNT: &str = range_cache_stat_name!("split_rejected_count");
 /// Ranges removed from the cache. `reason` is `evicted`, `explicit`, `expiring_write`, `error`,
 /// `closed`, `not_worth_it`, or `overflow`.
 pub const REMOVE_COUNT: &str = range_cache_stat_name!("remove_count");
@@ -63,6 +69,10 @@ pub const REMOVE_COUNT: &str = range_cache_stat_name!("remove_count");
 pub const RANGE_COUNT: &str = range_cache_stat_name!("range_count");
 /// Disk bytes of open range cache files.
 pub const FILE_BYTES: &str = range_cache_stat_name!("file_bytes");
+/// Disk bytes of unique base files across cached ranges (shared files counted once).
+pub const BASE_FILE_BYTES: &str = range_cache_stat_name!("base_file_bytes");
+/// Disk bytes of unique run files across cached ranges (shared files counted once).
+pub const RUN_FILE_BYTES: &str = range_cache_stat_name!("run_file_bytes");
 /// Estimated bytes of active and sealed write buffers across cached ranges.
 pub const DELTA_BYTES: &str = range_cache_stat_name!("delta_bytes");
 /// Heap metadata bytes of open files, delta views, and cached range layer sets.
@@ -522,6 +532,10 @@ pub(crate) struct RangeCacheStats {
     pub(crate) flush_merges: Arc<dyn CounterFn>,
     pub(crate) flush_merge_bytes: Arc<dyn CounterFn>,
     pub(crate) installs_rejected: Arc<dyn CounterFn>,
+    pub(crate) splits_maintenance: Arc<dyn CounterFn>,
+    pub(crate) splits_attach: Arc<dyn CounterFn>,
+    pub(crate) split_ranges: Arc<dyn CounterFn>,
+    pub(crate) splits_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
     removed_expiring_write: Arc<dyn CounterFn>,
@@ -531,6 +545,8 @@ pub(crate) struct RangeCacheStats {
     removed_overflow: Arc<dyn CounterFn>,
     pub(crate) ranges: Arc<dyn GaugeFn>,
     pub(crate) file_bytes: Arc<dyn GaugeFn>,
+    pub(crate) base_file_bytes: Arc<dyn GaugeFn>,
+    pub(crate) run_file_bytes: Arc<dyn GaugeFn>,
     pub(crate) delta_bytes: Arc<dyn GaugeFn>,
     pub(crate) meta_bytes: Arc<dyn GaugeFn>,
     pub(crate) view_bytes: Arc<dyn GaugeFn>,
@@ -554,6 +570,10 @@ impl RangeCacheStats {
             flush_merges: recorder.counter(FLUSH_MERGE_COUNT).register(),
             flush_merge_bytes: recorder.counter(FLUSH_MERGE_BYTES).register(),
             installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
+            splits_maintenance: labeled(SPLIT_COUNT, "when", "maintenance"),
+            splits_attach: labeled(SPLIT_COUNT, "when", "attach"),
+            split_ranges: recorder.counter(SPLIT_RANGE_COUNT).register(),
+            splits_rejected: recorder.counter(SPLIT_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
             removed_expiring_write: removed("expiring_write"),
@@ -563,6 +583,8 @@ impl RangeCacheStats {
             removed_overflow: removed("overflow"),
             ranges: recorder.gauge(RANGE_COUNT).register(),
             file_bytes: recorder.gauge(FILE_BYTES).register(),
+            base_file_bytes: recorder.gauge(BASE_FILE_BYTES).register(),
+            run_file_bytes: recorder.gauge(RUN_FILE_BYTES).register(),
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
             meta_bytes: recorder.gauge(META_BYTES).register(),
             view_bytes: recorder.gauge(VIEW_BYTES).register(),

@@ -1494,6 +1494,237 @@ mod tests {
         }
     }
 
+    /// The newest sequence number of the versions that the children of a split receive after it:
+    /// the split is at `MAX_SEQ`, and each child's active buffer holds the versions of its keys in
+    /// `(MAX_SEQ, LATE]`.
+    const LATE: u64 = 330;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 300,
+            max_global_rejects: 1_000_000,
+            ..ProptestConfig::default()
+        })]
+
+        /// Reads through zero-copy split children (from one or two parent chunks) match the full
+        /// history at `seq`, while the parent's pinned layers serve reads up to `MAX_SEQ` and
+        /// reject reads above it.
+        #[test]
+        fn should_read_through_split_children(
+            history in proptest::collection::btree_map((0u8..40, 1..=MAX_SEQ), kind(), 0..200),
+            late in proptest::collection::btree_map((0u8..40, MAX_SEQ + 1..=LATE), kind(), 0..40),
+            two in any::<bool>(),
+            boundary in 1u8..40,
+            a_high in any::<bool>(),
+            shape in shape(),
+            cuts in proptest::collection::btree_set(1u8..40, 1..3),
+            seq in LOW..=LATE,
+            start in bound(),
+            end in bound(),
+            prefix_rows in 0usize..20,
+            seek_to in proptest::option::of(0u8..40),
+            mmap in any::<bool>(),
+        ) {
+            let range = BytesRange::try_new(start.map(key), end.map(key));
+            prop_assume!(range.is_some());
+            let range = range.unwrap();
+            let (a_seq, b_seq) = if a_high { (HIGH, LOW) } else { (LOW, HIGH) };
+            // The `base_seq` of the chunk that holds `k`.
+            let chunk_seq = |k: u8| match (two, k < boundary) {
+                (false, _) => BASE_SEQ,
+                (true, true) => a_seq,
+                (true, false) => b_seq,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let source = page_source(mmap);
+                let parent = if two {
+                    two_chunks(dir.path(), &history, boundary, a_seq, b_seq, source).await
+                } else {
+                    layers_of(dir.path(), "f", &history, history_entry, &shape, source, |_| true, None).await
+                };
+                let cut_keys: Vec<Bytes> = cuts.iter().map(|c| key(*c)).collect();
+                let plan = crate::range_cache::split::plan(
+                    &parent,
+                    &parent.chunks,
+                    &Bytes::new(),
+                    None,
+                    &cut_keys,
+                )
+                .unwrap()
+                .expect("a plan");
+                assert_eq!(plan.children.len(), cuts.len() + 1);
+                let built = crate::range_cache::split::children_layers(
+                    &parent,
+                    plan.children,
+                    MAX_SEQ,
+                    *crate::range_cache::MAX_RUNS_RANGE.end(),
+                    |lo| Arc::new(Delta::for_test(&DeltaMemory::detached(), lo)),
+                );
+                let holds = |start: &Bytes, end: &Option<Bytes>, k: &[u8]| {
+                    k >= start.as_ref() && end.as_ref().is_none_or(|end| k < end.as_ref())
+                };
+                // The versions after the split go to the child that holds their key.
+                let children: Vec<(Bytes, Option<Bytes>, Arc<Layers>)> = built
+                    .into_iter()
+                    .map(|(start, end, layers)| {
+                        let mut writer = layers.active.writer();
+                        for ((k, seq), kind) in &late {
+                            if holds(&start, &end, &key(*k)) {
+                                writer.append(&history_entry(*k, *kind, *seq));
+                            }
+                        }
+                        drop(writer);
+                        // With one chunk the view lists every version of the runs in the child's
+                        // keys; `children_layers` checked the views of two chunks (I12).
+                        if let Some(view) = layers.view.as_ref().filter(|_| !two) {
+                            view.check_in(&start, end.as_deref()).unwrap();
+                        }
+                        (start, end, Arc::new(layers))
+                    })
+                    .collect();
+                let mut full = history.clone();
+                full.extend(late.iter().map(|(k, v)| (*k, *v)));
+                let child_of = |k: &[u8]| {
+                    children
+                        .iter()
+                        .position(|(start, end, _)| holds(start, end, k))
+                        .unwrap()
+                };
+
+                for k in 0u8..40 {
+                    let (_, _, child) = &children[child_of(&key(k))];
+                    let got = cached_get(child, k, seq).await;
+                    if seq < chunk_seq(k) {
+                        assert_eq!(got, None, "key {k} at {seq}");
+                    } else {
+                        assert_eq!(got, Some(model_get(&full, k, seq).await), "key {k} at {seq}");
+                    }
+                    // The parent's layers, pinned before the split.
+                    let pinned = cached_get(&parent, k, seq).await;
+                    if seq < chunk_seq(k) || seq > MAX_SEQ {
+                        assert_eq!(pinned, None, "parent, key {k} at {seq}");
+                    } else {
+                        assert_eq!(pinned, Some(model_get(&history, k, seq).await), "parent, key {k} at {seq}");
+                    }
+                }
+
+                // The children that the scan meets, from the one that holds its start.
+                let first = match RangeBounds::start_bound(&range) {
+                    Unbounded => 0,
+                    Included(k) | Excluded(k) => child_of(k),
+                };
+                let before_end = |child_start: &Bytes| match RangeBounds::end_bound(&range) {
+                    Unbounded => true,
+                    Included(e) => child_start <= e,
+                    Excluded(e) => child_start < e,
+                };
+                let parts: Vec<Arc<Layers>> = children[first..]
+                    .iter()
+                    .enumerate()
+                    .take_while(|(i, (start, _, _))| *i == 0 || before_end(start))
+                    .map(|(_, (_, _, layers))| layers.clone())
+                    .collect();
+                let last = parts.len() - 1;
+                let usable = parts.iter().enumerate().all(|(i, layers)| {
+                    let from = if i == 0 {
+                        RangeBounds::start_bound(&range).map(|k| k.as_ref())
+                    } else {
+                        Unbounded
+                    };
+                    let to = if i == last {
+                        RangeBounds::end_bound(&range).map(|k| k.as_ref())
+                    } else {
+                        Unbounded
+                    };
+                    crate::range_cache::RangeCache::usable_for(layers, from, to, seq).is_ok()
+                });
+                // The chunks that the scan meets: A if it starts below `boundary`, B if it ends
+                // after it, as before the split; the children's chunks keep their `base_seq`s.
+                let in_a = match RangeBounds::start_bound(&range) {
+                    Unbounded => true,
+                    Included(k) | Excluded(k) => *k < key(boundary),
+                };
+                let in_b = match RangeBounds::end_bound(&range) {
+                    Unbounded => true,
+                    Included(k) => *k >= key(boundary),
+                    Excluded(k) => *k > key(boundary),
+                };
+                let needed = if two {
+                    [(in_a, a_seq), (in_b, b_seq)]
+                        .iter()
+                        .filter(|(meets, _)| *meets)
+                        .map(|(_, s)| *s)
+                        .max()
+                        .unwrap()
+                } else {
+                    BASE_SEQ
+                };
+                assert_eq!(usable, seq >= needed, "a scan at {seq} that needs {needed}");
+                if !usable {
+                    return;
+                }
+                let merge: MergeOperatorType = Arc::new(StringConcatMergeOperator);
+                let visible = |rows: Vec<RowEntry>| {
+                    rows.into_iter().map(KeyValue::from).collect::<Vec<_>>()
+                };
+                let all = all_of(&full, history_entry);
+                let mut expected =
+                    crate::range_cache::stack_iterator(&all, seq, range.clone(), Some(merge.clone()))
+                        .await
+                        .unwrap();
+                let scan = CachedScan::new(parts, seq, &range, Some(merge.clone())).unwrap();
+                let mut actual = DbIterator::new_resolved(range.clone(), Box::new(scan), ReadTrace::none())
+                    .await
+                    .unwrap();
+                let want = drain(&mut expected, prefix_rows).await;
+                let got = drain(&mut actual, prefix_rows).await;
+                assert_eq!(visible(got), visible(want.clone()));
+                if let Some(target) = seek_to {
+                    let target = key(target);
+                    let allowed = RangeBounds::contains(&range, &target)
+                        && want.last().is_none_or(|last| last.key < target);
+                    if allowed {
+                        expected.seek(&target).await.unwrap();
+                        actual.seek(&target).await.unwrap();
+                    }
+                }
+                assert_eq!(
+                    visible(drain(&mut actual, usize::MAX).await),
+                    visible(drain(&mut expected, usize::MAX).await)
+                );
+
+                // The normal iterator stack over each child, within its keys.
+                for (start, end, child) in &children {
+                    let keys = BytesRange::new(
+                        Included(start.clone()),
+                        end.clone().map_or(Unbounded, Excluded),
+                    );
+                    let Some(part) = range.intersect(&keys) else {
+                        continue;
+                    };
+                    let meets = |k: u8| RangeBounds::contains(&part, &key(k));
+                    if (0u8..40).filter(|k| meets(*k)).any(|k| seq < chunk_seq(k)) {
+                        continue;
+                    }
+                    let mut expected =
+                        crate::range_cache::stack_iterator(&all, seq, part.clone(), Some(merge.clone()))
+                            .await
+                            .unwrap();
+                    let mut stacked =
+                        crate::range_cache::stack_iterator(child, seq, part, Some(merge.clone()))
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        visible(drain(&mut stacked, usize::MAX).await),
+                        visible(drain(&mut expected, usize::MAX).await)
+                    );
+                }
+            });
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 300,

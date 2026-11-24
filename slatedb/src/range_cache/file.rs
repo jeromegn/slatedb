@@ -1049,6 +1049,85 @@ impl RangeFile {
         self.max_seq
     }
 
+    /// Byte length of data pages and out-of-line values before the fence region.
+    #[cfg(test)]
+    pub(super) fn data_len(&self) -> u64 {
+        self.data_end
+    }
+
+    /// Start offset of `page` including preceding out-of-line values, or `data_end` at the end.
+    fn page_start(&self, page: usize) -> u64 {
+        match page {
+            0 => 0,
+            p if p >= self.page_count() => self.data_end,
+            p => self.page_offsets[p - 1] + self.page_size as u64,
+        }
+    }
+
+    /// Page index range holding keys in `[start, end)`, searched via the in-memory fence index.
+    fn span_pages(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> (usize, usize) {
+        let first = start.map_or(0, |key| self.pages_le(key).saturating_sub(1));
+        let last = end.map_or(self.page_count(), |key| self.pages_lt(key));
+        (first, last.max(first))
+    }
+
+    /// Disk bytes and estimated row count of pages covering `[start, end)`. Returns the full file
+    /// length and exact row count when all pages are included.
+    pub(super) fn span_share(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> (u64, u64) {
+        let (first, last) = self.span_pages(start, end);
+        if first == 0 && last == self.page_count() {
+            return (self.file_len, self.rows);
+        }
+        let bytes = self.page_start(last) - self.page_start(first);
+        let rows = u128::from(self.rows) * u128::from(bytes) / u128::from(self.data_end.max(1));
+        (bytes, rows as u64)
+    }
+
+    /// Start and end data offsets of pages covering `[start, end)`.
+    pub(super) fn span_data(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> (u64, u64) {
+        let (first, last) = self.span_pages(start, end);
+        (self.page_start(first), self.page_start(last))
+    }
+
+    /// Finds a page fence key inside `[start, end)` nearest to `at` bytes from the span start,
+    /// returning `(bytes_before, key)`, or `None` if fewer than two pages cover the span.
+    pub(super) fn cut_near(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        at: u64,
+    ) -> Option<(u64, Bytes)> {
+        let (first, last) = self.span_pages(start, end);
+        let lo = first + 1;
+        if lo >= last {
+            return None;
+        }
+        let base = self.page_start(first);
+        let target = base.saturating_add(at);
+        // The first candidate page that starts at or after the target, and the one before it.
+        let (mut a, mut b) = (lo, last);
+        while a < b {
+            let mid = (a + b) / 2;
+            if self.page_start(mid) < target {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        let after = a.min(last - 1);
+        let before = a.saturating_sub(1).max(lo);
+        let distance = |p: usize| self.page_start(p).abs_diff(target);
+        let page = if distance(before) <= distance(after) {
+            before
+        } else {
+            after
+        };
+        let key = self.fence(page);
+        if start.is_some_and(|s| key <= s) || end.is_some_and(|e| key >= e) {
+            return None;
+        }
+        Some((self.page_start(page) - base, Bytes::copy_from_slice(key)))
+    }
     fn page_count(&self) -> usize {
         self.page_offsets.len()
     }

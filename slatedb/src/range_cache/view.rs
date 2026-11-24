@@ -1,11 +1,11 @@
 //! Sorted delta view over all run files of a cached range.
 //!
 //! Each entry stores a run slot plus first-version flag, a 32-bit file offset, and front-coded
-//! key metadata (shared prefix length and next byte). The view omits run versions already
-//! absorbed by a base chunk. Periodic anchor keys let seeks binary-search anchors and scan one
-//! segment without reading run files in the common case. Flushes add a run incrementally from its
-//! writer's row locators; major merges drop absorbed runs without reading keys except to replace
-//! dropped anchors.
+//! key metadata (shared prefix length and next byte). The view omits run versions outside the
+//! range's keys or already absorbed by a base chunk. Periodic anchor keys let seeks binary-search
+//! anchors and scan one segment without reading run files in the common case. Flushes add a run
+//! incrementally from its writer's row locators; major merges drop absorbed runs and splits
+//! restrict views to child spans without reading keys except to replace dropped anchors.
 
 use std::borrow::Cow;
 use std::cmp::Ordering as Cmp;
@@ -445,6 +445,30 @@ impl DeltaView {
 
     /// Removes `dropped` runs from this view. Returns `None` if no runs remain.
     pub(crate) fn without(&self, dropped: &[Arc<Run>]) -> io::Result<Option<Self>> {
+        self.kept(dropped, 0..self.len())
+    }
+
+    /// Restricts this view to `[start, end)` while removing `dropped` runs.
+    /// Returns `None` if no runs remain.
+    pub(crate) fn restrict(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        dropped: &[Arc<Run>],
+    ) -> io::Result<Option<Self>> {
+        let from = self.seek(Bound::Included(start))?;
+        let to = match end {
+            Some(end) => self.seek(Bound::Included(end))?,
+            None => self.len(),
+        };
+        self.kept(dropped, from..to.max(from))
+    }
+
+    fn kept(
+        &self,
+        dropped: &[Arc<Run>],
+        entries: std::ops::Range<usize>,
+    ) -> io::Result<Option<Self>> {
         let mut slots = self.slots.clone();
         let mut dead = [false; VIEW_SLOTS];
         for run in dropped {
@@ -462,12 +486,14 @@ impl DeltaView {
             return Ok(None);
         }
         let live = |i: usize| !dead[self.slot_of(i) as usize];
-        let kept = (0..self.len()).filter(|&i| live(i)).count();
+        let kept = entries.clone().filter(|&i| live(i)).count();
         let mut out = Out::new(self.prefix.clone(), slots, kept);
         let mut gone: Option<(u8, u8)> = None;
-        let mut anchor = 0;
-        let mut i = 0;
-        while i < self.len() {
+        let mut anchor = self
+            .anchor_at
+            .partition_point(|&a| (a as usize) < entries.start);
+        let mut i = entries.start;
+        while i < entries.end {
             let end = self.next_key(i);
             let is_anchor = self.anchor_at.get(anchor).is_some_and(|&a| a as usize == i);
             if is_anchor {
@@ -531,12 +557,21 @@ impl DeltaView {
     /// its runs once.
     #[cfg(test)]
     pub(crate) fn check(&self) -> io::Result<()> {
+        self.check_in(&[], None)
+    }
+
+    /// [`DeltaView::check`] for the view of a range from `start` to `end` that a split made: the
+    /// view lists exactly the rows of its runs in those keys.
+    #[cfg(test)]
+    pub(crate) fn check_in(&self, start: &[u8], end: Option<&[u8]>) -> io::Result<()> {
         let mut prev: Option<(Vec<u8>, u64)> = None;
         let mut anchor = 0;
         let mut rows = 0u64;
+        let inside = |key: &[u8]| key >= start && end.is_none_or(|end| key < end);
         for i in 0..self.len() {
             let span = self.row(i)?;
             let key = self.key(i)?.to_vec();
+            assert!(inside(&key), "entry {i} outside the range's keys");
             assert!(
                 key.starts_with(&self.prefix),
                 "entry {i} outside the prefix"
@@ -580,7 +615,13 @@ impl DeltaView {
         }
         assert_eq!(anchor, self.anchor_at.len(), "anchors past the entries");
         assert!(self.len() == 0 || self.anchor_at.first() == Some(&0));
-        let expected: u64 = self.runs().map(|r| r.file.rows()).sum();
+        let mut expected = 0u64;
+        for run in self.runs() {
+            run.file.for_each_row(|_, key, _| {
+                expected += u64::from(inside(key));
+                Ok(())
+            })?;
+        }
         assert_eq!(rows, expected, "the view does not list every row once");
         Ok(())
     }
@@ -1104,6 +1145,8 @@ mod tests {
             flushed in proptest::collection::btree_set(key_strategy(), 0..20),
             targets in proptest::collection::vec(key_strategy(), 0..20),
             page_size in prop_oneof![Just(512usize), Just(4096usize)],
+            split_keys in (key_strategy(), proptest::option::of(key_strategy())),
+            split_drops in 0usize..3,
         ) {
             let dir = tempfile::tempdir().unwrap();
             let memory = Arc::new(ViewMemory::default());
@@ -1151,6 +1194,48 @@ mod tests {
                     let want = expected(&specs[absorbed..]);
                     prop_assert_eq!(keys_of(&left), want.clone());
                     check_seeks(&left, &want, &targets);
+                }
+            }
+
+            // A split restricts the view to `[lo, hi)` without absorbed runs.
+            let (lo, hi) = split_keys;
+            let hi = hi.filter(|hi| *hi > lo);
+            let inside = |k: &[u8]| k >= lo.as_slice() && hi.as_ref().is_none_or(|hi| k < hi.as_slice());
+            let drops = split_drops.min(runs.len());
+            let gone: Vec<Arc<Run>> = runs[..drops].iter().rev().map(|(r, _)| r.clone()).collect();
+            match view.restrict(&lo, hi.as_deref(), &gone).unwrap() {
+                None => prop_assert_eq!(drops, runs.len()),
+                Some(part) => {
+                    part.check_in(&lo, hi.as_deref()).unwrap();
+                    let want: Vec<(Vec<u8>, u64)> = expected(&specs[drops..])
+                        .into_iter()
+                        .filter(|(k, _)| inside(k))
+                        .collect();
+                    prop_assert_eq!(keys_of(&part), want.clone());
+                    let kept: Vec<Arc<Run>> = runs[drops..].iter().rev().map(|(r, _)| r.clone()).collect();
+                    let scratch = DeltaView::from_runs_where(&kept, &memory, |_, k| inside(k)).unwrap();
+                    prop_assert_eq!(part.entries(), scratch.entries());
+                    prop_assert_eq!(part.runs().count(), runs.len() - drops);
+                    check_seeks(&part, &want, &targets);
+                    check_page_mates(&part, page_size as u64);
+                    // A child's flush adds a run of its own keys to the restricted view.
+                    let mut rows: Vec<(Vec<u8>, u64)> = Vec::new();
+                    let mut at = seq;
+                    for key in flushed.iter().filter(|k| inside(k)) {
+                        at += 1;
+                        rows.push((key.clone(), at));
+                    }
+                    let (child_run, child_rows) = run(dir.path(), "child", seq, at + 1, rows.clone(), page_size);
+                    let grown = part.with_run(&child_run, &child_rows).unwrap();
+                    grown.check_in(&lo, hi.as_deref()).unwrap();
+                    let mut want_specs = specs[drops..].to_vec();
+                    want_specs.push((rows, seq, at + 1));
+                    let want: Vec<(Vec<u8>, u64)> = expected(&want_specs)
+                        .into_iter()
+                        .filter(|(k, _)| inside(k))
+                        .collect();
+                    prop_assert_eq!(keys_of(&grown), want.clone());
+                    check_seeks(&grown, &want, &targets);
                 }
             }
 
