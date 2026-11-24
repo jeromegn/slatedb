@@ -37,11 +37,12 @@ use super::delta::Delta;
 use super::file::{RangeFile, RangeFileIterator, RangeFileWriter, RowLocators};
 use super::merge::merge_versions_in;
 use super::split;
+use super::spread::{Measured, SliceTally, Spread};
 use super::stats::RemoveReason;
 use super::writer::{same_view, Target, ViewSwap};
 use super::{
-    CachedRange, Chunks, DeltaView, Layers, RangeCache, RangeCacheTuning, RangeIndex, Run,
-    MAX_RUNS_RANGE,
+    BuildCost, CachedRange, Chunks, DeltaView, Layers, RangeCache, RangeCacheTuning, RangeIndex,
+    Run, MAX_RUNS_RANGE,
 };
 use crate::bytes_range::BytesRange;
 use crate::db::DbInner;
@@ -297,6 +298,17 @@ pub(super) async fn off_workers<T: Send + 'static>(
         .map_err(|e| SlateDBError::BackgroundTaskPanic(format!("range cache file work: {e}")))?
 }
 
+/// Elapsed nanoseconds since `started` on `clock`.
+fn elapsed_nanos(
+    clock: &dyn slatedb_common::clock::SystemClock,
+    started: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    (clock.now() - started)
+        .num_nanoseconds()
+        .unwrap_or(0)
+        .max(0) as u64
+}
+
 /// True if `held` (newest first) are the newest of `runs` (newest first).
 fn holds_newest(runs: &[Arc<Run>], held: &[Arc<Run>]) -> bool {
     held.len() <= runs.len() && runs.iter().zip(held).all(|(a, b)| Arc::ptr_eq(a, b))
@@ -469,7 +481,7 @@ impl RangeCache {
         buffers: Vec<Arc<Delta>>,
         replaces: Vec<Arc<Run>>,
     ) -> Result<bool, SlateDBError> {
-        for _ in 0..VIEW_ATTEMPTS {
+        for attempt in 0..VIEW_ATTEMPTS {
             let was = {
                 let layers = range.layers.load();
                 if !holds_newest(&layers.runs, &replaces) {
@@ -486,16 +498,25 @@ impl RangeCache {
                     was.clone(),
                 );
                 off_workers(move || {
-                    Ok(DeltaView::after_flush(
+                    let mut cost = BuildCost::default();
+                    let started = cache.clock.now();
+                    let view = DeltaView::after_flush(
                         was.as_deref(),
                         &replaces,
                         &run,
                         &rows,
                         &cache.views,
-                    )?)
+                        &mut cost,
+                    )?;
+                    cost.nanos = elapsed_nanos(&*cache.clock, started);
+                    cache.stats.view[0].built(&cost);
+                    Ok(view)
                 })
                 .await?
             };
+            if attempt > 0 {
+                self.stats.view[0].retries.increment(1);
+            }
             fail_point!(
                 Arc::clone(&self.fp_registry),
                 "range-cache-install-run-view"
@@ -557,27 +578,32 @@ impl RangeCache {
         range: &Arc<CachedRange>,
         chunks: Chunks,
         absorbed: Vec<Arc<Run>>,
+        trigger: Trigger,
     ) -> Result<(), SlateDBError> {
         let Some(base_seq) = absorbed.first().map(|r| r.hi) else {
             return Ok(());
         };
         range.mark_build();
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-rebuild");
-        let new_base = {
+        let (new_base, spread) = {
             let (cache, absorbed, chunks) = (self.clone(), absorbed.clone(), chunks.clone());
             let (start, end) = (range.start.clone(), range.end.clone());
             let handle = tokio::runtime::Handle::current();
-            let file = off_workers(move || {
+            let (file, spread) = off_workers(move || {
                 let merge = cache.merge_files(&absorbed, &chunks, &start, end.as_ref(), base_seq);
                 handle.block_on(merge)
             })
             .await?;
-            Arc::new(file)
+            (Arc::new(file), spread)
         };
         if self
             .install_major_with_view(range, &chunks, absorbed, new_base, base_seq)
             .await?
         {
+            self.stats.spread(&spread);
+            if trigger == Trigger::Runs {
+                self.stats.rebuilds_by_runs.increment(1);
+            }
             self.evict(&[]).await;
         }
         Ok(())
@@ -591,7 +617,7 @@ impl RangeCache {
         new_base: Arc<RangeFile>,
         base_seq: u64,
     ) -> Result<bool, SlateDBError> {
-        for _ in 0..VIEW_ATTEMPTS {
+        for attempt in 0..VIEW_ATTEMPTS {
             let was = {
                 let layers = range.layers.load();
                 if !holds_oldest(&layers.runs, &absorbed) {
@@ -603,9 +629,20 @@ impl RangeCache {
                 return Ok(false);
             };
             let view = {
-                let absorbed = absorbed.clone();
-                off_workers(move || Ok(old.without(&absorbed)?)).await?
+                let (cache, absorbed) = (self.clone(), absorbed.clone());
+                off_workers(move || {
+                    let mut cost = BuildCost::default();
+                    let started = cache.clock.now();
+                    let view = old.without(&absorbed, &mut cost)?;
+                    cost.nanos = elapsed_nanos(&*cache.clock, started);
+                    cache.stats.view[1].built(&cost);
+                    Ok(view)
+                })
+                .await?
             };
+            if attempt > 0 {
+                self.stats.view[1].retries.increment(1);
+            }
             fail_point!(
                 Arc::clone(&self.fp_registry),
                 "range-cache-install-major-view"
@@ -644,15 +681,22 @@ impl RangeCache {
         fail_point!(Arc::clone(&self.fp_registry), "range-cache-split");
         let layers = range.layers.load_full();
         let plan = {
+            let cache = self.clone();
             let (start, end) = (range.start.clone(), range.end.clone());
             off_workers(move || {
-                Ok(split::plan(
+                let mut cost = BuildCost::default();
+                let started = cache.clock.now();
+                let plan = split::plan(
                     &layers,
                     &layers.chunks,
                     &start,
                     end.as_ref(),
                     &cuts,
-                )?)
+                    &mut cost,
+                )?;
+                cost.nanos = elapsed_nanos(&*cache.clock, started);
+                cache.stats.view[2].built(&cost);
+                Ok(plan)
             })
             .await?
         };
@@ -664,8 +708,8 @@ impl RangeCache {
         Ok(self.install_split(range, plan).await)
     }
 
-    /// Writes the state at `base_seq` of `chunks` and `runs` (newest first) into a new base file.
-    /// Merges each chunk within its span against runs it has not yet absorbed.
+    /// Writes the state at `base_seq` of `chunks` and `runs` (newest first) into a new base file
+    /// and measures where absorbed delta landed across virtual base slices.
     pub(super) async fn merge_files(
         &self,
         runs: &[Arc<Run>],
@@ -673,20 +717,27 @@ impl RangeCache {
         start: &Bytes,
         end: Option<&Bytes>,
         base_seq: u64,
-    ) -> Result<RangeFile, SlateDBError> {
+    ) -> Result<(RangeFile, Spread), SlateDBError> {
         let mut writer = RangeFileWriter::create(
             &self.options.root_folder,
             &self.new_file_name(),
             self.options.tuning.page_size,
         )?;
+        let mut spread = Spread::default();
         for (i, chunk) in chunks.iter().enumerate() {
             debug_assert!(chunk.base_seq <= base_seq, "a chunk newer than its merge");
             let span = chunks.span(i, Some(start), end);
+            let tally = SliceTally::new(
+                chunk.file.clone(),
+                split::span_start(&span),
+                split::span_end(&span),
+            )?;
             let mut sources: Vec<Box<dyn RowEntryIterator + 'static>> = runs
                 .iter()
                 .filter(|run| !chunk.absorbed(run))
                 .map(|run| {
-                    Box::new(RangeFileIterator::new(run.file.clone(), span.clone()))
+                    let source = RangeFileIterator::new(run.file.clone(), span.clone());
+                    Box::new(Measured::new(source, tally.clone()))
                         as Box<dyn RowEntryIterator + 'static>
                 })
                 .collect();
@@ -708,10 +759,11 @@ impl RangeCache {
             while let Some(entry) = iter.next_entry().await? {
                 writer.push(&entry)?;
             }
+            spread.add(&tally.spread());
         }
         let path = writer.finish()?;
         let file = RangeFile::open(path, self.options.page_source, self.files.clone())?;
-        Ok(file)
+        Ok((file, spread))
     }
 }
 
@@ -745,6 +797,7 @@ enum Job {
     Major {
         chunks: Chunks,
         absorbed: Vec<Arc<Run>>,
+        trigger: Trigger,
     },
     /// Split the range at `cuts` (see [`split_cuts`]).
     Split { cuts: Vec<Bytes> },
@@ -997,6 +1050,7 @@ impl Maintainer {
             let job = Job::Major {
                 chunks: layers.chunks.clone(),
                 absorbed: layers.runs[runs].to_vec(),
+                trigger,
             };
             drop(layers);
             self.start(&range, job);
@@ -1072,9 +1126,11 @@ impl Maintainer {
                         lo,
                         hi,
                     } => cache.flush(&range, buffers, replaces, lo, hi).await,
-                    Job::Major { chunks, absorbed } => {
-                        cache.major_merge(&range, chunks, absorbed).await
-                    }
+                    Job::Major {
+                        chunks,
+                        absorbed,
+                        trigger,
+                    } => cache.major_merge(&range, chunks, absorbed, trigger).await,
                     Job::Split { cuts } => cache.split(&range, cuts).await.map(|_| ()),
                 }
             },
@@ -1816,8 +1872,15 @@ mod tests {
         in_view: &[Arc<Run>],
     ) -> ViewSwap {
         let was = range.layers.load().view.clone();
-        let view =
-            DeltaView::after_flush(was.as_deref(), in_view, run, rows, &cache.views).unwrap();
+        let view = DeltaView::after_flush(
+            was.as_deref(),
+            in_view,
+            run,
+            rows,
+            &cache.views,
+            &mut BuildCost::default(),
+        )
+        .unwrap();
         ViewSwap {
             new: Some(Arc::new(view)),
             was,
@@ -1871,7 +1934,15 @@ mod tests {
         // A view built on a view that the range does not hold.
         let r = run(&both, lo, seal(&newer));
         let mut swap = swap_for(&cache, &range, &r.0, &r.1, &[]);
-        let other = DeltaView::after_flush(None, &[], &r.0, &r.1, &cache.views).unwrap();
+        let other = DeltaView::after_flush(
+            None,
+            &[],
+            &r.0,
+            &r.1,
+            &cache.views,
+            &mut BuildCost::default(),
+        )
+        .unwrap();
         swap.was = Some(Arc::new(other));
         assert!(
             !cache
@@ -1904,7 +1975,7 @@ mod tests {
             let cache = cache.clone();
             let (runs, base, end) = (vec![first.clone()], base.clone(), range.end.clone());
             async move {
-                let file = cache
+                let (file, _) = cache
                     .merge_files(&runs, &base, &key(0), end.as_ref(), base_seq)
                     .await
                     .unwrap();

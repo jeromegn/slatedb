@@ -1093,7 +1093,14 @@ mod tests {
         let newest_first: Vec<Arc<Run>> = runs.iter().rev().map(|(r, _)| r.clone()).collect();
         let view = match shape.view {
             _ if runs.is_empty() => None,
-            0 => Some(DeltaView::from_runs(&newest_first, &memory).unwrap()),
+            0 => Some(
+                DeltaView::from_runs(
+                    &newest_first,
+                    &memory,
+                    &mut crate::range_cache::BuildCost::default(),
+                )
+                .unwrap(),
+            ),
             how => {
                 let older: Vec<(Arc<Run>, RowLocators)> = if how == 2 {
                     vec![
@@ -1107,18 +1114,21 @@ mod tests {
                     3 => &runs[..runs.len() - 1],
                     _ => &runs[..],
                 };
+                let mut cost = crate::range_cache::BuildCost::default();
                 let mut view = DeltaView::empty(&memory);
                 for (run, rows) in older.iter().chain(flushed).chain(replaced.iter().rev()) {
-                    view = view.with_run(run, rows).unwrap();
+                    view = view.with_run(run, rows, &mut cost).unwrap();
                 }
                 if how == 2 {
                     let gone: Vec<Arc<Run>> = older.iter().rev().map(|(r, _)| r.clone()).collect();
-                    view = view.without(&gone).unwrap().unwrap();
+                    view = view.without(&gone, &mut cost).unwrap().unwrap();
                 }
                 if how == 3 {
                     let gone: Vec<Arc<Run>> = replaced.iter().map(|(r, _)| r.clone()).collect();
                     let (run, rows) = runs.last().unwrap();
-                    view = DeltaView::after_flush(Some(&view), &gone, run, rows, &memory).unwrap();
+                    view =
+                        DeltaView::after_flush(Some(&view), &gone, run, rows, &memory, &mut cost)
+                            .unwrap();
                 }
                 Some(view)
             }
@@ -1266,8 +1276,13 @@ mod tests {
             }
         };
         let memory = Arc::new(ViewMemory::default());
-        let view =
-            DeltaView::from_runs_where(&runs, &memory, |run, k| run.hi > base_of(k)).unwrap();
+        let view = DeltaView::from_runs_where(
+            &runs,
+            &memory,
+            &mut crate::range_cache::BuildCost::default(),
+            |run, k| run.hi > base_of(k),
+        )
+        .unwrap();
         let sealed = buffer(RUN_HI, SEALED_HI);
         sealed.sealed_at().store(SEALED_HI, Ordering::Release);
         let layers = Layers {
@@ -1551,6 +1566,7 @@ mod tests {
                     &Bytes::new(),
                     None,
                     &cut_keys,
+                    &mut crate::range_cache::BuildCost::default(),
                 )
                 .unwrap()
                 .expect("a plan");

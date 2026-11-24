@@ -18,7 +18,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::delta::Delta;
-use super::view::DeltaView;
+use super::view::{BuildCost, DeltaView};
 use super::{ChunkList, Chunks, Layers, Run};
 
 /// One range that a split makes: its keys, its base, its runs and its view.
@@ -227,6 +227,7 @@ pub(super) fn plan(
     start: &Bytes,
     end: Option<&Bytes>,
     cuts: &[Bytes],
+    cost: &mut BuildCost,
 ) -> io::Result<Option<SplitPlan>> {
     if chunks.loading() || cuts.is_empty() {
         return Ok(None);
@@ -254,7 +255,7 @@ pub(super) fn plan(
         }
         let view = match &layers.view {
             Some(view) => view
-                .restrict(&child_start, child_end.as_deref(), dropped)?
+                .restrict(&child_start, child_end.as_deref(), dropped, cost)?
                 .map(Arc::new),
             None => None,
         };
@@ -768,6 +769,7 @@ mod tests {
             &range.start,
             range.end.as_ref(),
             &[key(50)],
+            &mut BuildCost::default(),
         )
         .unwrap()
         .unwrap();
@@ -777,6 +779,7 @@ mod tests {
             &range.start,
             range.end.as_ref(),
             &[key(50)],
+            &mut BuildCost::default(),
         )
         .unwrap()
         .unwrap();

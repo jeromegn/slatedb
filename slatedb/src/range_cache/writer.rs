@@ -1062,11 +1062,16 @@ impl RangeCache {
             return false;
         }
         self.stats.flushes.increment(1);
+        self.stats.flushed_buffers.increment(buffers.len() as u64);
+        if buffers.len() > 1 {
+            self.stats.multi_buffer_flushes.increment(1);
+        }
         if replaces.is_empty() {
             self.stats.flush_bytes.increment(run.file_bytes());
         } else {
             self.stats.flush_merges.increment(1);
             self.stats.flush_merge_bytes.increment(run.file_bytes());
+            self.stats.flush_merge_runs.increment(replaces.len() as u64);
         }
         let mut runs = Vec::with_capacity(layers.runs.len() + 1 - replaces.len());
         let covered_to = run.hi;
@@ -1126,7 +1131,9 @@ impl RangeCache {
         let kept = kept.unwrap_or(0);
         self.stats.rebuilds.increment(1);
         self.stats.rebuild_bytes.increment(base.file_len());
-        range.jobs.record_major(base.file_len());
+        self.stats
+            .rebuild_flushes
+            .increment(range.jobs.record_major(base.file_len()));
         self.store_layers(
             range,
             Layers {
@@ -1809,6 +1816,7 @@ mod quiet_merge_tests {
     use crate::merge_operator::{MergeOperator, MergeOperatorError};
     use crate::object_store::memory::InMemory;
     use crate::oracle::Oracle;
+    use crate::range_cache::maintain::Trigger;
     use crate::range_cache::stats::{
         PIN_RETRY_COUNT, QUIET_MERGE_COUNT, QUIET_MERGE_REJECTED_COUNT, SPLIT_COUNT,
     };
@@ -1915,7 +1923,12 @@ mod quiet_merge_tests {
             }
             let layers = range.layers.load_full();
             self.cache()
-                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .major_merge(
+                    &range,
+                    layers.chunks.clone(),
+                    layers.runs.clone(),
+                    Trigger::Bytes,
+                )
                 .await
                 .unwrap();
             let base = self.range(start).layers.load().chunks[0].base_seq;
@@ -2098,7 +2111,12 @@ mod quiet_merge_tests {
         let layers = range.layers.load_full();
         if !layers.runs.is_empty() {
             t.cache()
-                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .major_merge(
+                    &range,
+                    layers.chunks.clone(),
+                    layers.runs.clone(),
+                    Trigger::Bytes,
+                )
                 .await
                 .unwrap();
         }
@@ -2178,7 +2196,12 @@ mod quiet_merge_tests {
             .await;
             let layers = range.layers.load_full();
             t.cache()
-                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .major_merge(
+                    &range,
+                    layers.chunks.clone(),
+                    layers.runs.clone(),
+                    Trigger::Bytes,
+                )
                 .await
                 .unwrap();
             let bytes = range.layers.load().base_share(&key(start)).0;

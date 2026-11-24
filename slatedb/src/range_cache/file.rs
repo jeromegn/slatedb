@@ -1055,6 +1055,12 @@ impl RangeFile {
         self.data_end
     }
 
+    /// File offset of the page whose keys hold `key`, or `None` if `key` precedes the first page.
+    pub(super) fn page_offset_of(&self, key: &[u8]) -> Option<u64> {
+        let pages = self.pages_le(key);
+        pages.checked_sub(1).map(|page| self.page_offsets[page])
+    }
+
     /// Start offset of `page` including preceding out-of-line values, or `data_end` at the end.
     fn page_start(&self, page: usize) -> u64 {
         match page {

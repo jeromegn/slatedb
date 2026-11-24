@@ -113,6 +113,19 @@ impl Drop for DeltaView {
     }
 }
 
+/// Profiling metrics for one delta view build.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BuildCost {
+    /// Rows added from new run locators.
+    pub(crate) rows_added: u64,
+    /// Existing run keys read from disk by locator.
+    pub(crate) keys_read: u64,
+    /// Bytes read from run files (row headers and keys).
+    pub(crate) bytes_read: u64,
+    /// Wall time of the build in nanoseconds, set by the caller.
+    pub(crate) nanos: u64,
+}
+
 impl DeltaView {
     /// A view of no run, to add a range's first run to.
     pub(crate) fn empty(memory: &Arc<ViewMemory>) -> Self {
@@ -308,6 +321,16 @@ impl DeltaView {
     /// Compares entry `i`'s key with `target`, given that the previous key is below `target` and
     /// shares `m` bytes with it. Reads the file key only when front coding cannot decide.
     fn coded_cmp(&self, i: usize, m: usize, target: &[u8]) -> io::Result<Coded> {
+        self.coded_cmp_counted(i, m, target, &mut BuildCost::default())
+    }
+
+    fn coded_cmp_counted(
+        &self,
+        i: usize,
+        m: usize,
+        target: &[u8],
+        cost: &mut BuildCost,
+    ) -> io::Result<Coded> {
         let l = self.lcp[i] as usize;
         let b = self.byte[i];
         let decided = if l == LCP_CAP && m >= LCP_CAP {
@@ -327,6 +350,8 @@ impl DeltaView {
             return Ok(decided);
         }
         let key = self.key(i)?;
+        cost.keys_read += 1;
+        cost.bytes_read += (key.len() + 21) as u64;
         let l = lcp(&key, target);
         Ok(match key.as_ref().cmp(target) {
             Cmp::Less => Coded::Less(l),
@@ -337,8 +362,12 @@ impl DeltaView {
 
     /// Builds a view from `runs` (newest first) by reading every key from their files.
     #[cfg(test)]
-    pub(crate) fn from_runs(runs: &[Arc<Run>], memory: &Arc<ViewMemory>) -> io::Result<Self> {
-        Self::from_runs_where(runs, memory, |_, _| true)
+    pub(crate) fn from_runs(
+        runs: &[Arc<Run>],
+        memory: &Arc<ViewMemory>,
+        cost: &mut BuildCost,
+    ) -> io::Result<Self> {
+        Self::from_runs_where(runs, memory, cost, |_, _| true)
     }
 
     /// Builds a view from `runs` keeping only entries matching `keep(run, key)`.
@@ -346,6 +375,7 @@ impl DeltaView {
     pub(crate) fn from_runs_where(
         runs: &[Arc<Run>],
         memory: &Arc<ViewMemory>,
+        cost: &mut BuildCost,
         keep: impl Fn(&Run, &[u8]) -> bool,
     ) -> io::Result<Self> {
         if runs.len() > VIEW_SLOTS {
@@ -360,7 +390,9 @@ impl DeltaView {
                 }
                 Ok(())
             })?;
+            cost.bytes_read += run.file.data_bytes();
         }
+        cost.rows_added += rows.len() as u64;
         rows.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
         let prefix = match (rows.first(), rows.last()) {
             (Some(first), Some(last)) => first.0[..lcp(&first.0, &last.0)].to_vec(),
@@ -392,11 +424,12 @@ impl DeltaView {
         run: &Arc<Run>,
         rows: &RowLocators,
         memory: &Arc<ViewMemory>,
+        cost: &mut BuildCost,
     ) -> io::Result<Self> {
         let kept;
         let base = match was {
             Some(view) if !replaced.is_empty() => {
-                kept = view.without(replaced)?;
+                kept = view.without(replaced, cost)?;
                 kept.as_ref()
             }
             Some(view) => Some(view),
@@ -404,13 +437,18 @@ impl DeltaView {
             None => return Err(corrupt("a flush replaced runs of a range without a view")),
         };
         match base {
-            Some(view) => view.with_run(run, rows),
-            None => DeltaView::empty(memory).with_run(run, rows),
+            Some(view) => view.with_run(run, rows, cost),
+            None => DeltaView::empty(memory).with_run(run, rows, cost),
         }
     }
 
     /// Adds a newer `run` and its `new` row locators into this view in a free slot.
-    pub(crate) fn with_run(&self, run: &Arc<Run>, new: &RowLocators) -> io::Result<Self> {
+    pub(crate) fn with_run(
+        &self,
+        run: &Arc<Run>,
+        new: &RowLocators,
+        cost: &mut BuildCost,
+    ) -> io::Result<Self> {
         check_size(run)?;
         if new.rows() as u64 != run.file.rows() {
             return Err(corrupt("row locators of another run"));
@@ -423,6 +461,7 @@ impl DeltaView {
             slots.resize(slot + 1, None);
         }
         slots[slot] = Some(run.clone());
+        cost.rows_added += new.rows() as u64;
         let (Some(first), Some(last)) = (new.first(), new.last()) else {
             let mut out = Out::new(self.prefix.clone(), slots, self.len());
             self.copy_all(&mut out, &self.prefix);
@@ -435,7 +474,7 @@ impl DeltaView {
             self.prefix[..keep].to_vec()
         };
         let mut out = Out::new(prefix, slots, self.len() + new.rows());
-        let mut merge = Merge::new(self, &mut out);
+        let mut merge = Merge::new(self, &mut out, cost);
         for g in 0..new.groups() {
             merge.insert(new.key(g), new.offsets(g), slot as u8)?;
         }
@@ -444,8 +483,12 @@ impl DeltaView {
     }
 
     /// Removes `dropped` runs from this view. Returns `None` if no runs remain.
-    pub(crate) fn without(&self, dropped: &[Arc<Run>]) -> io::Result<Option<Self>> {
-        self.kept(dropped, 0..self.len())
+    pub(crate) fn without(
+        &self,
+        dropped: &[Arc<Run>],
+        cost: &mut BuildCost,
+    ) -> io::Result<Option<Self>> {
+        self.kept(dropped, 0..self.len(), cost)
     }
 
     /// Restricts this view to `[start, end)` while removing `dropped` runs.
@@ -455,19 +498,21 @@ impl DeltaView {
         start: &[u8],
         end: Option<&[u8]>,
         dropped: &[Arc<Run>],
+        cost: &mut BuildCost,
     ) -> io::Result<Option<Self>> {
         let from = self.seek(Bound::Included(start))?;
         let to = match end {
             Some(end) => self.seek(Bound::Included(end))?,
             None => self.len(),
         };
-        self.kept(dropped, from..to.max(from))
+        self.kept(dropped, from..to.max(from), cost)
     }
 
     fn kept(
         &self,
         dropped: &[Arc<Run>],
         entries: std::ops::Range<usize>,
+        cost: &mut BuildCost,
     ) -> io::Result<Option<Self>> {
         let mut slots = self.slots.clone();
         let mut dead = [false; VIEW_SLOTS];
@@ -513,6 +558,8 @@ impl DeltaView {
                 out.anchor(self.anchor_suffix(anchor - 1));
             } else if out.must_anchor() {
                 let key = self.key(i)?;
+                cost.keys_read += 1;
+                cost.bytes_read += (key.len() + 21) as u64;
                 out.anchor(&key[out.prefix.len()..]);
             }
             out.push((self.sel[first] & SLOT) | FIRST, self.off[first], l, b);
@@ -775,9 +822,10 @@ enum Last<'n> {
 }
 
 /// Merges a new run's keys into an existing view.
-struct Merge<'v, 'o, 'n> {
+struct Merge<'v, 'o, 'n, 'c> {
     old: &'v DeltaView,
     out: &'o mut Out,
+    cost: &'c mut BuildCost,
     p: usize,
     a: usize,
     has_prev: bool,
@@ -787,11 +835,12 @@ struct Merge<'v, 'o, 'n> {
     fix: Option<(u8, u8)>,
 }
 
-impl<'v, 'o, 'n> Merge<'v, 'o, 'n> {
-    fn new(old: &'v DeltaView, out: &'o mut Out) -> Self {
+impl<'v, 'o, 'n, 'c> Merge<'v, 'o, 'n, 'c> {
+    fn new(old: &'v DeltaView, out: &'o mut Out, cost: &'c mut BuildCost) -> Self {
         Self {
             old,
             out,
+            cost,
             p: 0,
             a: 0,
             has_prev: false,
@@ -823,6 +872,8 @@ impl<'v, 'o, 'n> Merge<'v, 'o, 'n> {
             self.a += 1;
         } else if self.out.must_anchor() {
             let key = old.key(i)?;
+            self.cost.keys_read += 1;
+            self.cost.bytes_read += (key.len() + 21) as u64;
             self.out.anchor(&key[self.out.prefix.len()..]);
         }
         self.out.push(old.sel[i], old.off[i], l, b);
@@ -896,7 +947,7 @@ impl<'v, 'o, 'n> Merge<'v, 'o, 'n> {
         let limit = old.anchor_at.get(self.a).map_or(n, |&a| a as usize);
         while self.p < limit {
             debug_assert!(self.has_prev, "a walk without a previous key");
-            match old.coded_cmp(self.p, m, key)? {
+            match old.coded_cmp_counted(self.p, m, key, self.cost)? {
                 Coded::Less(l) => {
                     self.emit_old_key()?;
                     m = l;
@@ -1171,13 +1222,14 @@ mod tests {
                 .map(|(i, (rows, lo, hi))| run(dir.path(), &format!("r{i}"), *lo, *hi, rows.clone(), page_size))
                 .collect();
             // Incremental: the oldest run on an empty view, then each newer one.
+            let mut cost = BuildCost::default();
             let mut view = DeltaView::empty(&memory);
             for (r, rows) in &runs {
-                view = view.with_run(r, rows).unwrap();
+                view = view.with_run(r, rows, &mut cost).unwrap();
                 view.check().unwrap();
             }
             let newest_first: Vec<Arc<Run>> = runs.iter().rev().map(|(r, _)| r.clone()).collect();
-            let scratch = DeltaView::from_runs(&newest_first, &memory).unwrap();
+            let scratch = DeltaView::from_runs(&newest_first, &memory, &mut cost).unwrap();
             prop_assert_eq!(keys_of(&view), keys_of(&scratch));
             prop_assert_eq!(view.entries(), scratch.entries());
             prop_assert_eq!(keys_of(&view), expected(&specs));
@@ -1187,7 +1239,7 @@ mod tests {
             // A major merge absorbs the oldest runs.
             let absorbed = absorbed.min(runs.len());
             let gone: Vec<Arc<Run>> = runs[..absorbed].iter().rev().map(|(r, _)| r.clone()).collect();
-            match view.without(&gone).unwrap() {
+            match view.without(&gone, &mut cost).unwrap() {
                 None => prop_assert_eq!(absorbed, runs.len()),
                 Some(left) => {
                     left.check().unwrap();
@@ -1203,7 +1255,7 @@ mod tests {
             let inside = |k: &[u8]| k >= lo.as_slice() && hi.as_ref().is_none_or(|hi| k < hi.as_slice());
             let drops = split_drops.min(runs.len());
             let gone: Vec<Arc<Run>> = runs[..drops].iter().rev().map(|(r, _)| r.clone()).collect();
-            match view.restrict(&lo, hi.as_deref(), &gone).unwrap() {
+            match view.restrict(&lo, hi.as_deref(), &gone, &mut cost).unwrap() {
                 None => prop_assert_eq!(drops, runs.len()),
                 Some(part) => {
                     part.check_in(&lo, hi.as_deref()).unwrap();
@@ -1213,7 +1265,7 @@ mod tests {
                         .collect();
                     prop_assert_eq!(keys_of(&part), want.clone());
                     let kept: Vec<Arc<Run>> = runs[drops..].iter().rev().map(|(r, _)| r.clone()).collect();
-                    let scratch = DeltaView::from_runs_where(&kept, &memory, |_, k| inside(k)).unwrap();
+                    let scratch = DeltaView::from_runs_where(&kept, &memory, &mut cost, |_, k| inside(k)).unwrap();
                     prop_assert_eq!(part.entries(), scratch.entries());
                     prop_assert_eq!(part.runs().count(), runs.len() - drops);
                     check_seeks(&part, &want, &targets);
@@ -1226,7 +1278,7 @@ mod tests {
                         rows.push((key.clone(), at));
                     }
                     let (child_run, child_rows) = run(dir.path(), "child", seq, at + 1, rows.clone(), page_size);
-                    let grown = part.with_run(&child_run, &child_rows).unwrap();
+                    let grown = part.with_run(&child_run, &child_rows, &mut cost).unwrap();
                     grown.check_in(&lo, hi.as_deref()).unwrap();
                     let mut want_specs = specs[drops..].to_vec();
                     want_specs.push((rows, seq, at + 1));
@@ -1252,11 +1304,11 @@ mod tests {
             seq += 1;
             let (merged, merged_rows) = run(dir.path(), "merged", lo, seq, rows.clone(), page_size);
             let replaces: Vec<Arc<Run>> = runs[kept..].iter().rev().map(|(r, _)| r.clone()).collect();
-            let after = DeltaView::after_flush(Some(&view), &replaces, &merged, &merged_rows, &memory).unwrap();
+            let after = DeltaView::after_flush(Some(&view), &replaces, &merged, &merged_rows, &memory, &mut cost).unwrap();
             after.check().unwrap();
             let mut remaining: Vec<Arc<Run>> = vec![merged.clone()];
             remaining.extend(runs[..kept].iter().rev().map(|(r, _)| r.clone()));
-            let rebuilt = DeltaView::from_runs(&remaining, &memory).unwrap();
+            let rebuilt = DeltaView::from_runs(&remaining, &memory, &mut cost).unwrap();
             prop_assert_eq!(after.entries(), rebuilt.entries());
             let mut want_specs = specs[..kept].to_vec();
             want_specs.push((rows, lo, seq));
@@ -1280,18 +1332,31 @@ mod tests {
             .map(|i| (format!("key{i:06}").into_bytes(), i as u64 + 1))
             .collect();
         let (r, rows) = run(dir.path(), "a", 0, 100, keys, 512);
-        let first = DeltaView::after_flush(None, &[], &r, &rows, &memory).unwrap();
+        let mut cost = BuildCost::default();
+        let first = DeltaView::after_flush(None, &[], &r, &rows, &memory, &mut cost).unwrap();
         first.check().unwrap();
         assert_eq!(first.len(), 100);
+        assert_eq!(cost.rows_added, 100);
         assert!(first.has_visible(1) && !first.has_visible(0));
-        assert!(
-            DeltaView::after_flush(None, std::slice::from_ref(&r), &r, &rows, &memory).is_err()
-        );
+        assert!(DeltaView::after_flush(
+            None,
+            std::slice::from_ref(&r),
+            &r,
+            &rows,
+            &memory,
+            &mut cost
+        )
+        .is_err());
         let (other, other_rows) = run(dir.path(), "b", 100, 101, vec![(b"k".to_vec(), 101)], 512);
-        assert!(first.with_run(&other, &rows).is_err());
-        let both = first.with_run(&other, &other_rows).unwrap();
+        assert!(first.with_run(&other, &rows, &mut cost).is_err());
+        let both = first.with_run(&other, &other_rows, &mut cost).unwrap();
         both.check().unwrap();
-        assert_eq!(both.without(&[other, r]).unwrap().map(|v| v.len()), None);
+        assert_eq!(
+            both.without(&[other, r], &mut cost)
+                .unwrap()
+                .map(|v| v.len()),
+            None
+        );
     }
 
     #[test]
@@ -1302,7 +1367,8 @@ mod tests {
             .map(|i| (format!("key{i:06}").into_bytes(), i as u64 + 1))
             .collect();
         let (r, _) = run(dir.path(), "a", 0, 1000, keys, 4096);
-        let view = DeltaView::from_runs(&[r], &memory).unwrap();
+        let mut cost = BuildCost::default();
+        let view = DeltaView::from_runs(&[r], &memory, &mut cost).unwrap();
         assert!(view.bytes() >= 7 * 1000);
         assert_eq!(memory.bytes(), view.bytes());
         drop(view);

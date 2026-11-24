@@ -397,6 +397,7 @@ mod tests {
     use crate::merge_operator::{MergeOperator, MergeOperatorError};
     use crate::object_store::memory::InMemory;
     use crate::oracle::Oracle;
+    use crate::range_cache::maintain::Trigger;
     use crate::range_cache::stats::{
         FALLBACK_COUNT, LAZY_PIN_COUNT, MIXED_SCAN_COUNT, SCAN_COUNT, UNUSABLE_COUNT,
     };
@@ -507,7 +508,12 @@ mod tests {
             }
             let layers = range.layers.load_full();
             self.cache()
-                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .major_merge(
+                    &range,
+                    layers.chunks.clone(),
+                    layers.runs.clone(),
+                    Trigger::Bytes,
+                )
                 .await
                 .unwrap();
             let base = self.range(start).layers.load().chunks[0].base_seq;
@@ -1119,7 +1125,12 @@ mod tests {
                                 && layers.runs.len() < t.cache().options.tuning.max_runs
                             {
                                 t.cache()
-                                    .major_merge(range, layers.chunks.clone(), layers.runs.clone())
+                                    .major_merge(
+                                        range,
+                                        layers.chunks.clone(),
+                                        layers.runs.clone(),
+                                        Trigger::Bytes,
+                                    )
                                     .await
                                     .unwrap();
                             }

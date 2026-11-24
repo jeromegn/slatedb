@@ -44,18 +44,36 @@ pub const LOAD_BYTES: &str = range_cache_stat_name!("load_bytes");
 pub const LOAD_REJECTED_COUNT: &str = range_cache_stat_name!("load_rejected_count");
 /// Major merges that rebuilt a range base from its base and runs.
 pub const REBUILD_COUNT: &str = range_cache_stat_name!("rebuild_count");
+/// Major merges triggered by run count (`max_runs - headroom`) rather than run bytes.
+pub const REBUILD_BY_RUNS_COUNT: &str = range_cache_stat_name!("rebuild_by_runs_count");
+/// Flushes installed while a major merge waited or ran, counted when the merge installs.
+pub const REBUILD_FLUSH_COUNT: &str = range_cache_stat_name!("rebuild_flush_count");
 /// Bytes of base files written by major merges.
 pub const REBUILD_BYTES: &str = range_cache_stat_name!("rebuild_bytes");
+/// Base data bytes rewritten by installed major merges, sliced into 1 MiB and 8 MiB virtual bands.
+pub const MAJOR_MERGE_BASE_BYTES: &str = range_cache_stat_name!("major_merge_base_bytes");
+/// Key and value bytes absorbed by major merges. `span` is `inside` or `outside` base key bounds.
+pub const MAJOR_MERGE_DELTA_BYTES: &str = range_cache_stat_name!("major_merge_delta_bytes");
+/// Bytes of virtual slices holding at least one absorbed version. `slice` is `1mib` or `8mib`.
+pub const MAJOR_MERGE_TOUCHED_BYTES: &str = range_cache_stat_name!("major_merge_touched_bytes");
+/// Bytes of densest virtual slices accounting for half of absorbed delta bytes. By `slice`.
+pub const MAJOR_MERGE_HALF_BYTES: &str = range_cache_stat_name!("major_merge_half_bytes");
 /// Active write buffers sealed. `reason` is `full` or `pressure`.
 pub const SEAL_COUNT: &str = range_cache_stat_name!("seal_count");
 /// Flushes of sealed buffers to run files.
 pub const FLUSH_COUNT: &str = range_cache_stat_name!("flush_count");
 /// Bytes of run files written by plain flushes.
 pub const FLUSH_BYTES: &str = range_cache_stat_name!("flush_bytes");
+/// Sealed write buffers flushed across all flush jobs.
+pub const FLUSHED_BUFFER_COUNT: &str = range_cache_stat_name!("flushed_buffer_count");
+/// Flush jobs that wrote more than one sealed buffer.
+pub const MULTI_BUFFER_FLUSH_COUNT: &str = range_cache_stat_name!("multi_buffer_flush_count");
 /// Flushes that merged the newest runs at `max_runs` to stay within the run cap.
 pub const FLUSH_MERGE_COUNT: &str = range_cache_stat_name!("flush_merge_count");
 /// Bytes of run files written by flush-merges.
 pub const FLUSH_MERGE_BYTES: &str = range_cache_stat_name!("flush_merge_bytes");
+/// Runs replaced by flush-merges.
+pub const FLUSH_MERGE_RUN_COUNT: &str = range_cache_stat_name!("flush_merge_run_count");
 /// Flushed runs or merged bases rejected because the range state changed concurrently.
 pub const INSTALL_REJECTED_COUNT: &str = range_cache_stat_name!("install_rejected_count");
 /// Zero-copy range splits. `when` is `maintenance` or `attach`.
@@ -86,6 +104,18 @@ pub const META_BYTES: &str = range_cache_stat_name!("meta_bytes");
 /// Exact heap bytes allocated by live write buffers (chunks and filters). Never exceeds
 /// `max_recent_bytes`.
 pub const DELTA_ALLOCATED_BYTES: &str = range_cache_stat_name!("delta_allocated_bytes");
+/// Delta view builds. `job` is `flush`, `major`, or `split`.
+pub const VIEW_BUILD_COUNT: &str = range_cache_stat_name!("view_build_count");
+/// Wall time of delta view builds in nanoseconds, by `job`.
+pub const VIEW_BUILD_NANOS: &str = range_cache_stat_name!("view_build_nanos");
+/// Rows added to delta views from new run locators, by `job`.
+pub const VIEW_BUILD_ROWS: &str = range_cache_stat_name!("view_build_rows");
+/// Existing run keys read from disk during delta view builds, by `job`.
+pub const VIEW_BUILD_KEYS: &str = range_cache_stat_name!("view_build_keys");
+/// Bytes read from run files during delta view builds, by `job`.
+pub const VIEW_BUILD_BYTES: &str = range_cache_stat_name!("view_build_bytes");
+/// Delta view rebuild retries after concurrent view swaps, by `job`.
+pub const VIEW_RETRY_COUNT: &str = range_cache_stat_name!("view_retry_count");
 /// Heap bytes of all live delta views. Also included in `meta_bytes`.
 pub const VIEW_BYTES: &str = range_cache_stat_name!("view_bytes");
 
@@ -538,12 +568,22 @@ pub(crate) struct RangeCacheStats {
     pub(crate) loads_rejected_memory: Arc<dyn CounterFn>,
     pub(crate) rebuilds: Arc<dyn CounterFn>,
     pub(crate) rebuild_bytes: Arc<dyn CounterFn>,
+    pub(crate) rebuilds_by_runs: Arc<dyn CounterFn>,
+    pub(crate) rebuild_flushes: Arc<dyn CounterFn>,
+    major_merge_base_bytes: Arc<dyn CounterFn>,
+    major_merge_delta_inside: Arc<dyn CounterFn>,
+    major_merge_delta_outside: Arc<dyn CounterFn>,
+    major_merge_touched: [Arc<dyn CounterFn>; 2],
+    major_merge_half: [Arc<dyn CounterFn>; 2],
     pub(crate) seals_full: Arc<dyn CounterFn>,
     pub(crate) seals_pressure: Arc<dyn CounterFn>,
     pub(crate) flushes: Arc<dyn CounterFn>,
     pub(crate) flush_bytes: Arc<dyn CounterFn>,
+    pub(crate) flushed_buffers: Arc<dyn CounterFn>,
+    pub(crate) multi_buffer_flushes: Arc<dyn CounterFn>,
     pub(crate) flush_merges: Arc<dyn CounterFn>,
     pub(crate) flush_merge_bytes: Arc<dyn CounterFn>,
+    pub(crate) flush_merge_runs: Arc<dyn CounterFn>,
     pub(crate) installs_rejected: Arc<dyn CounterFn>,
     pub(crate) splits_maintenance: Arc<dyn CounterFn>,
     pub(crate) splits_attach: Arc<dyn CounterFn>,
@@ -564,7 +604,42 @@ pub(crate) struct RangeCacheStats {
     pub(crate) run_file_bytes: Arc<dyn GaugeFn>,
     pub(crate) delta_bytes: Arc<dyn GaugeFn>,
     pub(crate) meta_bytes: Arc<dyn GaugeFn>,
+    /// View build counters indexed by job: flush (`0`), major (`1`), split (`2`).
+    pub(crate) view: [ViewStats; 3],
     pub(crate) view_bytes: Arc<dyn GaugeFn>,
+}
+
+/// View build profiling counters for one maintenance job type.
+pub(crate) struct ViewStats {
+    builds: Arc<dyn CounterFn>,
+    nanos: Arc<dyn CounterFn>,
+    rows: Arc<dyn CounterFn>,
+    keys: Arc<dyn CounterFn>,
+    bytes: Arc<dyn CounterFn>,
+    pub(crate) retries: Arc<dyn CounterFn>,
+}
+
+impl ViewStats {
+    fn new(recorder: &MetricsRecorderHelper, job: &'static str) -> Self {
+        let labeled = |name| recorder.counter(name).labels(&[("job", job)]).register();
+        Self {
+            builds: labeled(VIEW_BUILD_COUNT),
+            nanos: labeled(VIEW_BUILD_NANOS),
+            rows: labeled(VIEW_BUILD_ROWS),
+            keys: labeled(VIEW_BUILD_KEYS),
+            bytes: labeled(VIEW_BUILD_BYTES),
+            retries: labeled(VIEW_RETRY_COUNT),
+        }
+    }
+
+    /// Records one completed view build and its cost.
+    pub(crate) fn built(&self, cost: &super::view::BuildCost) {
+        self.builds.increment(1);
+        self.nanos.increment(cost.nanos);
+        self.rows.increment(cost.rows_added);
+        self.keys.increment(cost.keys_read);
+        self.bytes.increment(cost.bytes_read);
+    }
 }
 
 impl RangeCacheStats {
@@ -578,12 +653,28 @@ impl RangeCacheStats {
             loads_rejected_memory: labeled(LOAD_REJECTED_COUNT, "reason", "memory"),
             rebuilds: recorder.counter(REBUILD_COUNT).register(),
             rebuild_bytes: recorder.counter(REBUILD_BYTES).register(),
+            rebuilds_by_runs: recorder.counter(REBUILD_BY_RUNS_COUNT).register(),
+            rebuild_flushes: recorder.counter(REBUILD_FLUSH_COUNT).register(),
+            major_merge_base_bytes: recorder.counter(MAJOR_MERGE_BASE_BYTES).register(),
+            major_merge_delta_inside: labeled(MAJOR_MERGE_DELTA_BYTES, "span", "inside"),
+            major_merge_delta_outside: labeled(MAJOR_MERGE_DELTA_BYTES, "span", "outside"),
+            major_merge_touched: [
+                labeled(MAJOR_MERGE_TOUCHED_BYTES, "slice", "1mib"),
+                labeled(MAJOR_MERGE_TOUCHED_BYTES, "slice", "8mib"),
+            ],
+            major_merge_half: [
+                labeled(MAJOR_MERGE_HALF_BYTES, "slice", "1mib"),
+                labeled(MAJOR_MERGE_HALF_BYTES, "slice", "8mib"),
+            ],
             seals_full: labeled(SEAL_COUNT, "reason", "full"),
             seals_pressure: labeled(SEAL_COUNT, "reason", "pressure"),
             flushes: recorder.counter(FLUSH_COUNT).register(),
             flush_bytes: recorder.counter(FLUSH_BYTES).register(),
+            flushed_buffers: recorder.counter(FLUSHED_BUFFER_COUNT).register(),
+            multi_buffer_flushes: recorder.counter(MULTI_BUFFER_FLUSH_COUNT).register(),
             flush_merges: recorder.counter(FLUSH_MERGE_COUNT).register(),
             flush_merge_bytes: recorder.counter(FLUSH_MERGE_BYTES).register(),
+            flush_merge_runs: recorder.counter(FLUSH_MERGE_RUN_COUNT).register(),
             installs_rejected: recorder.counter(INSTALL_REJECTED_COUNT).register(),
             splits_maintenance: labeled(SPLIT_COUNT, "when", "maintenance"),
             splits_attach: labeled(SPLIT_COUNT, "when", "attach"),
@@ -604,7 +695,24 @@ impl RangeCacheStats {
             run_file_bytes: recorder.gauge(RUN_FILE_BYTES).register(),
             delta_bytes: recorder.gauge(DELTA_BYTES).register(),
             meta_bytes: recorder.gauge(META_BYTES).register(),
+            view: [
+                ViewStats::new(recorder, "flush"),
+                ViewStats::new(recorder, "major"),
+                ViewStats::new(recorder, "split"),
+            ],
             view_bytes: recorder.gauge(VIEW_BYTES).register(),
+        }
+    }
+
+    /// Records the delta spread measured by an installed major merge.
+    pub(crate) fn spread(&self, spread: &super::spread::Spread) {
+        self.major_merge_base_bytes.increment(spread.base_bytes);
+        self.major_merge_delta_inside.increment(spread.inside_bytes);
+        self.major_merge_delta_outside
+            .increment(spread.outside_bytes);
+        for (i, slices) in spread.slices.iter().enumerate() {
+            self.major_merge_touched[i].increment(slices.touched_bytes);
+            self.major_merge_half[i].increment(slices.half_bytes);
         }
     }
 

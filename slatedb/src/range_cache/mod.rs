@@ -26,8 +26,13 @@ mod merge;
 mod mixed;
 mod scan;
 mod split;
+#[cfg(test)]
+mod split_bench;
+mod spread;
 pub mod stats;
 mod view;
+#[cfg(test)]
+mod view_bench;
 mod writer;
 
 use std::collections::BTreeMap;
@@ -81,7 +86,7 @@ use scan::CachedScan;
 use stats::{
     AutoStats, Fallback, FallbackOp, PinOp, RangeCacheStats, ReadCount, RemoveReason, Unfit,
 };
-use view::{DeltaView, ViewMemory};
+use view::{BuildCost, DeltaView, ViewMemory};
 use writer::{Padded, Target, WriterQueue};
 
 /// Max attempts to pin a range before falling back to the normal read path.
@@ -2079,7 +2084,15 @@ impl RangeCache {
         let (start, end) = (range.start.clone(), range.end.clone());
         let rate = range.heat.last_rate();
         let plan = maintain::off_workers(move || {
-            Ok(split::plan(&layers, &chunks, &start, end.as_ref(), &cuts)?)
+            let mut cost = BuildCost::default();
+            Ok(split::plan(
+                &layers,
+                &chunks,
+                &start,
+                end.as_ref(),
+                &cuts,
+                &mut cost,
+            )?)
         })
         .await?;
         Ok(plan.map(|plan| split::SplitPlan { rate, ..plan }))
