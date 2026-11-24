@@ -20,6 +20,7 @@ mod delta;
 mod file;
 mod filter;
 mod hits;
+mod lazy;
 mod maintain;
 mod merge;
 mod mixed;
@@ -35,7 +36,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -73,6 +74,7 @@ use file::{
 };
 use filter::{hash_key, Filter};
 use hits::{HitStats, RangeHits};
+use lazy::{GapReader, LazyHandle, LazyScan, NextPart};
 pub(crate) use maintain::{Maintainer, RANGE_CACHE_MAINTENANCE_TASK_NAME};
 use mixed::{GapSource, MixedScan, Part, PartKind};
 use scan::CachedScan;
@@ -1271,6 +1273,10 @@ pub(crate) struct RangeCache {
     rand: Arc<DbRand>,
     handle: tokio::runtime::Handle,
     merge_operator: Option<MergeOperatorType>,
+    /// Normal-path gap reader bound on the first lazily pinned scan.
+    gaps: OnceLock<GapReader>,
+    /// Sharded per-thread handles held by lazily pinned scans.
+    lazy_handles: Box<[Arc<LazyHandle>]>,
     #[allow(dead_code)]
     fp_registry: Arc<FailPointRegistry>,
 }
@@ -1352,7 +1358,8 @@ impl RangeCache {
             options.tuning.stats_fold_interval,
             clock.clone(),
         );
-        let cache = Arc::new(Self {
+        let cache = Arc::new_cyclic(|weak| Self {
+            lazy_handles: LazyHandle::all(weak, &hits),
             options,
             index: ArcSwap::from_pointee(RangeIndex::new()),
             writer: WriterQueue::new(),
@@ -1368,6 +1375,7 @@ impl RangeCache {
             rand,
             handle,
             merge_operator,
+            gaps: OnceLock::new(),
             fp_registry,
         });
         Ok((cache, rx))
@@ -1637,14 +1645,17 @@ impl RangeCache {
         CacheRead::Unusable
     }
 
-    /// Pins layers for a fully cached scan across one or more adjacent ranges at one sequence
-    /// number.
+    /// Pins layers for a cached scan at one sequence number. Snapshot and transaction scans
+    /// (`at.is_some()`) pin only the starting range and pin later ranges lazily.
     pub(crate) fn pin_scan(
         &self,
         range: &BytesRange,
         oracle: &dyn Oracle,
         at: Option<u64>,
     ) -> ScanPin {
+        if at.is_some() {
+            return self.pin_first(range, oracle, at);
+        }
         match self.try_pin_scan(range, oracle, at) {
             Some(Ok(pinned)) => ScanPin::Pinned(pinned),
             Some(Err(())) => ScanPin::Unusable,
@@ -1724,6 +1735,97 @@ impl RangeCache {
         }
         // The last attempt returns: `count_unfit` never retries it.
         Some(Err(()))
+    }
+
+    /// Pins only the range holding the start of `range` for a snapshot or transaction scan (`at`).
+    /// Returns [`ScanPin::Pinned`] if that single range covers the scan, or [`ScanPin::Lazy`] if
+    /// later ranges will be pinned on demand.
+    fn pin_first(&self, range: &BytesRange, oracle: &dyn Oracle, at: Option<u64>) -> ScanPin {
+        if self.index.load().is_empty() {
+            return ScanPin::Uncovered;
+        }
+        let excluded_start;
+        let start: &[u8] = match RangeBounds::start_bound(range) {
+            Unbounded => &[],
+            Included(key) => key,
+            Excluded(_) => match half_open(range) {
+                Some((key, _)) => {
+                    excluded_start = key;
+                    &excluded_start
+                }
+                None => return ScanPin::Uncovered,
+            },
+        };
+        for attempt in 1..=PIN_ATTEMPTS {
+            let index = self.index.load();
+            let Some(first) = covering(&index, start) else {
+                return ScanPin::Uncovered;
+            };
+            let layers = first.layers.load_full();
+            if layers.chunks.loading() {
+                return ScanPin::Uncovered;
+            }
+            fail_point!(Arc::clone(&self.fp_registry), "range-cache-pin");
+            let seq = read_seq(oracle, at);
+            let whole = first.contains_range(range);
+            let end = if whole {
+                RangeBounds::end_bound(range).map(|key| key.as_ref())
+            } else {
+                Unbounded
+            };
+            if let Err(reason) = Self::usable_for(&layers, Included(start), end, seq) {
+                if self.count_unfit(PinOp::Scan, reason, attempt) {
+                    continue;
+                }
+                self.count_fallback(FallbackOp::Scan, reason.into());
+                return ScanPin::Unusable;
+            }
+            return if whole {
+                self.count_read(first, ReadCount::Scan);
+                ScanPin::Pinned(PinnedScan {
+                    parts: vec![layers],
+                    seq,
+                })
+            } else {
+                self.count_read(first, ReadCount::LazyPin);
+                ScanPin::Lazy(LazyFirst { layers, seq })
+            };
+        }
+        ScanPin::Unusable
+    }
+
+    /// Pins the next segment starting at `from` for a lazily pinned scan at `seq` ending at
+    /// `scan_end`, returning cached layers or a normal-path gap bound.
+    fn pin_next(&self, from: &Bytes, scan_end: &Bound<Bytes>, seq: u64) -> NextPart {
+        for attempt in 1..=PIN_ATTEMPTS {
+            let index = self.index.load();
+            let Some(range) = covering(&index, from) else {
+                let next = index
+                    .range::<[u8], _>((Excluded(from.as_ref()), Unbounded))
+                    .next()
+                    .map(|(start, _)| start.clone());
+                return NextPart::Gap(Fallback::Uncovered, scan::min_end(scan_end, &next));
+            };
+            let layers = range.layers.load_full();
+            let end = scan::min_end(scan_end, &range.end);
+            if layers.chunks.loading() {
+                return NextPart::Gap(Fallback::Loading, end);
+            }
+            fail_point!(Arc::clone(&self.fp_registry), "range-cache-lazy-pin");
+            match Self::usable_for(&layers, Included(from), as_slices(&end), seq) {
+                Ok(()) => {
+                    self.count_read(range, ReadCount::LazyPin);
+                    return NextPart::Cached(layers);
+                }
+                Err(reason) => {
+                    if self.count_unfit(PinOp::ScanPart, reason, attempt) {
+                        continue;
+                    }
+                    return NextPart::Gap(reason.into(), end);
+                }
+            }
+        }
+        NextPart::Gap(Fallback::Sealed, scan_end.clone())
     }
 
     /// Plans a mixed scan of cached parts and gaps at one sequence number. Returns the highest-
@@ -2026,6 +2128,8 @@ impl Pinned {
 pub(crate) enum ScanPin {
     /// Pinned layers that serve the scan.
     Pinned(PinnedScan),
+    /// Starting range pinned for a snapshot or transaction scan that pins later ranges lazily.
+    Lazy(LazyFirst),
     /// Ready ranges do not hold all of the scan range.
     Uncovered,
     /// Ready ranges hold the scan range, but failed the sequence number rules, which the pin
@@ -2040,6 +2144,12 @@ struct MixedPin {
     seq: u64,
     /// The first cached part's range, which counts as read if the scan goes ahead.
     first: Arc<CachedRange>,
+}
+
+/// Starting range layers pinned at a registered sequence number for [`ScanPin::Lazy`].
+pub(crate) struct LazyFirst {
+    layers: Arc<Layers>,
+    seq: u64,
 }
 
 /// The layers of the adjacent cached ranges that hold a scan range, pinned at one sequence
@@ -2358,6 +2468,29 @@ impl DbInner {
                     .scan(range, self.reader.read_merge_operator.clone())
                     .await,
             ),
+            ScanPin::Lazy(first) => {
+                cache.gaps.get_or_init(|| GapReader {
+                    reader: self.reader.clone(),
+                    state: self.state.clone(),
+                    snapshots: self.snapshot_manager.clone(),
+                    transactions: self.txn_manager.clone(),
+                });
+                let scan = LazyScan::new(
+                    first.layers,
+                    first.seq,
+                    &range,
+                    self.reader.read_merge_operator.clone(),
+                    LazyHandle::of(&cache.lazy_handles),
+                    options.clone(),
+                    prefix.cloned(),
+                );
+                ScanRoute::Served(match scan {
+                    Ok(scan) => {
+                        DbIterator::new_resolved(range, Box::new(scan), ReadTrace::none()).await
+                    }
+                    Err(e) => Err(e.into()),
+                })
+            }
             ScanPin::Uncovered => {
                 // Why the scan uses the normal read path, if no attempt plans a mixed scan.
                 let mut reason = Fallback::Frozen;

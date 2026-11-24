@@ -24,6 +24,8 @@ pub const MIXED_SCAN_COUNT: &str = range_cache_stat_name!("mixed_scan_count");
 pub const SCAN_GAP_COUNT: &str = range_cache_stat_name!("scan_gap_count");
 /// Mixed-scan planning retries caused by a concurrent memtable freeze.
 pub const MIXED_SCAN_RETRY_COUNT: &str = range_cache_stat_name!("mixed_scan_retry_count");
+/// Cached ranges pinned lazily by snapshot and transaction scans.
+pub const LAZY_PIN_COUNT: &str = range_cache_stat_name!("lazy_pin_count");
 /// Retried attempts to pin a ready cached range. `op` is `get` or `scan`; `reason` is `too_old`
 /// or `sealed`.
 pub const PIN_RETRY_COUNT: &str = range_cache_stat_name!("pin_retry_count");
@@ -236,10 +238,12 @@ pub(crate) enum ReadCount {
     FallbackGapLoading,
     FallbackGapTooOld,
     FallbackGapSealed,
+    /// Cached range pinned lazily by a snapshot or transaction scan.
+    LazyPin,
 }
 
 /// Number of [`ReadCount`] variants.
-pub(crate) const READ_COUNTS: usize = 40;
+pub(crate) const READ_COUNTS: usize = 41;
 
 impl ReadCount {
     /// Every variant in discriminant order.
@@ -284,6 +288,7 @@ impl ReadCount {
         ReadCount::FallbackGapLoading,
         ReadCount::FallbackGapTooOld,
         ReadCount::FallbackGapSealed,
+        ReadCount::LazyPin,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -292,7 +297,10 @@ impl ReadCount {
 
     /// Returns true if this read counts as a scan rather than a get on the range.
     pub(crate) fn is_scan(self) -> bool {
-        matches!(self, ReadCount::Scan | ReadCount::MixedScan)
+        matches!(
+            self,
+            ReadCount::Scan | ReadCount::MixedScan | ReadCount::LazyPin
+        )
     }
 
     /// Maps `(op, reason)` to its fallback counter, or `None` for impossible combinations.
@@ -405,6 +413,7 @@ impl ReadCount {
             ReadCount::FallbackGapLoading => fallback_labels("gap", "loading"),
             ReadCount::FallbackGapTooOld => fallback_labels("gap", "too_old"),
             ReadCount::FallbackGapSealed => fallback_labels("gap", "sealed"),
+            ReadCount::LazyPin => (LAZY_PIN_COUNT, &[]),
         }
     }
 }

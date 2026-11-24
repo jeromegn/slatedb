@@ -288,7 +288,8 @@ thread_local! {
     static BLOCKS: RefCell<Blocks> = const { RefCell::new(Blocks(Vec::new())) };
 }
 
-/// The read bookkeeping of one cache. See the module documentation.
+/// Per-cache read bookkeeping. Clones record into the same shared counters.
+#[derive(Clone)]
 pub(crate) struct HitStats {
     shared: Arc<Shared>,
 }
