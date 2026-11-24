@@ -12,6 +12,8 @@
 //!   defer until reads pay for them or the range reaches its run limit.
 //! - **Split**: divides a range whose base exceeds `2 * range_target_bytes` in two without copying
 //!   when no flush or major merge runs for it. Splits take priority over major merges.
+//! - **Quiet merge**: joins two adjacent quiet ranges (no runs, no sealed buffers, empty active
+//!   buffer) whose bases are both below `range_target_bytes / 8` without copying file data.
 //! - **View races**: flushes and major merges run concurrently on blocking threads. If one
 //!   changes the view before the other installs, the second rebuilds its view on the new state
 //!   (up to [`VIEW_ATTEMPTS`] times) without rewriting its file.
@@ -64,6 +66,8 @@ const MAX_SPLITS: usize = 2;
 /// The ticks between two updates of the gauges of base and run files, which walk every file:
 /// about a second.
 const FILE_GAUGE_TICKS: u64 = 50;
+/// Max quiet merges requested per tick walk.
+const MAX_QUIET_MERGES: usize = 4;
 /// The most early seals that one pass asks for.
 const PRESSURE_SEALS: usize = 4;
 /// Max newest runs merged into a flush when the range is already at `max_runs`.
@@ -141,6 +145,8 @@ pub(super) struct RangeJobs {
     merging: AtomicBool,
     /// True while a split of the range runs. No flush or major merge starts meanwhile.
     splitting: AtomicBool,
+    /// True after requesting a quiet merge until rejected (merged ranges leave the index).
+    pub(super) quiet_merge_asked: AtomicBool,
     /// True while a message about the range is on its way to the task.
     notified: AtomicBool,
     /// True while the range waits in the task's flush queue, or in its merge queue. Only the task
@@ -177,6 +183,17 @@ impl RangeJobs {
         let jobs = Self::default();
         jobs.headroom
             .store(parent.headroom.load(Ordering::Relaxed), Ordering::Relaxed);
+        jobs
+    }
+
+    /// Job state for a quietly merged range: idle, zero counts, and the larger headroom.
+    pub(super) fn merged(a: &RangeJobs, b: &RangeJobs) -> Self {
+        let jobs = Self::default();
+        let headroom = a
+            .headroom
+            .load(Ordering::Relaxed)
+            .max(b.headroom.load(Ordering::Relaxed));
+        jobs.headroom.store(headroom, Ordering::Relaxed);
         jobs
     }
 
@@ -333,6 +350,25 @@ pub(super) fn major_due(
 /// base). Unpaid automatic ranges are evicted at this point.
 pub(super) fn at_run_limit(range: &CachedRange, layers: &Layers, trigger: Trigger) -> bool {
     trigger == Trigger::Runs || layers.run_share(&range.start) >= layers.base_share(&range.start).0
+}
+
+/// Returns `range`'s base chunks if it is idle, has no runs or buffered writes, and its base share
+/// is below `small` bytes.
+pub(super) fn quiet_base(range: &CachedRange, small: u64) -> Option<Chunks> {
+    let jobs = &range.jobs;
+    if jobs.flushing()
+        || jobs.merging()
+        || jobs.splitting()
+        || jobs.quiet_merge_asked.load(Ordering::Relaxed)
+    {
+        return None;
+    }
+    let layers = range.layers.load();
+    let quiet = !layers.chunks.loading()
+        && layers.runs.is_empty()
+        && layers.sealed.is_empty()
+        && layers.active.is_empty();
+    (quiet && layers.base_share(&range.start).0 < small).then(|| layers.chunks.clone())
 }
 
 /// Returns cut keys to split `range` in two when its base exceeds `2 * range_target_bytes`.
@@ -516,7 +552,7 @@ impl RangeCache {
 
     /// Merges `chunks` with `absorbed` (newest first) into a new single-chunk base at the newest
     /// absorbed run's `hi`, and installs it with the updated delta view.
-    async fn major_merge(
+    pub(super) async fn major_merge(
         self: &Arc<Self>,
         range: &Arc<CachedRange>,
         chunks: Chunks,
@@ -785,6 +821,7 @@ impl Maintainer {
                 for range in index.values() {
                     self.look(range);
                 }
+                self.merge_quiet(&index);
                 // The file and metadata gauges change with every install; the writer updates
                 // them only when the index changes.
                 self.cache.update_gauges();
@@ -843,6 +880,37 @@ impl Maintainer {
             .store(jobs.flushes.load(Ordering::Relaxed), Ordering::Relaxed);
         jobs.merge_queued.store(true, Ordering::Relaxed);
         self.merge_queue.push_back(Arc::downgrade(range));
+    }
+
+    /// Requests quiet merges for up to [`MAX_QUIET_MERGES`] adjacent pairs whose bases are both
+    /// below `range_target_bytes / 8`. Merged ranges stay below `range_target_bytes / 4`, well
+    /// below the split threshold (`2 * range_target_bytes`).
+    fn merge_quiet(&self, index: &RangeIndex) {
+        let small = self.cache.options.tuning.quiet_merge_below();
+        if small == 0 {
+            return;
+        }
+        let mut asked = 0;
+        let mut left: Option<(&Arc<CachedRange>, Chunks)> = None;
+        for range in index.values() {
+            let quiet = quiet_base(range, small);
+            if let (Some((l, l_chunks)), Some(chunks)) = (&left, &quiet) {
+                if l.end.as_ref() == Some(&range.start) && CachedRange::may_merge(l, range) {
+                    l.jobs.quiet_merge_asked.store(true, Ordering::Relaxed);
+                    range.jobs.quiet_merge_asked.store(true, Ordering::Relaxed);
+                    let rate = l.heat.last_rate() + range.heat.last_rate();
+                    self.cache
+                        .ask_quiet_merge(l, range, [l_chunks.clone(), chunks.clone()], rate);
+                    asked += 1;
+                    if asked >= MAX_QUIET_MERGES {
+                        return;
+                    }
+                    left = None;
+                    continue;
+                }
+            }
+            left = quiet.map(|chunks| (range, chunks));
+        }
     }
 
     /// The flush that `range` calls for, with its inputs: every sealed buffer, and when the range

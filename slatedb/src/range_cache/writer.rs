@@ -18,8 +18,8 @@ use super::file::RangeFile;
 use super::split::{SplitChild, SplitPlan};
 use super::stats::RemoveReason;
 use super::{
-    covering, one_chunk, uncovered, CachedRange, Chunks, Delta, DeltaView, Layers, Origin,
-    RangeCache, RangeIndex, Run,
+    covering, one_chunk, uncovered, CachedRange, Chunk, ChunkList, Chunks, Delta, DeltaView,
+    Layers, Origin, RangeCache, RangeIndex, Run,
 };
 use crate::batch_write::BatchWriterMessage;
 use crate::bytes_range::BytesRange;
@@ -84,6 +84,15 @@ pub(super) enum Request {
         plan: SplitPlan,
         reply: oneshot::Sender<bool>,
     },
+    /// Merge adjacent quiet ranges `left` and `right` into one if both remain quiet and hold
+    /// `chunks_was`. `rate` is the sum of their read rates.
+    QuietMerge {
+        left: Arc<CachedRange>,
+        right: Arc<CachedRange>,
+        chunks_was: [Chunks; 2],
+        rate: f64,
+        reply: Option<oneshot::Sender<bool>>,
+    },
     /// Seal `buffer` if it is still the active buffer of `range` and holds a version.
     Seal {
         range: Arc<CachedRange>,
@@ -119,6 +128,11 @@ impl Request {
             | Request::InstallMajor { reply, .. }
             | Request::Split { reply, .. } => {
                 let _ = reply.send(false);
+            }
+            Request::QuietMerge { reply, .. } => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(false);
+                }
             }
             Request::Seal { .. } => {}
             Request::Remove { reply, .. } => {
@@ -394,6 +408,45 @@ impl RangeCache {
             range: range.clone(),
             buffer: buffer.clone(),
         });
+    }
+
+    /// Asks the writer to merge adjacent quiet ranges `left` and `right` without waiting.
+    pub(super) fn ask_quiet_merge(
+        &self,
+        left: &Arc<CachedRange>,
+        right: &Arc<CachedRange>,
+        chunks_was: [Chunks; 2],
+        rate: f64,
+    ) {
+        self.submit(Request::QuietMerge {
+            left: left.clone(),
+            right: right.clone(),
+            chunks_was,
+            rate,
+            reply: None,
+        });
+    }
+
+    /// Requests a quiet merge of `left` and `right` and returns whether it succeeded.
+    #[cfg(test)]
+    pub(super) async fn quiet_merge(
+        &self,
+        left: &Arc<CachedRange>,
+        right: &Arc<CachedRange>,
+    ) -> bool {
+        let chunks_was = [
+            left.layers.load().chunks.clone(),
+            right.layers.load().chunks.clone(),
+        ];
+        let (reply, answer) = oneshot::channel();
+        self.submit(Request::QuietMerge {
+            left: left.clone(),
+            right: right.clone(),
+            chunks_was,
+            rate: 0.0,
+            reply: Some(reply),
+        });
+        answer.await.unwrap_or(false)
     }
 
     /// Asks the writer to remove `target`. The removal takes effect at the writer's next
@@ -679,6 +732,18 @@ impl RangeCache {
                     self.install_major_at(&range, &chunks_was, &absorbed, base, base_seq, view);
                 let _ = reply.send(installed);
             }
+            Request::QuietMerge {
+                left,
+                right,
+                chunks_was,
+                rate,
+                reply,
+            } => {
+                let merged = self.quiet_merge_at(&left, &right, &chunks_was, rate, w);
+                if let Some(reply) = reply {
+                    let _ = reply.send(merged);
+                }
+            }
             Request::Seal { range, buffer } => {
                 if self.is_indexed(&range) {
                     let layers = range.layers.load();
@@ -739,14 +804,17 @@ impl RangeCache {
                 covered_to: w,
                 end: part_end.clone(),
             };
-            let range = Arc::new(CachedRange::new(
+            let mut range = CachedRange::new(
                 part_start.clone(),
                 part_end,
                 layers,
                 origin,
                 now,
                 self.writer.take_slot(),
-            ));
+            );
+            // `splits` are ascending: a part matching one starts at a cache-chosen boundary.
+            range.cut_start = splits.binary_search(&part_start).is_ok();
+            let range = Arc::new(range);
             index.insert(part_start, range.clone());
             ranges.push(range);
         }
@@ -889,6 +957,76 @@ impl RangeCache {
             self.maintenance.notify(child);
         }
         made
+    }
+
+    /// Merges adjacent quiet ranges `left` and `right` at writer boundary `w` without copying.
+    ///
+    /// Both ranges must be indexed, adjacent, quiet (no runs, no sealed buffers, empty active
+    /// buffer, no in-flight jobs), eligible under [`CachedRange::may_merge`], and still holding
+    /// `chunks_was`. Seals both active buffers at `w` before publishing the merged range with all
+    /// chunks labeled `w` (coalescing adjacent chunks from the same file).
+    fn quiet_merge_at(
+        &self,
+        left: &Arc<CachedRange>,
+        right: &Arc<CachedRange>,
+        chunks_was: &[Chunks; 2],
+        rate: f64,
+        w: u64,
+    ) -> bool {
+        let (a, b) = (left.layers.load_full(), right.layers.load_full());
+        let quiet = |range: &CachedRange, layers: &Layers| {
+            !layers.chunks.loading()
+                && layers.runs.is_empty()
+                && layers.sealed.is_empty()
+                && layers.active.is_empty()
+                && !range.jobs.flushing()
+                && !range.jobs.merging()
+                && !range.jobs.splitting()
+        };
+        let fits = self.is_indexed(left)
+            && self.is_indexed(right)
+            && left.end.as_ref() == Some(&right.start)
+            && CachedRange::may_merge(left, right)
+            && quiet(left, &a)
+            && quiet(right, &b)
+            && a.chunks.same(&chunks_was[0])
+            && b.chunks.same(&chunks_was[1]);
+        if !fits {
+            left.jobs.quiet_merge_asked.store(false, Ordering::Relaxed);
+            right.jobs.quiet_merge_asked.store(false, Ordering::Relaxed);
+            self.stats.quiet_merges_rejected.increment(1);
+            return false;
+        }
+        a.active.sealed_at().store(w, Ordering::SeqCst);
+        b.active.sealed_at().store(w, Ordering::SeqCst);
+        let layers = Layers {
+            active: self.new_buffer(w),
+            sealed: Vec::new(),
+            runs: Vec::new(),
+            view: None,
+            chunks: merged_chunks(&a.chunks, &right.start, &b.chunks, w),
+            covered_to: w,
+            end: right.end.clone(),
+        };
+        layers.check(&left.start, self.options.tuning.max_runs);
+        let merged = Arc::new(CachedRange::merged_from(
+            left,
+            right,
+            layers,
+            rate,
+            self.now_ms(),
+            self.writer.take_slot(),
+        ));
+        let mut index = RangeIndex::clone(&self.index.load());
+        index.remove(&right.start);
+        index.insert(left.start.clone(), merged.clone());
+        self.index.store(Arc::new(index));
+        self.writer.give_back_slot(left.slot);
+        self.writer.give_back_slot(right.slot);
+        self.stats.quiet_merges.increment(1);
+        self.update_gauges();
+        self.maintenance.notify(&merged);
+        true
     }
 
     /// Installs a flushed run, removes its sealed buffers, updates `covered_to`, and swaps the
@@ -1100,6 +1238,41 @@ impl RangeCache {
         // Pairs with the fence in `submit`.
         fence(Ordering::SeqCst);
         self.refuse_queued();
+    }
+}
+
+/// Combines chunks from `left` and `right` (starting at `right_start`) labeled at `w`.
+/// Adjacent chunks backed by the same file coalesce into one chunk.
+fn merged_chunks(left: &Chunks, right_start: &Bytes, right: &Chunks, w: u64) -> Chunks {
+    let mut chunks: Vec<Chunk> = Vec::with_capacity(left.len() + right.len());
+    let mut starts: Vec<Bytes> = Vec::with_capacity(left.len() + right.len());
+    let all = left
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| (left.start(i), chunk))
+        .chain(right.iter().enumerate().map(|(i, chunk)| {
+            let start = if i == 0 {
+                Some(right_start)
+            } else {
+                right.start(i)
+            };
+            (start, chunk)
+        }));
+    for (start, chunk) in all {
+        if chunks
+            .last()
+            .is_some_and(|last| Arc::ptr_eq(&last.file, &chunk.file))
+        {
+            continue;
+        }
+        if let (Some(start), false) = (start, chunks.is_empty()) {
+            starts.push(start.clone());
+        }
+        chunks.push(Chunk::new(chunk.file.clone(), w));
+    }
+    match chunks.len() {
+        1 => Chunks::One(chunks.remove(0)),
+        _ => Chunks::Many(Arc::new(ChunkList::new(chunks, starts))),
     }
 }
 
@@ -1616,5 +1789,410 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod quiet_merge_tests {
+    use std::ops::Bound::{self, Excluded, Included, Unbounded};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+    use fail_parallel::FailPointRegistry;
+    use slatedb_common::metrics::{
+        lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder,
+    };
+
+    use crate::config::{ReadOptions, ScanOptions, TracingOptions};
+    use crate::db::Db;
+    use crate::merge_operator::{MergeOperator, MergeOperatorError};
+    use crate::object_store::memory::InMemory;
+    use crate::oracle::Oracle;
+    use crate::range_cache::stats::{
+        PIN_RETRY_COUNT, QUIET_MERGE_COUNT, QUIET_MERGE_REJECTED_COUNT, SPLIT_COUNT,
+    };
+    use crate::range_cache::{CachedRange, Chunks, RangeCache, RangeCacheOptions, MAX_RUNS_RANGE};
+
+    const PROMPT: Duration = Duration::from_secs(20);
+
+    struct Concat;
+
+    impl MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &Bytes,
+            existing_value: Option<Bytes>,
+            operand: Bytes,
+        ) -> Result<Bytes, MergeOperatorError> {
+            let mut merged = existing_value.map(|v| v.to_vec()).unwrap_or_default();
+            merged.extend_from_slice(&operand);
+            Ok(Bytes::from(merged))
+        }
+    }
+
+    struct TestDb {
+        db: Db,
+        recorder: Arc<DefaultMetricsRecorder>,
+        fp_registry: Arc<FailPointRegistry>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestDb {
+        fn cache(&self) -> &Arc<RangeCache> {
+            self.db.inner.range_cache.as_ref().unwrap()
+        }
+
+        fn range(&self, start: usize) -> Arc<CachedRange> {
+            self.cache().index.load().get(&key(start)).unwrap().clone()
+        }
+
+        fn starts(&self) -> Vec<usize> {
+            self.cache()
+                .index
+                .load()
+                .keys()
+                .map(|k| {
+                    std::str::from_utf8(k)
+                        .unwrap()
+                        .trim_start_matches("key")
+                        .parse()
+                        .unwrap_or(0)
+                })
+                .collect()
+        }
+
+        fn committed(&self) -> u64 {
+            self.db.inner.oracle.last_committed_seq()
+        }
+
+        fn metric(&self, name: &str, labels: &[(&str, &str)]) -> i64 {
+            if labels.is_empty() {
+                lookup_metric(&self.recorder, name).unwrap_or(0)
+            } else {
+                lookup_metric_with_labels(&self.recorder, name, labels).unwrap_or(0)
+            }
+        }
+
+        fn fail(&self, name: &str, action: &str) {
+            fail_parallel::cfg(self.fp_registry.clone(), name, action).unwrap();
+        }
+
+        async fn wait(&self, what: &str, done: impl Fn(&Self) -> bool) {
+            let deadline = Instant::now() + PROMPT;
+            while !done(self) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+
+        async fn split(&self, start: usize, cuts: &[usize]) -> bool {
+            let cuts = cuts.iter().map(|i| key(*i)).collect();
+            self.cache().split(&self.range(start), cuts).await.unwrap()
+        }
+
+        async fn quiet_merge(&self, left: usize, right: usize) -> bool {
+            self.cache()
+                .quiet_merge(&self.range(left), &self.range(right))
+                .await
+        }
+
+        async fn merge_above(&self, start: usize, a: usize, b: usize) -> u64 {
+            let range = self.range(start);
+            let mut i = 0;
+            while range.layers.load().runs.is_empty() {
+                let layers = range.layers.load_full();
+                if layers.sealed.is_empty() {
+                    let k = a + i % (b - a);
+                    self.db.put(key(k), value(k, 100 + i)).await.unwrap();
+                    i += 1;
+                    if !layers.active.is_empty() && i % 64 == 0 {
+                        self.cache().request_seal(&range, &layers.active);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                assert!(i < 100_000, "the range never flushed");
+            }
+            let layers = range.layers.load_full();
+            self.cache()
+                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .await
+                .unwrap();
+            let base = self.range(start).layers.load().chunks[0].base_seq;
+            assert_eq!(base, layers.runs[0].hi, "the major merge did not install");
+            base
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            let _ = fail_parallel::cfg(self.fp_registry.clone(), "range-cache-pin", "off");
+        }
+    }
+
+    async fn open(tune: impl FnOnce(&mut RangeCacheOptions)) -> TestDb {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = RangeCacheOptions::new(dir.path());
+        options.tuning.stats_fold_events = 1;
+        options.tuning.min_rebuild_delta_bytes = usize::MAX;
+        options.tuning.range_target_bytes = 0;
+        tune(&mut options);
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let db = Db::builder("range_cache_quiet_merge", Arc::new(InMemory::new()))
+            .with_range_cache(options)
+            .with_merge_operator(Arc::new(Concat))
+            .with_metrics_recorder(recorder.clone())
+            .with_fp_registry(fp_registry.clone())
+            .build()
+            .await
+            .unwrap();
+        TestDb {
+            db,
+            recorder,
+            fp_registry,
+            _dir: dir,
+        }
+    }
+
+    fn key(i: usize) -> Bytes {
+        Bytes::from(format!("key{i:05}"))
+    }
+
+    fn value(i: usize, round: usize) -> Bytes {
+        let mut v = format!("value-{i}-{round}-").into_bytes();
+        v.resize(200, b'.');
+        Bytes::from(v)
+    }
+
+    fn span(a: usize, b: usize) -> (Bound<Bytes>, Bound<Bytes>) {
+        (Included(key(a)), Excluded(key(b)))
+    }
+
+    fn normal_scan() -> ScanOptions {
+        ScanOptions::default().with_tracing_options(Some(TracingOptions::new("normal")))
+    }
+
+    async fn put_all(t: &TestDb, a: usize, b: usize) {
+        for i in a..b {
+            t.db.put(key(i), value(i, 0)).await.unwrap();
+        }
+    }
+
+    async fn mixed_writes(t: &TestDb, a: usize, b: usize, round: usize) {
+        for i in a..b {
+            match (i + round) % 4 {
+                0 => {
+                    t.db.put(key(i), value(i, round)).await.unwrap();
+                }
+                1 => {
+                    t.db.delete(key(i)).await.unwrap();
+                }
+                2 => {
+                    t.db.merge(key(i), format!("+{round}")).await.unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn assert_scan_eq(
+        reader: &crate::DbSnapshot,
+        range: (Bound<Bytes>, Bound<Bytes>),
+        label: &str,
+    ) {
+        let mut cached = reader.scan(range.clone()).await.unwrap();
+        let mut normal = reader
+            .scan_with_options(range, &normal_scan())
+            .await
+            .unwrap();
+        loop {
+            let (c, n) = (cached.next().await.unwrap(), normal.next().await.unwrap());
+            assert_eq!(c, n, "{label}");
+            if c.is_none() {
+                break;
+            }
+        }
+    }
+
+    /// A point read pinned to one side of a quiet merge retries for sequence numbers above the
+    /// merge boundary and reads the merged range.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_retry_a_read_that_pinned_a_side_of_a_quiet_merge() {
+        let t = open(|_| {}).await;
+        put_all(&t, 0, 300).await;
+        t.db.cache_range(span(100, 300)).await.unwrap();
+        assert!(t.split(100, &[200]).await);
+        t.fail("range-cache-pin", "pause");
+        let reader = {
+            let db = t.db.clone();
+            tokio::spawn(async move { db.get(key(120)).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let w = t.committed();
+        assert!(t.quiet_merge(100, 200).await);
+        t.db.put(key(120), "after").await.unwrap();
+        assert!(t.committed() > w);
+        let retries = t.metric(PIN_RETRY_COUNT, &[("op", "get"), ("reason", "sealed")]);
+        t.fail("range-cache-pin", "off");
+        assert_eq!(reader.await.unwrap(), Some(Bytes::from("after")));
+        assert!(t.metric(PIN_RETRY_COUNT, &[("op", "get"), ("reason", "sealed")]) > retries);
+        t.db.close().await.unwrap();
+    }
+
+    /// Only adjacent quiet ranges separated by a cache-chosen split merge; same-file chunks
+    /// coalesce into one chunk while distinct files produce a multi-chunk base.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_merge_only_quiet_neighbours_that_a_split_cut() {
+        let t = open(|o| o.tuning.range_seal_bytes = 4 * 1024).await;
+        put_all(&t, 0, 500).await;
+        t.db.cache_range(span(0, 100)).await.unwrap();
+        t.db.cache_range(span(100, 500)).await.unwrap();
+        assert!(t.split(100, &[200, 300, 400]).await);
+        let rejected = || t.metric(QUIET_MERGE_REJECTED_COUNT, &[]);
+        // Ranges named separately by the application stay separate.
+        assert!(!t.quiet_merge(0, 100).await);
+        assert_eq!(rejected(), 1);
+        // Active buffer or runs disqualify a range from quiet merge.
+        t.db.put(key(250), value(250, 1)).await.unwrap();
+        assert!(!t.quiet_merge(200, 300).await);
+        t.merge_above(200, 200, 300).await;
+        let range = t.range(200);
+        if !range.layers.load().active.is_empty() || !range.layers.load().runs.is_empty() {
+            assert!(!t.quiet_merge(200, 300).await);
+        }
+        // Non-adjacent ranges do not merge.
+        assert!(!t.cache().quiet_merge(&t.range(100), &t.range(300)).await);
+
+        // Quiet children sharing one file coalesce back into one chunk at `w`.
+        let before = t.db.snapshot().unwrap();
+        let file = t.range(300).layers.load().chunks[0].file.clone();
+        let merges = t.metric(QUIET_MERGE_COUNT, &[]);
+        let w = t.committed();
+        assert!(t.quiet_merge(300, 400).await);
+        assert_eq!(t.metric(QUIET_MERGE_COUNT, &[]) - merges, 1);
+        let merged = t.range(300).layers.load_full();
+        match &merged.chunks {
+            Chunks::One(chunk) => {
+                assert!(Arc::ptr_eq(&chunk.file, &file));
+                assert_eq!(chunk.base_seq, w);
+            }
+            _ => panic!("two chunks of one file were not joined"),
+        }
+        assert_eq!(merged.covered_to, w);
+        assert!(merged.runs.is_empty() && merged.sealed.is_empty());
+        assert_eq!(t.range(300).end, Some(key(500)));
+        merged.check(&key(300), *MAX_RUNS_RANGE.end());
+
+        // Quiet ranges with distinct files produce a two-chunk base.
+        let range = t.range(200);
+        let layers = range.layers.load_full();
+        if !layers.active.is_empty() {
+            t.cache().request_seal(&range, &layers.active);
+            t.wait("the flush", |t| {
+                let l = t.range(200).layers.load_full();
+                l.sealed.is_empty() && l.active.is_empty()
+            })
+            .await;
+        }
+        let layers = range.layers.load_full();
+        if !layers.runs.is_empty() {
+            t.cache()
+                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .await
+                .unwrap();
+        }
+        let w = t.committed();
+        assert!(t.quiet_merge(200, 300).await);
+        let merged = t.range(200).layers.load_full();
+        match &merged.chunks {
+            Chunks::Many(list) => {
+                assert_eq!(list.chunks.len(), 2);
+                assert_eq!(list.starts.as_ref(), &[key(300)]);
+                assert!(list.chunks.iter().all(|c| c.base_seq == w));
+            }
+            _ => panic!("ranges of two files did not make two chunks"),
+        }
+        merged.check(&key(200), *MAX_RUNS_RANGE.end());
+        let now = t.db.snapshot().unwrap();
+        mixed_writes(&t, 150, 450, 2).await;
+        for (reader, label) in [(&now, "at the merge"), (&before, "before the merge")] {
+            for (a, b) in [(150, 450), (250, 350), (290, 310)] {
+                assert_scan_eq(reader, span(a, b), label).await;
+            }
+            for i in 190..410 {
+                let cached = reader.get(key(i)).await.unwrap();
+                let want = reader
+                    .get_with_options(
+                        key(i),
+                        &ReadOptions::default()
+                            .with_tracing_options(Some(TracingOptions::new("normal"))),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(cached, want, "{label}: key {i}");
+            }
+        }
+        // Splitting the two-chunk range then major-merging one child restores a single chunk.
+        assert!(t.split(200, &[250]).await);
+        t.merge_above(250, 250, 400).await;
+        assert!(matches!(t.range(250).layers.load().chunks, Chunks::One(_)));
+        let latest = t.db.snapshot().unwrap();
+        assert_scan_eq(&latest, span(150, 450), "after the split").await;
+        t.db.close().await.unwrap();
+    }
+
+    /// Maintenance merges quiet neighbours below `range_target_bytes / 8` without triggering
+    /// another split.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_merge_small_quiet_neighbours_and_keep_them_merged() {
+        let t = open(|o| {
+            o.tuning.range_target_bytes = 64 * 1024;
+            o.tuning.range_seal_bytes = 4 * 1024;
+        })
+        .await;
+        put_all(&t, 0, 1600).await;
+        t.db.cache_range(span(0, 1600)).await.unwrap();
+        t.wait("the load", |t| {
+            !t.db.cached_ranges().iter().any(|r| r.loading)
+        })
+        .await;
+        let starts = t.starts();
+        assert!(starts.len() >= 3, "the load was not split: {starts:?}");
+        let (a, b, c) = (starts[0], starts[1], starts[2]);
+        for i in a..c {
+            if i % 50 != 0 {
+                t.db.delete(key(i)).await.unwrap();
+            }
+        }
+        for (start, end) in [(a, b), (b, c)] {
+            let range = t.range(start);
+            let layers = range.layers.load_full();
+            if !layers.active.is_empty() {
+                t.cache().request_seal(&range, &layers.active);
+            }
+            t.wait("the flush", |t| {
+                let l = t.range(start).layers.load_full();
+                l.sealed.is_empty() && l.active.is_empty()
+            })
+            .await;
+            let layers = range.layers.load_full();
+            t.cache()
+                .major_merge(&range, layers.chunks.clone(), layers.runs.clone())
+                .await
+                .unwrap();
+            let bytes = range.layers.load().base_share(&key(start)).0;
+            assert!(bytes < 8 * 1024, "{start}..{end}: {bytes} bytes");
+        }
+        let splits = t.metric(SPLIT_COUNT, &[("when", "maintenance")]);
+        t.wait("the quiet merge", |t| t.metric(QUIET_MERGE_COUNT, &[]) >= 1)
+            .await;
+        assert!(!t.starts().contains(&b));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(t.starts().contains(&a) && !t.starts().contains(&b));
+        assert_eq!(t.metric(SPLIT_COUNT, &[("when", "maintenance")]), splits);
+        let snapshot = t.db.snapshot().unwrap();
+        assert_scan_eq(&snapshot, (Unbounded, Unbounded), "after the merge").await;
+        t.db.close().await.unwrap();
     }
 }

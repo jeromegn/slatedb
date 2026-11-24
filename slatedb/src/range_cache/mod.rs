@@ -148,8 +148,9 @@ pub struct RangeCacheTuning {
     /// disables buffer filters.
     pub buffer_filter_bytes: usize,
     /// Target size per cached range. `cache_range` cuts larger requests at sorted-run block
-    /// boundaries, and bases exceeding twice this size split without copying on attach or after
-    /// major merges. `0` disables splitting.
+    /// boundaries, bases exceeding twice this size split without copying, and adjacent quiet
+    /// ranges below an eighth of this size merge without copying. `0` disables splits and quiet
+    /// merges.
     pub range_target_bytes: u64,
     /// Heap metadata budget for fence indexes, filters, delta views, and layer sets. `None` uses
     /// `max(max_disk_bytes / 16, 64 MiB)`.
@@ -234,6 +235,11 @@ impl RangeCacheTuning {
             seal_bytes: self.range_seal_bytes as u64,
             filter_from: u64::try_from(self.buffer_filter_bytes).unwrap_or(u64::MAX),
         }
+    }
+
+    /// Base size below which adjacent quiet ranges merge (`0` disables quiet merges).
+    fn quiet_merge_below(&self) -> u64 {
+        self.range_target_bytes / 8
     }
 
     fn meta_limit(&self, max_disk_bytes: u64) -> u64 {
@@ -379,8 +385,8 @@ pub(crate) enum Chunks {
     Loading,
     /// Single chunk covering the entire range.
     One(Chunk),
-    /// Multiple chunks tiling the range in key order.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Multiple chunks tiling the range in key order (created by quiet merges across distinct
+    /// base files).
     Many(Arc<ChunkList>),
 }
 
@@ -825,6 +831,20 @@ impl Heat {
         }
     }
 
+    /// Combines heat for a quiet merge: summed `rate`, newer last access, zero new reads.
+    fn merged(a: &Heat, b: &Heat, rate: f64, now_ms: i64) -> Self {
+        let hits = RangeHits::default();
+        hits.set_last_access(a.hits.last_access().max(b.hits.last_access()));
+        Self {
+            hits: Arc::new(hits),
+            rate: Mutex::new(HeatRate {
+                reads: 0,
+                at_ms: now_ms,
+                rate,
+            }),
+        }
+    }
+
     /// The decayed read rate as of the last time anyone computed it.
     fn last_rate(&self) -> f64 {
         self.rate.lock().rate
@@ -859,6 +879,9 @@ struct CachedRange {
     slot: u32,
     /// True if automatic promotion cached this range.
     auto: bool,
+    /// True if this range starts at a cache-chosen split key. Explicit ranges merge quietly only
+    /// across cache-chosen boundaries.
+    cut_start: bool,
     /// Folded read count, last access clock, and decayed read rate.
     heat: Heat,
     /// Estimated normal-path cost per read in nanoseconds (`0` for explicit ranges).
@@ -895,6 +918,7 @@ impl CachedRange {
             layers: ArcSwap::from_pointee(layers),
             slot,
             auto,
+            cut_start: false,
             heat: Heat::new(rate, now_ms),
             read_cost_ns,
             reads_carried: 0,
@@ -919,12 +943,14 @@ impl CachedRange {
         slot: u32,
     ) -> Self {
         let reads_carried = (parent.reads_since_build() as f64 * inherited.share).round() as u64;
+        let cut_start = start != parent.start || parent.cut_start;
         Self {
             start,
             end,
             layers: ArcSwap::from_pointee(layers),
             slot,
             auto: parent.auto,
+            cut_start,
             heat: parent
                 .heat
                 .split(inherited.rate * inherited.share, inherited.now_ms),
@@ -936,6 +962,39 @@ impl CachedRange {
             )),
             jobs: maintain::RangeJobs::inherit(&parent.jobs),
         }
+    }
+
+    /// Creates a range from quietly merging adjacent ranges `left` and `right`, preserving their
+    /// origin, combined read history, newer timestamps, and larger headroom.
+    fn merged_from(
+        left: &CachedRange,
+        right: &CachedRange,
+        layers: Layers,
+        rate: f64,
+        now_ms: i64,
+        slot: u32,
+    ) -> Self {
+        let last_write = |r: &CachedRange| r.last_write_seq.0.load(Ordering::Acquire);
+        Self {
+            start: left.start.clone(),
+            end: right.end.clone(),
+            layers: ArcSwap::from_pointee(layers),
+            slot,
+            auto: left.auto,
+            cut_start: left.cut_start,
+            heat: Heat::merged(&left.heat, &right.heat, rate, now_ms),
+            read_cost_ns: left.read_cost_ns.max(right.read_cost_ns),
+            reads_carried: left.reads_since_build() + right.reads_since_build(),
+            reads_at_build: AtomicU64::new(0),
+            last_write_seq: Padded(AtomicU64::new(last_write(left).max(last_write(right)))),
+            jobs: maintain::RangeJobs::merged(&left.jobs, &right.jobs),
+        }
+    }
+
+    /// Returns true if two adjacent ranges may merge quietly: both automatic, or both explicit
+    /// separated by a cache-chosen split boundary.
+    fn may_merge(left: &CachedRange, right: &CachedRange) -> bool {
+        left.auto == right.auto && (right.auto || right.cut_start)
     }
 
     /// The reads that the range's base served since it was written: since its load or its last

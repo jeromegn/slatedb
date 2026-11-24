@@ -62,6 +62,10 @@ pub const SPLIT_COUNT: &str = range_cache_stat_name!("split_count");
 pub const SPLIT_RANGE_COUNT: &str = range_cache_stat_name!("split_range_count");
 /// Splits rejected because the range state changed before install.
 pub const SPLIT_REJECTED_COUNT: &str = range_cache_stat_name!("split_rejected_count");
+/// Merges of two adjacent quiet ranges into one without copying file data.
+pub const QUIET_MERGE_COUNT: &str = range_cache_stat_name!("quiet_merge_count");
+/// Quiet merges rejected because either range changed before install.
+pub const QUIET_MERGE_REJECTED_COUNT: &str = range_cache_stat_name!("quiet_merge_rejected_count");
 /// Ranges removed from the cache. `reason` is `evicted`, `explicit`, `expiring_write`, `error`,
 /// `closed`, `not_worth_it`, or `overflow`.
 pub const REMOVE_COUNT: &str = range_cache_stat_name!("remove_count");
@@ -536,6 +540,8 @@ pub(crate) struct RangeCacheStats {
     pub(crate) splits_attach: Arc<dyn CounterFn>,
     pub(crate) split_ranges: Arc<dyn CounterFn>,
     pub(crate) splits_rejected: Arc<dyn CounterFn>,
+    pub(crate) quiet_merges: Arc<dyn CounterFn>,
+    pub(crate) quiet_merges_rejected: Arc<dyn CounterFn>,
     removed_evicted: Arc<dyn CounterFn>,
     removed_explicit: Arc<dyn CounterFn>,
     removed_expiring_write: Arc<dyn CounterFn>,
@@ -574,6 +580,8 @@ impl RangeCacheStats {
             splits_attach: labeled(SPLIT_COUNT, "when", "attach"),
             split_ranges: recorder.counter(SPLIT_RANGE_COUNT).register(),
             splits_rejected: recorder.counter(SPLIT_REJECTED_COUNT).register(),
+            quiet_merges: recorder.counter(QUIET_MERGE_COUNT).register(),
+            quiet_merges_rejected: recorder.counter(QUIET_MERGE_REJECTED_COUNT).register(),
             removed_evicted: removed("evicted"),
             removed_explicit: removed("explicit"),
             removed_expiring_write: removed("expiring_write"),
