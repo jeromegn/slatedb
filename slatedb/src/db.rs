@@ -134,6 +134,7 @@ impl DbInner {
         merge_operator: Option<MergeOperatorType>,
         status_manager: Arc<DbStatusManager>,
         segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+        conflict_window_commits: usize,
     ) -> Result<Self, SlateDBError> {
         // both last_seq and last_committed_seq will be updated after WAL replay.
         let last_l0_seq = manifest.value.core.last_l0_seq;
@@ -170,7 +171,11 @@ impl DbInner {
             merge_operator.clone(),
         );
 
-        let txn_manager = Arc::new(TransactionManager::new(oracle.clone(), rand.clone()));
+        let txn_manager = Arc::new(TransactionManager::with_conflict_window(
+            oracle.clone(),
+            rand.clone(),
+            conflict_window_commits,
+        ));
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
         let wal_observer = DbWalObserver::new(wal_observer, oracle.clone(), status_manager.clone());
 
@@ -1848,6 +1853,55 @@ impl Db {
             isolation_level,
         );
         Ok(txn)
+    }
+
+    /// Begin a write-only transaction that started at `started_seq`, an earlier sequence
+    /// number than the last committed one, such as the snapshot that a transaction read on
+    /// another node before handing its writes to this one.
+    ///
+    /// The commit checks the transaction's writes, and its reads under
+    /// [`IsolationLevel::SerializableSnapshot`] or when marked with
+    /// [`DbTransaction::mark_read`], [`DbTransaction::mark_read_masked`] and
+    /// [`DbTransaction::mark_read_range`], against every commit after `started_seq`, as if
+    /// the transaction had been begun with [`Db::begin`] then. The reads cannot be made here:
+    /// [`DbTransaction::get`] and [`DbTransaction::scan`] and their variants fail with
+    /// [`crate::ErrorKind::Invalid`], and the transaction does not keep compaction from
+    /// dropping the versions visible at `started_seq`. It does keep the commits after
+    /// `started_seq` in the conflict window until it ends.
+    ///
+    /// The conflict window must still hold those commits: it keeps up to
+    /// [`DbBuilder::with_conflict_window_commits`] recent commits, and every commit after
+    /// the start of an active transaction.
+    ///
+    /// ## Errors
+    /// - [`crate::ErrorKind::Transaction`] if `started_seq` is before
+    ///   [`Db::conflict_window_floor_seq`]: some of the commits after it have left the
+    ///   window, so the commit could miss a conflict.
+    /// - [`crate::ErrorKind::Invalid`] if `started_seq` is after the last committed
+    ///   sequence number.
+    ///
+    /// [`DbBuilder::with_conflict_window_commits`]: crate::DbBuilder::with_conflict_window_commits
+    pub fn begin_commit_at_seq(
+        &self,
+        isolation_level: IsolationLevel,
+        started_seq: u64,
+    ) -> Result<DbTransaction, crate::Error> {
+        self.inner.check_closed()?;
+        let txn = DbTransaction::new_commit_at_seq(
+            self.inner.clone(),
+            self.inner.txn_manager.clone(),
+            isolation_level,
+            started_seq,
+        )?;
+        Ok(txn)
+    }
+
+    /// The oldest sequence number that [`Db::begin_commit_at_seq`] accepts: every commit
+    /// after it is still in the transaction conflict window. It is at least the last
+    /// sequence number recovered when the database was opened, and rises as commits leave
+    /// the window.
+    pub fn conflict_window_floor_seq(&self) -> u64 {
+        self.inner.txn_manager.window_floor_seq()
     }
 
     /// Resolve an object store from a URL.

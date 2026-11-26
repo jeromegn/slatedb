@@ -455,6 +455,7 @@ mod tests {
                 None,
                 Arc::new(status_manager),
                 segment_extractor,
+                0,
             )
             .await
             .unwrap(),
