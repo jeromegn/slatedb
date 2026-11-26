@@ -303,6 +303,17 @@ pub(crate) enum SlateDBError {
     #[error("transaction conflict")]
     TransactionConflict,
 
+    #[error("reads are disabled on a transaction started at an explicit sequence number")]
+    TransactionReadsDisabled,
+
+    #[error(
+        "transaction start sequence number exceeds last committed sequence number. started_seq=`{started_seq}`, last_committed_seq=`{last_committed_seq}`"
+    )]
+    TransactionStartSeqAfterLatest {
+        started_seq: u64,
+        last_committed_seq: u64,
+    },
+
     #[error("iterator not initialized")]
     IteratorNotInitialized,
 
@@ -812,6 +823,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidSequenceOrder { .. } => Error::invalid(msg),
             SlateDBError::InvalidEnvironmentVariable { .. } => Error::invalid(msg),
             SlateDBError::InvalidSequenceNumber { .. } => Error::invalid(msg),
+            SlateDBError::TransactionReadsDisabled => Error::invalid(msg),
+            SlateDBError::TransactionStartSeqAfterLatest { .. } => Error::invalid(msg),
             SlateDBError::EmptyBatch => Error::invalid(msg),
 
             // Data errors

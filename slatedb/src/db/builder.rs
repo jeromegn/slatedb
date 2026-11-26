@@ -202,6 +202,7 @@ pub struct DbBuilder<P: Into<Path>> {
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
     epoch_claim: EpochClaim,
     row_cache: Option<Arc<dyn RowCache>>,
+    conflict_window_commits: usize,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -236,6 +237,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             wal_writer_init: None,
             epoch_claim: EpochClaim::default(),
             row_cache: None,
+            conflict_window_commits: 0,
         }
     }
 
@@ -245,6 +247,25 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// [`crate::CloseReason::Fenced`]. Compactor epoch changes do not cause a claim to fail.
     pub fn with_epoch_claim(mut self, epoch_claim: EpochClaim) -> Self {
         self.epoch_claim = epoch_claim;
+        self
+    }
+
+    /// Keeps up to `max_commits` of the most recent commits in the transaction conflict
+    /// window, even when no transaction is active, so that [`Db::begin_commit_at_seq`] can
+    /// begin a transaction at an earlier sequence number, such as the snapshot that a
+    /// transaction read on another node, and check its commit against every commit since.
+    ///
+    /// A sequence number before the oldest commit still in the window (see
+    /// [`Db::conflict_window_floor_seq`]) is refused. The window also keeps every commit
+    /// after the start of an active transaction, beyond `max_commits`, as it always does.
+    /// The commits recovered at open are never in the window: a transaction begun at an
+    /// earlier sequence number than the last of them is refused.
+    ///
+    /// Each retained commit keeps its written keys in memory. The default, `0`, keeps no
+    /// extra commits: the window drains when the last active transaction ends, and
+    /// [`Db::begin_commit_at_seq`] accepts only a sequence number after its last drain.
+    pub fn with_conflict_window_commits(mut self, max_commits: usize) -> Self {
+        self.conflict_window_commits = max_commits;
         self
     }
 
@@ -744,6 +765,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 status_manager,
                 self.segment_extractor.clone(),
                 self.row_cache,
+                self.conflict_window_commits,
             )
             .await?,
         );
@@ -890,6 +912,13 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Replay WAL
         inner.replay_wal(replay_iterator).await?;
+        // The conflict window holds none of the recovered commits: a transaction begun
+        // before the newest of them could miss a conflict with it.
+        inner
+            .txn_manager
+            .set_window_floor_seq(crate::oracle::Oracle::last_committed_seq(
+                inner.oracle.as_ref(),
+            ));
 
         let db = Db {
             inner,

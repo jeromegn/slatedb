@@ -1,5 +1,6 @@
 use crate::bytes_range::BytesRange;
 use crate::db_transaction::ReadSet;
+use crate::error::SlateDBError;
 use crate::oracle::{DbOracle, Oracle};
 use crate::utils::IdGenerator;
 use bytes::Bytes;
@@ -299,6 +300,10 @@ struct TransactionManagerInner {
     /// - Non-transactional writes are modeled as single-op transactions with `started_seq ==
     ///   committed_seq` and follow the same GC rule.
     /// - If there are no active transactions, this deque can be fully drained.
+    /// - With a `conflict_window_commits` above zero, the newest `conflict_window_commits`
+    ///   entries are kept even when no active transaction needs them, so that a transaction
+    ///   begun at an earlier sequence number ([`TransactionManager::new_transaction_at_seq`])
+    ///   can still be checked against them.
     recent_committed_txns: VecDeque<TransactionState>,
     /// The started sequence numbers that flushes and compaction retain what they see of, by
     /// transaction id: a transaction's, from its start until it ends, or until the last
@@ -306,22 +311,101 @@ struct TransactionManagerInner {
     retained: HashMap<Uuid, u64>,
     /// Writes of `recent_committed_txns` indexed by key for conflict checks.
     window_writes: WindowWrites,
+    /// Whether `recent_committed_txns` is ordered by committed sequence number, as it is
+    /// when commits are tracked in order. Eviction from a bounded window then only looks at
+    /// its front.
+    window_sorted: bool,
+    /// How many of the newest commits the window keeps although no active transaction needs
+    /// them. Zero keeps none: the window drains when the last active transaction ends.
+    conflict_window_commits: usize,
+    /// The newest committed sequence number that may have left the window, or that this
+    /// manager never saw (the commits recovered at open). Every commit with a sequence
+    /// number above it is in `recent_committed_txns` and `window_writes`, so a transaction
+    /// that started at or after it can be checked; one that started before it conflicts.
+    window_floor_seq: u64,
     /// The oracle for tracking the last committed sequence number.
     oracle: Arc<DbOracle>,
 }
 
 impl TransactionManager {
+    #[cfg(test)]
     pub(crate) fn new(oracle: Arc<DbOracle>, db_rand: Arc<DbRand>) -> Self {
+        Self::with_conflict_window(oracle, db_rand, 0)
+    }
+
+    /// A manager whose window keeps the newest `conflict_window_commits` commits although
+    /// no active transaction needs them (see [`Self::new_transaction_at_seq`]).
+    pub(crate) fn with_conflict_window(
+        oracle: Arc<DbOracle>,
+        db_rand: Arc<DbRand>,
+        conflict_window_commits: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(TransactionManagerInner {
                 active_txns: HashMap::new(),
                 recent_committed_txns: VecDeque::new(),
                 retained: HashMap::new(),
                 window_writes: WindowWrites::default(),
+                window_sorted: true,
+                conflict_window_commits,
+                window_floor_seq: 0,
                 oracle,
             })),
             db_rand,
         }
+    }
+
+    /// Raises the window floor to `seq` if it is below: the commits at or before `seq` are
+    /// not all in the window, so a transaction that started before `seq` conflicts. Called
+    /// after the WAL replay at open with the newest recovered commit, which the window never
+    /// saw.
+    pub(crate) fn set_window_floor_seq(&self, seq: u64) {
+        let mut inner = self.inner.write();
+        inner.window_floor_seq = inner.window_floor_seq.max(seq);
+    }
+
+    /// The window floor: the oldest sequence number that a transaction begun with
+    /// [`Self::new_transaction_at_seq`] may start at.
+    pub(crate) fn window_floor_seq(&self) -> u64 {
+        self.inner.read().window_floor_seq
+    }
+
+    /// Register a transaction that started at `started_seq`, an earlier sequence number than
+    /// the last committed one, such as the snapshot that a transaction read on another node.
+    /// Its commit is checked against every commit after `started_seq`, which the window must
+    /// therefore still hold: it holds every commit after the window floor, and the
+    /// transaction keeps those it needs in the window until it ends. It does not hold back
+    /// compaction, as it cannot read at `started_seq` (see [`Self::min_active_seq`]).
+    ///
+    /// Fails with [`SlateDBError::TransactionStartSeqAfterLatest`] if `started_seq` is after the
+    /// last committed sequence number, and with [`SlateDBError::TransactionConflict`] if it is
+    /// before the window floor, as some of the commits after it may have left the window.
+    pub(crate) fn new_transaction_at_seq(&self, started_seq: u64) -> Result<Uuid, SlateDBError> {
+        let txn_id = self.db_rand.rng().gen_uuid();
+        let mut inner = self.inner.write();
+        let last_committed = inner.oracle.last_committed_seq();
+        if started_seq > last_committed {
+            return Err(SlateDBError::TransactionStartSeqAfterLatest {
+                started_seq,
+                last_committed_seq: last_committed,
+            });
+        }
+        if started_seq < inner.window_floor_seq {
+            return Err(SlateDBError::TransactionConflict);
+        }
+        inner.active_txns.insert(
+            txn_id,
+            TransactionState {
+                started_seq,
+                committed_seq: None,
+                write_keys: WriteKeys::default(),
+                write_since: HashMap::new(),
+                write_recompute: HashSet::new(),
+                read_keys: HashSet::new(),
+                read_ranges: Vec::new(),
+            },
+        );
+        Ok(txn_id)
     }
 
     /// Register a read-write transaction state.
@@ -500,6 +584,12 @@ impl TransactionManager {
             Some(txn_state) => txn_state,
         };
 
+        // Some of the commits after a start before the window floor may have left the
+        // window, so the checks below could miss a conflict with them.
+        if txn_state.started_seq < inner.window_floor_seq {
+            return true;
+        }
+
         // both SI and SSI need to check write-write conflicts
         let ww_conflict = inner.has_write_write_conflict_since(
             &txn_state.write_keys,
@@ -608,6 +698,9 @@ impl TransactionManager {
     ///
     /// The manifest writer samples this value for `recent_snapshot_min_seq`
     /// before each manifest write.
+    ///
+    /// Transactions begun with [`Self::new_transaction_at_seq`] do not count: they cannot
+    /// read, so compaction need not retain the versions visible at their start.
     pub(crate) fn min_active_seq(&self) -> Option<u64> {
         let inner = self.inner.read();
         inner.retained.values().copied().min()
@@ -617,13 +710,14 @@ impl TransactionManager {
 impl TransactionManagerInner {
     fn track_recent_committed_state(&mut self, txn_state: TransactionState) {
         self.window_writes.insert(&txn_state);
+        let back = self.recent_committed_txns.back();
+        if back.is_some_and(|back| txn_state.committed_seq < back.committed_seq) {
+            self.window_sorted = false;
+        }
         self.recent_committed_txns.push_back(txn_state);
 
-        if self.min_conflict_check_seq().is_none() {
-            // No active write transactions remain, so there is nobody left that can
-            // conflict with this committed state or any older committed state.
-            self.recent_committed_txns.clear();
-            self.window_writes.clear();
+        if self.conflict_window_commits > 0 || self.min_conflict_check_seq().is_none() {
+            self.recycle_recent_committed_txns();
         }
     }
 
@@ -634,6 +728,12 @@ impl TransactionManagerInner {
         for txn in &self.recent_committed_txns {
             self.window_writes.insert(txn);
         }
+        let seqs: Vec<_> = self
+            .recent_committed_txns
+            .iter()
+            .map(|txn| txn.committed_seq)
+            .collect();
+        self.window_sorted = seqs.windows(2).all(|pair| pair[0] <= pair[1]);
     }
 
     /// The min started_seq of all active transactions, this seq is useful to garbage
@@ -645,7 +745,86 @@ impl TransactionManagerInner {
             .min()
     }
 
+    /// Drops the commits that the window no longer needs, raising the window floor to the
+    /// newest one dropped. Without a `conflict_window_commits`, those are the commits before
+    /// the oldest active transaction started, or all of them if none is active. With one,
+    /// the oldest commits beyond the newest `conflict_window_commits`, as long as no active
+    /// transaction started before them; and then every commit at or before the new floor, so
+    /// that the window holds exactly the commits after it.
     fn recycle_recent_committed_txns(&mut self) {
+        if self.conflict_window_commits > 0 {
+            self.evict_beyond_conflict_window();
+        } else {
+            self.drain_unneeded_committed_txns();
+        }
+        if self.recent_committed_txns.is_empty() {
+            self.window_sorted = true;
+        }
+    }
+
+    fn evict_beyond_conflict_window(&mut self) {
+        let min_conflict_seq = self.min_conflict_check_seq();
+        let mut evicted = false;
+        while self.recent_committed_txns.len() > self.conflict_window_commits {
+            let Some(front_seq) = self
+                .recent_committed_txns
+                .front()
+                .map(|txn| txn.committed_seq)
+            else {
+                break;
+            };
+            let Some(front_seq) = front_seq else {
+                warn!("Found transaction with committed_seq = None, this may cause memory leaks");
+                break;
+            };
+            if min_conflict_seq.is_some_and(|min_seq| front_seq >= min_seq) {
+                break;
+            }
+            let txn = self
+                .recent_committed_txns
+                .pop_front()
+                .expect("the window has a front");
+            self.window_floor_seq = self.window_floor_seq.max(front_seq);
+            self.window_writes
+                .remove_before(&txn, self.window_floor_seq.saturating_add(1));
+            evicted = true;
+        }
+        if !evicted {
+            return;
+        }
+        // Each eviction took the commits at or before the floor of the keys it wrote out
+        // of `window_writes`, so every commit at or before the floor leaves the window too:
+        // in a sorted window they are at its front (commits at the sequence number of the
+        // last one evicted), and anywhere in one tracked out of order.
+        let floor = self.window_floor_seq;
+        let remove_cutoff = floor.saturating_add(1);
+        let at_or_before_floor =
+            |txn: &TransactionState| txn.committed_seq.is_some_and(|s| s <= floor);
+        if self.window_sorted {
+            while self
+                .recent_committed_txns
+                .front()
+                .is_some_and(at_or_before_floor)
+            {
+                let txn = self
+                    .recent_committed_txns
+                    .pop_front()
+                    .expect("the window has a front");
+                self.window_writes.remove_before(&txn, remove_cutoff);
+            }
+        } else {
+            let window_writes = &mut self.window_writes;
+            self.recent_committed_txns.retain(|txn| {
+                let evict = at_or_before_floor(txn);
+                if evict {
+                    window_writes.remove_before(txn, remove_cutoff);
+                }
+                !evict
+            });
+        }
+    }
+
+    fn drain_unneeded_committed_txns(&mut self) {
         let min_conflict_seq = self.min_conflict_check_seq();
         if let Some(min_seq) = min_conflict_seq {
             // Remove transactions that are no longer needed for conflict checking.
@@ -653,6 +832,7 @@ impl TransactionManagerInner {
             // have started_seq strictly greater than the transaction's committed_seq.
             // This means we keep transactions where committed_seq >= min_seq.
             let window_writes = &mut self.window_writes;
+            let floor = &mut self.window_floor_seq;
             self.recent_committed_txns.retain(|txn| {
                 let keep = if let Some(committed_seq) = txn.committed_seq {
                     committed_seq >= min_seq
@@ -665,11 +845,20 @@ impl TransactionManagerInner {
                 };
                 if !keep {
                     window_writes.remove_before(txn, min_seq);
+                    *floor = (*floor).max(txn.committed_seq.unwrap_or_default());
                 }
                 keep
             });
         } else {
             // No active transactions, can drain the entire deque
+            let newest = self
+                .recent_committed_txns
+                .iter()
+                .filter_map(|txn| txn.committed_seq)
+                .max();
+            if let Some(newest) = newest {
+                self.window_floor_seq = self.window_floor_seq.max(newest);
+            }
             self.recent_committed_txns.clear();
             self.window_writes.clear();
         }
@@ -898,10 +1087,15 @@ mod tests {
     }
 
     fn create_transaction_manager() -> TransactionManager {
+        create_bounded_transaction_manager(0)
+    }
+
+    /// A manager whose window keeps the newest `conflict_window_commits` commits.
+    fn create_bounded_transaction_manager(conflict_window_commits: usize) -> TransactionManager {
         let db_rand = Arc::new(DbRand::new(0));
         let status_reporter = DbStatusManager::new(0);
         let oracle = Arc::new(DbOracle::new(0, 0, 0, Arc::new(status_reporter)));
-        TransactionManager::new(oracle, db_rand)
+        TransactionManager::with_conflict_window(oracle, db_rand, conflict_window_commits)
     }
 
     #[test]
@@ -2831,14 +3025,19 @@ mod tests {
     /// A small scenario of the differential test: random tracking calls on a window of a
     /// few transactions, with commits out of order and windows set by hand, and
     /// `window_writes` compared with the window after every change.
-    fn diff_small_scenario(base_seed: u64, scenario: u64, counts: &mut DiffCounts) {
+    fn diff_small_scenario(
+        base_seed: u64,
+        scenario: u64,
+        conflict_window_commits: usize,
+        counts: &mut DiffCounts,
+    ) {
         const STEPS: usize = 150;
         let seed = base_seed.wrapping_add(scenario);
         let db_rand = DbRand::new(seed);
         let mut rng = db_rand.rng();
         let rng = &mut *rng;
         let universe = DiffUniverse::small();
-        let txn_manager = create_transaction_manager();
+        let txn_manager = create_bounded_transaction_manager(conflict_window_commits);
         let mut active: Vec<Uuid> = Vec::new();
         let mut next_id = 0u128;
         let mut seq = 10u64;
@@ -3043,13 +3242,14 @@ mod tests {
         base_seed: u64,
         scenario: u64,
         sizes: std::ops::RangeInclusive<usize>,
+        conflict_window_commits: usize,
         counts: &mut DiffCounts,
     ) {
         let db_rand = DbRand::new(base_seed.wrapping_add(scenario));
         let mut rng = db_rand.rng();
         let rng = &mut *rng;
         let mut run = DiffRun {
-            txn_manager: create_transaction_manager(),
+            txn_manager: create_bounded_transaction_manager(conflict_window_commits),
             universe: DiffUniverse::large(),
             seq: 10,
             next_id: 0,
@@ -3118,11 +3318,11 @@ mod tests {
         };
         let mut small = DiffCounts::default();
         for scenario in 0..SMALL_SCENARIOS {
-            diff_small_scenario(base_seed, scenario, &mut small);
+            diff_small_scenario(base_seed, scenario, 0, &mut small);
         }
         let mut large = DiffCounts::default();
         for (n, sizes) in LARGE_SIZES.into_iter().enumerate() {
-            diff_large_scenario(base_seed, SMALL_SCENARIOS + n as u64, sizes, &mut large);
+            diff_large_scenario(base_seed, SMALL_SCENARIOS + n as u64, sizes, 0, &mut large);
         }
         println!("TXN_INDEX_SEED={base_seed}: small windows: {small}; large windows: {large}");
         small.assert_both_outcomes("small windows");
@@ -3167,5 +3367,305 @@ mod tests {
             assert!(inner.window_writes.0.is_empty());
         }
         txn_manager.drop_txn(&last);
+    }
+
+    /// The differential test of [`test_window_writes_checks_match_window_walk`] on bounded
+    /// windows, which evict the oldest commits beyond the bound, including out of order.
+    #[test]
+    fn test_bounded_window_writes_checks_match_window_walk() {
+        const SMALL_SCENARIOS: u64 = 300;
+        let base_seed: u64 = match std::env::var("TXN_INDEX_SEED") {
+            Ok(seed) => seed.parse().expect("TXN_INDEX_SEED is a u64"),
+            Err(_) => rand::random(),
+        };
+        for (n, window) in [1usize, 3, 8, 64].into_iter().enumerate() {
+            let offset = 10_000 * n as u64;
+            let mut small = DiffCounts::default();
+            for scenario in 0..SMALL_SCENARIOS {
+                diff_small_scenario(base_seed, offset + scenario, window, &mut small);
+            }
+            let mut large = DiffCounts::default();
+            diff_large_scenario(
+                base_seed,
+                offset + SMALL_SCENARIOS,
+                300..=700,
+                window,
+                &mut large,
+            );
+            println!(
+                "TXN_INDEX_SEED={base_seed}, window {window}: small windows: {small}; \
+                 large windows: {large}"
+            );
+            small.assert_both_outcomes("small bounded windows");
+            large.assert_both_outcomes("large bounded windows");
+        }
+    }
+
+    /// Commits `keys` as a write batch at the next sequence number of the oracle.
+    fn commit_batch(txn_manager: &TransactionManager, keys: &[&'static str]) -> u64 {
+        let seq = txn_manager.inner.read().oracle.last_committed_seq() + 1;
+        let keys: HashSet<Bytes> = keys
+            .iter()
+            .map(|key| Bytes::from_static(key.as_bytes()))
+            .collect();
+        txn_manager.track_recent_committed_write_batch(&keys, seq);
+        seq
+    }
+
+    fn window_seqs(txn_manager: &TransactionManager) -> Vec<u64> {
+        let inner = txn_manager.inner.read();
+        inner
+            .recent_committed_txns
+            .iter()
+            .map(|txn| txn.committed_seq.expect("committed"))
+            .collect()
+    }
+
+    #[test]
+    fn test_bounded_window_retains_commits_without_active_txns() {
+        let txn_manager = create_bounded_transaction_manager(4);
+        for _ in 0..3 {
+            commit_batch(&txn_manager, &["a"]);
+        }
+        assert_eq!(window_seqs(&txn_manager), vec![1, 2, 3]);
+        assert_eq!(txn_manager.window_floor_seq(), 0);
+        commit_batch(&txn_manager, &["b"]);
+        assert_eq!(window_seqs(&txn_manager), vec![1, 2, 3, 4]);
+        assert_eq!(txn_manager.window_floor_seq(), 0);
+        assert_window_writes_match(&txn_manager.inner.read(), "retained");
+
+        // A historical transaction from the floor sees the retained commits.
+        let txn = txn_manager
+            .new_transaction_at_seq(0)
+            .expect("within window");
+        txn_manager.track_write_keys(&txn, &[Bytes::from_static(b"b")].into());
+        assert!(txn_manager.check_has_conflict(&txn));
+        txn_manager.drop_txn(&txn);
+        assert_eq!(window_seqs(&txn_manager), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_bounded_window_eviction_advances_floor() {
+        let txn_manager = create_bounded_transaction_manager(3);
+        for key in ["a", "b", "a", "c", "d"] {
+            commit_batch(&txn_manager, &[key]);
+            assert_window_writes_match(&txn_manager.inner.read(), "evicting");
+        }
+        assert_eq!(window_seqs(&txn_manager), vec![3, 4, 5]);
+        assert_eq!(txn_manager.window_floor_seq(), 2);
+        {
+            let inner = txn_manager.inner.read();
+            assert_eq!(inner.window_writes.0[&Bytes::from_static(b"a")].len(), 1);
+            assert!(!inner
+                .window_writes
+                .0
+                .contains_key(&Bytes::from_static(b"b")));
+        }
+
+        // A start before the floor may miss evicted commits: refused.
+        assert!(matches!(
+            txn_manager.new_transaction_at_seq(1),
+            Err(SlateDBError::TransactionConflict)
+        ));
+        // A start at the floor sees every later commit.
+        let txn = txn_manager.new_transaction_at_seq(2).expect("at floor");
+        txn_manager.track_write_keys(&txn, &[Bytes::from_static(b"b")].into());
+        assert!(!txn_manager.check_has_conflict(&txn));
+        txn_manager.track_write_keys(&txn, &[Bytes::from_static(b"a")].into());
+        assert!(txn_manager.check_has_conflict(&txn));
+        txn_manager.drop_txn(&txn);
+    }
+
+    #[test]
+    fn test_bounded_window_pinned_by_active_txn() {
+        let txn_manager = create_bounded_transaction_manager(2);
+        commit_batch(&txn_manager, &["a"]);
+        let (pinned, started) = txn_manager.new_transaction();
+        assert_eq!(started, 1);
+        for _ in 0..5 {
+            commit_batch(&txn_manager, &["b"]);
+        }
+        // The pin keeps the commits from its start on, beyond the bound.
+        assert_eq!(window_seqs(&txn_manager), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(txn_manager.window_floor_seq(), 0);
+        assert_window_writes_match(&txn_manager.inner.read(), "pinned");
+        txn_manager.track_write_keys(&pinned, &[Bytes::from_static(b"b")].into());
+        assert!(txn_manager.check_has_conflict(&pinned));
+
+        // A historical transaction pins as well, but not compaction.
+        let historical = txn_manager
+            .new_transaction_at_seq(3)
+            .expect("within window");
+        assert_eq!(txn_manager.min_active_seq(), Some(1));
+        txn_manager.drop_txn(&pinned);
+        assert_eq!(window_seqs(&txn_manager), vec![3, 4, 5, 6]);
+        assert_eq!(txn_manager.window_floor_seq(), 2);
+        assert_eq!(txn_manager.min_active_seq(), None);
+        assert_window_writes_match(&txn_manager.inner.read(), "historical pin");
+
+        txn_manager.drop_txn(&historical);
+        assert_eq!(window_seqs(&txn_manager), vec![5, 6]);
+        assert_eq!(txn_manager.window_floor_seq(), 4);
+        assert_window_writes_match(&txn_manager.inner.read(), "released");
+    }
+
+    #[test]
+    fn test_new_transaction_at_seq_bounds() {
+        let txn_manager = create_bounded_transaction_manager(8);
+        for _ in 0..4 {
+            commit_batch(&txn_manager, &["a"]);
+        }
+        txn_manager.set_window_floor_seq(2);
+        // Monotonic: a lower floor is ignored.
+        txn_manager.set_window_floor_seq(1);
+        assert_eq!(txn_manager.window_floor_seq(), 2);
+        for seq in 2..=4 {
+            let txn = txn_manager.new_transaction_at_seq(seq).expect("in bounds");
+            assert_eq!(txn_manager.inner.read().active_txns[&txn].started_seq, seq);
+            txn_manager.drop_txn(&txn);
+        }
+        assert!(matches!(
+            txn_manager.new_transaction_at_seq(1),
+            Err(SlateDBError::TransactionConflict)
+        ));
+        assert!(matches!(
+            txn_manager.new_transaction_at_seq(5),
+            Err(SlateDBError::TransactionStartSeqAfterLatest {
+                started_seq: 5,
+                last_committed_seq: 4
+            })
+        ));
+        assert!(txn_manager.inner.read().active_txns.is_empty());
+    }
+
+    #[test]
+    fn test_conflict_check_before_floor_is_conservative() {
+        let txn_manager = create_transaction_manager();
+        let txn = txn_manager.new_txn_with_id(0, Uuid::from_u128(1));
+        txn_manager.set_window_floor_seq(5);
+        // Nothing in the window conflicts, but commits after 0 may be missing.
+        assert!(txn_manager.check_has_conflict(&txn));
+    }
+
+    #[test]
+    fn test_unbounded_window_drains_and_advances_floor() {
+        let txn_manager = create_transaction_manager();
+        commit_batch(&txn_manager, &["a"]);
+        assert!(window_seqs(&txn_manager).is_empty());
+        assert_eq!(txn_manager.window_floor_seq(), 1);
+
+        let (txn, _) = txn_manager.new_transaction();
+        commit_batch(&txn_manager, &["a"]);
+        commit_batch(&txn_manager, &["b"]);
+        let (later, _) = txn_manager.new_transaction();
+        commit_batch(&txn_manager, &["c"]);
+        assert_eq!(window_seqs(&txn_manager), vec![2, 3, 4]);
+        assert_eq!(txn_manager.window_floor_seq(), 1);
+
+        // Commits before the oldest active start leave, raising the floor.
+        txn_manager.drop_txn(&txn);
+        assert_eq!(window_seqs(&txn_manager), vec![3, 4]);
+        assert_eq!(txn_manager.window_floor_seq(), 2);
+        assert_window_writes_match(&txn_manager.inner.read(), "trimmed");
+        assert!(matches!(
+            txn_manager.new_transaction_at_seq(1),
+            Err(SlateDBError::TransactionConflict)
+        ));
+        txn_manager.drop_txn(&later);
+        assert!(window_seqs(&txn_manager).is_empty());
+        assert_eq!(txn_manager.window_floor_seq(), 4);
+    }
+
+    /// Random commits, transactions and historical transactions on bounded windows keep the
+    /// floor invariant: the window holds exactly the commits after the floor, which is never
+    /// after the start of an active transaction, and holds more than the bound only for an
+    /// active transaction that started before its oldest commit.
+    #[test]
+    fn test_bounded_window_floor_invariant() {
+        let base_seed: u64 = match std::env::var("TXN_INDEX_SEED") {
+            Ok(seed) => seed.parse().expect("TXN_INDEX_SEED is a u64"),
+            Err(_) => rand::random(),
+        };
+        let universe = DiffUniverse::small();
+        for scenario in 0..200u64 {
+            let db_rand = DbRand::new(base_seed.wrapping_add(scenario));
+            let mut rng = db_rand.rng();
+            let rng = &mut *rng;
+            let window = rng.random_range(1..=6usize);
+            let txn_manager = create_bounded_transaction_manager(window);
+            let mut active: Vec<Uuid> = Vec::new();
+            let mut commits: Vec<u64> = Vec::new();
+            for step in 0..200 {
+                let context = format!(
+                    "TXN_INDEX_SEED={base_seed}, scenario {scenario}, window {window}, step {step}"
+                );
+                let last = txn_manager.inner.read().oracle.last_committed_seq();
+                match rng.random_range(0..100) {
+                    0..=14 => active.push(txn_manager.new_transaction().0),
+                    15..=29 => {
+                        let floor = txn_manager.window_floor_seq();
+                        let seq = rng.random_range(floor.saturating_sub(2)..=last + 1);
+                        match txn_manager.new_transaction_at_seq(seq) {
+                            Ok(txn) => {
+                                assert!(floor <= seq && seq <= last, "{context}");
+                                active.push(txn);
+                            }
+                            Err(SlateDBError::TransactionConflict) => {
+                                assert!(seq < floor, "{context}")
+                            }
+                            Err(SlateDBError::TransactionStartSeqAfterLatest { .. }) => {
+                                assert!(seq > last, "{context}")
+                            }
+                            Err(error) => panic!("{context}: {error}"),
+                        }
+                    }
+                    30..=54 if !active.is_empty() => {
+                        let txn = active.swap_remove(rng.random_range(0..active.len()));
+                        let writes = universe.commit_writes(rng);
+                        txn_manager.track_writes(&txn, writes, HashMap::new(), HashSet::new());
+                        if txn_manager.check_has_conflict(&txn) {
+                            txn_manager.drop_txn(&txn);
+                        } else {
+                            txn_manager.track_recent_committed_txn(&txn, last + 1);
+                            commits.push(last + 1);
+                        }
+                    }
+                    55..=74 => {
+                        let keys = universe.batch_keys(rng);
+                        txn_manager.track_recent_committed_write_batch(&keys, last + 1);
+                        commits.push(last + 1);
+                    }
+                    75..=89 if !active.is_empty() => {
+                        let txn = active.swap_remove(rng.random_range(0..active.len()));
+                        txn_manager.drop_txn(&txn);
+                    }
+                    _ => txn_manager.inner.write().recycle_recent_committed_txns(),
+                }
+                let inner = txn_manager.inner.read();
+                assert_window_writes_match(&inner, &context);
+                let floor = inner.window_floor_seq;
+                let want: Vec<u64> = commits.iter().copied().filter(|&s| s > floor).collect();
+                let got: Vec<u64> = inner
+                    .recent_committed_txns
+                    .iter()
+                    .map(|txn| txn.committed_seq.expect("committed"))
+                    .collect();
+                assert_eq!(
+                    got, want,
+                    "{context}: window is not the commits after the floor"
+                );
+                let min_seq = inner.min_conflict_check_seq();
+                assert!(
+                    min_seq.is_none_or(|min| floor <= min),
+                    "{context}: floor after a start"
+                );
+                if got.len() > window {
+                    assert!(
+                        min_seq.is_some_and(|min| min <= got[0]),
+                        "{context}: window beyond its bound without a pin"
+                    );
+                }
+            }
+        }
     }
 }

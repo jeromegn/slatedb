@@ -130,6 +130,10 @@ pub struct DbTransaction {
     /// hold too, so that it outlives the transaction while one of them reads on. `None` only
     /// while the transaction drops.
     retention: Option<Arc<RetentionPin>>,
+    /// Whether `get` and `scan` fail, as on a transaction begun at an explicit sequence
+    /// number ([`Self::new_commit_at_seq`]): the versions visible there may be compacted
+    /// away, as the transaction does not hold back compaction.
+    reads_disabled: bool,
 }
 
 impl DbTransaction {
@@ -152,7 +156,32 @@ impl DbTransaction {
             range_trackers: Mutex::new(Vec::new()),
             read_set: Mutex::new(ReadSet::default()),
             write_tracking: RwLock::new(WriteTracking::default()),
+            reads_disabled: false,
         }
+    }
+
+    /// A transaction that started at `started_seq`, an earlier sequence number than the
+    /// last committed one, that cannot read (see [`crate::Db::begin_commit_at_seq`]).
+    pub(crate) fn new_commit_at_seq(
+        db_inner: Arc<DbInner>,
+        txn_manager: Arc<TransactionManager>,
+        isolation_level: IsolationLevel,
+        started_seq: u64,
+    ) -> Result<Self, SlateDBError> {
+        let txn_id = txn_manager.new_transaction_at_seq(started_seq)?;
+        Ok(Self {
+            txn_id,
+            started_seq,
+            retention: None,
+            txn_manager,
+            write_batch: RwLock::new(WriteBatch::new()),
+            db_inner,
+            isolation_level,
+            range_trackers: Mutex::new(Vec::new()),
+            read_set: Mutex::new(ReadSet::default()),
+            write_tracking: RwLock::new(WriteTracking::default()),
+            reads_disabled: true,
+        })
     }
 
     /// The reads that the commit checks for read-write conflicts. The commit
@@ -207,6 +236,9 @@ impl DbTransaction {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
+        if self.reads_disabled {
+            return Err(SlateDBError::TransactionReadsDisabled.into());
+        }
         self.db_inner.check_closed()?;
 
         // Track read key for SSI conflict detection if needed, with the conflict domains of
@@ -398,6 +430,9 @@ impl DbTransaction {
         options: &ScanOptions,
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, crate::Error> {
+        if self.reads_disabled {
+            return Err(SlateDBError::TransactionReadsDisabled.into());
+        }
         // Under SSI, register the *requested* scan range with the transaction
         // so that any concurrent write inside it is detected as an
         // rw-anti-dependency at commit time — including writes to portions of
@@ -3601,5 +3636,207 @@ mod tests {
             "recomputed random additions: {commits} committed, {aborts} aborted, {flushes} flushes"
         );
         assert!(commits > aborts, "{commits} committed, {aborts} aborted");
+    }
+
+    /// Opens a database whose conflict window keeps `window` commits.
+    async fn open_window_db(
+        path: &str,
+        store: Arc<dyn object_store::ObjectStore>,
+        window: usize,
+    ) -> crate::Db {
+        crate::Db::builder(path, store)
+            .with_conflict_window_commits(window)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    fn assert_invalid<T>(result: Result<T, crate::Error>) {
+        assert_eq!(result.err().unwrap().kind(), crate::ErrorKind::Invalid);
+    }
+
+    /// A transaction begun at an earlier sequence number conflicts with the commits after
+    /// it as one begun then would: its writes with every later commit of a key it writes,
+    /// including blind batches and writes outside transactions, and its marked reads (keys,
+    /// with masks, and ranges) with later commits that change them; it commits otherwise.
+    #[rstest]
+    #[case::snapshot(IsolationLevel::Snapshot)]
+    #[case::serializable(IsolationLevel::SerializableSnapshot)]
+    #[tokio::test]
+    async fn test_commit_at_seq_conflicts(#[case] isolation: IsolationLevel) {
+        let db = open_window_db(
+            &format!("/tmp/test_commit_at_seq_{isolation:?}"),
+            Arc::new(InMemory::new()),
+            16,
+        )
+        .await;
+        let start = db.put(b"row", b"v0").await.unwrap().seqnum();
+        // After `start`: a blind batch, a write outside a transaction, a masked write.
+        let mut batch = WriteBatch::new();
+        batch.put(b"x", b"blind");
+        db.write(batch).await.unwrap();
+        db.put(b"b", b"put").await.unwrap();
+        let writer = db.begin(isolation).unwrap();
+        writer.put(b"row", b"v1").unwrap();
+        writer.set_write_mask(b"row", 0b10).unwrap();
+        writer.commit().await.unwrap();
+
+        let at_start = || db.begin_commit_at_seq(isolation, start).unwrap();
+
+        // Writes of keys nobody wrote since commit.
+        let txn = at_start();
+        assert_eq!(txn.seqnum(), start);
+        txn.put(b"z", b"new").unwrap();
+        txn.commit().await.unwrap();
+
+        // A write of a key written since conflicts: the blind batch, the plain write.
+        for key in [&b"x"[..], b"b", b"row"] {
+            let txn = at_start();
+            txn.put(key, b"late").unwrap();
+            assert_conflict(txn.commit().await);
+        }
+
+        // Marked reads: a key and a range conflict with a later write in them.
+        let txn = at_start();
+        txn.mark_read([b"x"]).unwrap();
+        txn.put(b"e1", b"v").unwrap();
+        assert_conflict(txn.commit().await);
+        let txn = at_start();
+        txn.mark_read_range("a".."c", ALL_CONFLICT_DOMAINS).unwrap();
+        txn.put(b"e2", b"v").unwrap();
+        assert_conflict(txn.commit().await);
+        let txn = at_start();
+        txn.mark_read_range("s".."w", ALL_CONFLICT_DOMAINS).unwrap();
+        txn.put(b"e3", b"v").unwrap();
+        txn.commit().await.unwrap();
+
+        // Masks: the masked write of "row" changed only the domain of bit 1.
+        let txn = at_start();
+        txn.mark_read_masked([b"row"], 0b01).unwrap();
+        txn.put(b"e4", b"v").unwrap();
+        txn.commit().await.unwrap();
+        let txn = at_start();
+        txn.mark_read_masked([b"row"], 0b10).unwrap();
+        txn.put(b"e5", b"v").unwrap();
+        assert_conflict(txn.commit().await);
+
+        // A start at the newest commit sees no later commit.
+        let newest = db.begin(isolation).unwrap().seqnum();
+        let txn = db.begin_commit_at_seq(isolation, newest).unwrap();
+        txn.mark_read([b"x"]).unwrap();
+        txn.put(b"row", b"v2").unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            db.get(b"row").await.unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+
+        // Nothing after the last commit.
+        assert_invalid(db.begin_commit_at_seq(isolation, newest + 100));
+    }
+
+    /// A transaction begun at an explicit sequence number cannot read, but can mark reads,
+    /// write and commit, and does not hold back compaction.
+    #[tokio::test]
+    async fn test_commit_at_seq_reads_disabled() {
+        let db = open_window_db(
+            "/tmp/test_commit_at_seq_reads",
+            Arc::new(InMemory::new()),
+            4,
+        )
+        .await;
+        let start = db.put(b"a", b"1").await.unwrap().seqnum();
+        let isolations = [
+            IsolationLevel::Snapshot,
+            IsolationLevel::SerializableSnapshot,
+        ];
+        for (n, isolation) in isolations.into_iter().enumerate() {
+            let txn = db.begin_commit_at_seq(isolation, start).unwrap();
+            assert_invalid(txn.get(b"a").await);
+            assert_invalid(txn.get_key_value(b"a").await);
+            assert_invalid(txn.scan(..).await);
+            assert_invalid(txn.scan_prefix(b"a", ..).await);
+            assert!(txn.read_set().keys.is_empty() && txn.range_trackers.lock().is_empty());
+            assert_eq!(db.inner.txn_manager.min_active_seq(), None);
+            txn.mark_read([b"a"]).unwrap();
+            // Keys of their own: the transactions start at the same sequence number.
+            txn.put([b'b', n as u8], b"2").unwrap();
+            txn.delete([b'c', n as u8]).unwrap();
+            txn.commit().await.unwrap();
+        }
+        assert_eq!(
+            db.get(b"b\x01").await.unwrap(),
+            Some(Bytes::from_static(b"2"))
+        );
+    }
+
+    /// Commits that left the window beyond `with_conflict_window_commits` cannot be checked:
+    /// a start before them is refused. An active transaction keeps the commits after its
+    /// start in the window beyond the bound.
+    #[tokio::test]
+    async fn test_commit_at_seq_evicted() {
+        let db = open_window_db(
+            "/tmp/test_commit_at_seq_evicted",
+            Arc::new(InMemory::new()),
+            4,
+        )
+        .await;
+        let first = db.put(b"k", b"0").await.unwrap().seqnum();
+        let pinned = db
+            .begin_commit_at_seq(IsolationLevel::Snapshot, first)
+            .unwrap();
+        let mut last = first;
+        for n in 1..=8u8 {
+            last = db.put(b"k", [n]).await.unwrap().seqnum();
+        }
+        // The pin keeps the commits after `first`, which conflict.
+        assert!(db.conflict_window_floor_seq() < first);
+        pinned.put(b"k", b"pinned").unwrap();
+        assert_conflict(pinned.commit().await);
+        // Without it they leave: only the newest 4 commits stay.
+        db.put(b"other", b"1").await.unwrap();
+        let floor = db.conflict_window_floor_seq();
+        assert!(floor > first, "floor {floor} after first {first}");
+        assert!(floor < last);
+        let result = db.begin_commit_at_seq(IsolationLevel::Snapshot, first);
+        assert_eq!(result.err().unwrap().kind(), crate::ErrorKind::Transaction);
+        let txn = db
+            .begin_commit_at_seq(IsolationLevel::Snapshot, floor)
+            .unwrap();
+        txn.put(b"k", b"late").unwrap();
+        assert_conflict(txn.commit().await);
+    }
+
+    /// The commits recovered at open are not in the window: after a reopen, as on a failover,
+    /// the floor is the newest of them, and only a start at or after it is accepted.
+    #[tokio::test]
+    async fn test_commit_at_seq_after_reopen() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_commit_at_seq_reopen";
+        let db = open_window_db(path, store.clone(), 16).await;
+        let mut last = 0;
+        for n in 0..5u8 {
+            last = db.put([b'k', n], b"v").await.unwrap().seqnum();
+        }
+        db.begin_commit_at_seq(IsolationLevel::Snapshot, last - 2)
+            .unwrap();
+        db.close().await.unwrap();
+
+        let db = open_window_db(path, store, 16).await;
+        let recovered = db.begin(IsolationLevel::Snapshot).unwrap().seqnum();
+        assert_eq!(recovered, last);
+        assert_eq!(db.conflict_window_floor_seq(), recovered);
+        let result = db.begin_commit_at_seq(IsolationLevel::Snapshot, recovered - 1);
+        assert_eq!(result.err().unwrap().kind(), crate::ErrorKind::Transaction);
+        let txn = db
+            .begin_commit_at_seq(IsolationLevel::SerializableSnapshot, recovered)
+            .unwrap();
+        txn.mark_read([b"k\x00"]).unwrap();
+        txn.put(b"k\x00", b"after failover").unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            db.get(b"k\x00").await.unwrap(),
+            Some(Bytes::from_static(b"after failover"))
+        );
     }
 }
