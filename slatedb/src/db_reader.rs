@@ -19,11 +19,14 @@ use {
         },
         mem_table::{ImmutableMemtable, KVTable, WritableKVTable},
         merge_operator::MergeOperatorType,
-        oracle::DbReaderOracle,
+        oracle::{DbReaderOracle, Oracle},
         prefix_extractor::PrefixExtractor,
         reader::{DbStateReader, Reader, ScanContext},
+        row_cache::{
+            scan_start_key, GetOutcome, OpenContext as RowCacheOpenContext, RowCache, ScanOutcome,
+        },
         tablestore::TableStore,
-        types::KeyValue,
+        types::{KeyValue, RowEntry},
         utils::IdGenerator,
         wal::slatedb::store::WalTableStore,
         wal::WalReader as WalReaderTrait,
@@ -32,11 +35,12 @@ use {
     },
     async_trait::async_trait,
     bytes::Bytes,
+    fail_parallel::FailPointRegistry,
     futures::stream::BoxStream,
     log::{info, warn},
     object_store::{path::Path, ObjectStore},
     parking_lot::RwLock,
-    slatedb_common::{clock::SystemClock, DbRand},
+    slatedb_common::{clock::SystemClock, metrics::MetricsRecorder, DbRand},
     std::{
         collections::{BTreeSet, VecDeque},
         ops::Sub,
@@ -117,15 +121,15 @@ pub struct DbReader {
 
 pub(crate) struct DbReaderInner {
     manifest_store: Arc<ManifestStore>,
-    table_store: Arc<TableStore>,
+    pub(crate) table_store: Arc<TableStore>,
     wal_reader: Arc<dyn WalReaderTrait>,
     options: DbReaderOptions,
     mode: DbReaderMode,
-    state: RwLock<Arc<ReaderState>>,
+    pub(crate) state: RwLock<Arc<ReaderState>>,
     system_clock: Arc<dyn SystemClock>,
-    oracle: Arc<DbReaderOracle>,
-    reader: Reader,
-    status_manager: DbStatusManager,
+    pub(crate) oracle: Arc<DbReaderOracle>,
+    pub(crate) reader: Reader,
+    pub(crate) status_manager: DbStatusManager,
     segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     rand: Arc<DbRand>,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
@@ -135,10 +139,30 @@ pub(crate) struct DbReaderInner {
     recorder: slatedb_common::metrics::MetricsRecorderHelper,
     /// The live snapshots and the checkpoints they lease.
     pub(crate) snapshots: SnapshotRegistry,
+    /// Pluggable logical row cache, configured through `DbReaderBuilder::with_row_cache`.
+    row_cache: Option<ReaderRowCache>,
+}
+
+/// A row cache attached to a reader, and the state it reads through
+/// [`Host`](crate::row_cache::Host).
+struct ReaderRowCache {
+    cache: Arc<dyn RowCache>,
+    /// The newest state the poller built. The poller installs a state here before it feeds the
+    /// cache the writes of that state, and installs it on the read path after the reader's
+    /// sequence number advances. A range that the cache registers at a sequence number therefore
+    /// loads from a state that holds every write up to it.
+    view: RwLock<Arc<ReaderState>>,
+}
+
+/// The options of a row cache attached to a reader at open.
+pub(crate) struct ReaderRowCacheOptions {
+    pub(crate) cache: Arc<dyn RowCache>,
+    pub(crate) metrics_recorder: Arc<dyn MetricsRecorder>,
+    pub(crate) fp_registry: Arc<FailPointRegistry>,
 }
 
 #[derive(Debug)]
-enum DbReaderMessage {
+pub(crate) enum DbReaderMessage {
     PollManifest,
     /// Poll now, as the ticker would, and report whether the reader then holds a newer state
     /// than the state of version `since`.
@@ -146,6 +170,8 @@ enum DbReaderMessage {
         since: StateVersion,
         reply: oneshot::Sender<Result<bool, SlateDBError>>,
     },
+    /// Drain queued row cache work, sent by [`Host::wake_writer`](crate::row_cache::Host).
+    RowCacheWake,
 }
 
 /// Identifies a reader state: its manifest id, last replayed WAL id and sequence number.
@@ -305,8 +331,62 @@ impl DbReaderInner {
             rand,
             recorder,
             snapshots: SnapshotRegistry::new(),
+            row_cache: None,
         };
         Ok(inner)
+    }
+
+    /// Attaches `cache`, which reads the current state until the poller builds a newer one.
+    fn attach_row_cache(&mut self, cache: Arc<dyn RowCache>) {
+        let view = RwLock::new(Arc::clone(&self.state.read()));
+        self.row_cache = Some(ReaderRowCache { cache, view });
+    }
+
+    /// The state the row cache reads: the newest state the poller built.
+    pub(crate) fn row_cache_view(&self) -> Arc<ReaderState> {
+        match &self.row_cache {
+            Some(row_cache) => Arc::clone(&row_cache.view.read()),
+            None => Arc::clone(&self.state.read()),
+        }
+    }
+
+    pub(crate) fn system_clock(&self) -> Arc<dyn SystemClock> {
+        Arc::clone(&self.system_clock)
+    }
+
+    pub(crate) fn rand(&self) -> Arc<DbRand> {
+        Arc::clone(&self.rand)
+    }
+
+    /// Installs `new_state` as the row cache's view and feeds the cache every write of the state
+    /// above the reader's sequence number, strictly before that number advances. Runs on the
+    /// poller task only.
+    ///
+    /// If the state's L0 holds writes above the reader's sequence number, the reader never
+    /// replayed them: the cache drops its rows above that number first. Otherwise the cache
+    /// already holds every write up to the L0, and a flush or compaction changes nothing in it.
+    fn feed_row_cache(&self, new_state: &Arc<ReaderState>) {
+        let Some(row_cache) = &self.row_cache else {
+            return;
+        };
+        *row_cache.view.write() = Arc::clone(new_state);
+        let prev_seq = self.oracle.last_committed_seq();
+        let mut applied = prev_seq;
+        let last_l0_seq = new_state.core().last_l0_seq;
+        if last_l0_seq > prev_seq {
+            row_cache.cache.invalidate_all(prev_seq, last_l0_seq);
+            applied = last_l0_seq;
+        }
+        for batch in writes_after(new_state.imm_memtable(), applied) {
+            let seq = batch[0].seq;
+            row_cache.cache.apply_write(&batch, applied);
+            applied = seq;
+        }
+        if new_state.last_remote_persisted_seq > applied {
+            row_cache
+                .cache
+                .drain_writer(new_state.last_remote_persisted_seq);
+        }
     }
 
     async fn get_or_create_checkpoint(
@@ -355,9 +435,7 @@ impl DbReaderInner {
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, SlateDBError> {
         self.check_closed()?;
-        let db_state = Arc::clone(&self.state.read());
-        self.reader
-            .get_key_value_with_options(key, options, db_state.as_ref(), None, None)
+        self.get_key_value_in(None, None, key.as_ref(), options)
             .await
     }
 
@@ -368,19 +446,7 @@ impl DbReaderInner {
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
         self.check_closed()?;
-        let db_state = Arc::clone(&self.state.read());
-        self.reader
-            .scan_with_options(
-                range,
-                options,
-                ScanContext {
-                    db_state: db_state.as_ref(),
-                    write_batch_iter: None,
-                    max_seq: None,
-                    prefix,
-                },
-            )
-            .await
+        self.scan_in(None, None, range, options, prefix).await
     }
 
     /// Reads `key` in `state` at `seq`, for a snapshot.
@@ -391,8 +457,7 @@ impl DbReaderInner {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, SlateDBError> {
-        self.reader
-            .get_key_value_with_options(key, options, state, None, Some(seq))
+        self.get_key_value_in(Some(state), Some(seq), key.as_ref(), options)
             .await
     }
 
@@ -405,18 +470,101 @@ impl DbReaderInner {
         options: &ScanOptions,
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
-        self.reader
+        self.scan_in(Some(state), Some(seq), range, options, prefix)
+            .await
+    }
+
+    /// Reads `key` through the row cache, if any, then in `state` (the current state if `None`)
+    /// at `seq` (the newest if `None`).
+    async fn get_key_value_in(
+        &self,
+        state: Option<&ReaderState>,
+        seq: Option<u64>,
+        key: &[u8],
+        options: &ReadOptions,
+    ) -> Result<Option<KeyValue>, SlateDBError> {
+        let miss = if let Some(row_cache) = &self.row_cache {
+            match row_cache.cache.get(key, options, seq) {
+                GetOutcome::Hit(result) => {
+                    return result.map_err(|err| SlateDBError::RowCache(Arc::new(err)));
+                }
+                GetOutcome::Miss(token) => token,
+            }
+        } else {
+            None
+        };
+        let result = match state {
+            Some(state) => {
+                self.reader
+                    .get_key_value_with_options(key, options, state, None, seq)
+                    .await
+            }
+            None => {
+                let state = Arc::clone(&self.state.read());
+                self.reader
+                    .get_key_value_with_options(key, options, state.as_ref(), None, seq)
+                    .await
+            }
+        };
+        if let (Some(row_cache), Some(token)) = (&self.row_cache, miss) {
+            row_cache.cache.record_miss(token, key);
+        }
+        result
+    }
+
+    /// Scans `range` through the row cache, if any, then in `state` (the current state if
+    /// `None`) at `seq` (the newest if `None`).
+    async fn scan_in(
+        &self,
+        state: Option<&ReaderState>,
+        seq: Option<u64>,
+        range: BytesRange,
+        options: &ScanOptions,
+        prefix: Option<Bytes>,
+    ) -> Result<DbIterator, SlateDBError> {
+        let miss = if let Some(row_cache) = &self.row_cache {
+            let bounds = (
+                ByteRangeBounds::start_bound(&range),
+                ByteRangeBounds::end_bound(&range),
+            );
+            match row_cache
+                .cache
+                .scan(bounds, options, prefix.as_deref(), seq)
+            {
+                ScanOutcome::Hit(result) => {
+                    let iter = result.map_err(|err| SlateDBError::RowCache(Arc::new(err)))?;
+                    return Ok(DbIterator::from_row_cache(range, iter));
+                }
+                ScanOutcome::Miss(token) => token.map(|token| (token, scan_start_key(&range))),
+            }
+        } else {
+            None
+        };
+        let current;
+        let state = match state {
+            Some(state) => state,
+            None => {
+                current = Arc::clone(&self.state.read());
+                current.as_ref()
+            }
+        };
+        let result = self
+            .reader
             .scan_with_options(
                 range,
                 options,
                 ScanContext {
                     db_state: state,
                     write_batch_iter: None,
-                    max_seq: Some(seq),
+                    max_seq: seq,
                     prefix,
                 },
             )
-            .await
+            .await;
+        if let (Some(row_cache), Some((token, start_key))) = (&self.row_cache, miss) {
+            row_cache.cache.record_miss(token, &start_key);
+        }
+        result
     }
 
     /// The current time in milliseconds since the Unix epoch, on the reader's clock.
@@ -426,7 +574,7 @@ impl DbReaderInner {
 
     /// Takes a snapshot of the current state. Waits while the poller removes the checkpoint of
     /// the current state, which ends when the poller installs the state on the new checkpoint.
-    async fn snapshot(self: &Arc<Self>) -> Result<DbReaderSnapshot, SlateDBError> {
+    pub(crate) async fn snapshot(self: &Arc<Self>) -> Result<DbReaderSnapshot, SlateDBError> {
         let lease = self.mode == DbReaderMode::ManagedCheckpoint;
         loop {
             self.check_closed()?;
@@ -524,9 +672,11 @@ impl DbReaderInner {
         let durable_seq = new_state.last_remote_persisted_seq;
         let versioned_manifest = VersionedManifest::from(&new_state);
         let touched_segments = collect_touched_segments(&new_state);
+        let new_state = Arc::new(new_state);
+        self.feed_row_cache(&new_state);
         self.oracle.advance_durable_seq(durable_seq);
         let mut write_guard = self.state.write();
-        *write_guard = Arc::new(new_state);
+        *write_guard = new_state;
         drop(write_guard);
         self.status_manager
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
@@ -550,9 +700,7 @@ impl DbReaderInner {
         .await?;
 
         if last_wal_id > current_state.last_wal_id {
-            self.oracle.advance_durable_seq(last_committed_seq);
-            let mut write_guard = self.state.write();
-            *write_guard = Arc::new(ReaderState {
+            let new_state = Arc::new(ReaderState {
                 manifest_id: current_state.manifest_id,
                 checkpoint: current_state.checkpoint.clone(),
                 manifest: current_state.manifest.clone(),
@@ -560,6 +708,10 @@ impl DbReaderInner {
                 last_wal_id,
                 last_remote_persisted_seq: last_committed_seq,
             });
+            self.feed_row_cache(&new_state);
+            self.oracle.advance_durable_seq(last_committed_seq);
+            let mut write_guard = self.state.write();
+            *write_guard = new_state;
             drop(write_guard);
             self.status_manager
                 .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
@@ -956,6 +1108,33 @@ impl DbReaderInner {
     }
 }
 
+/// The writes in `tables` above `seq`, one batch per sequence number in ascending order, each in
+/// key order.
+fn writes_after(tables: &VecDeque<Arc<ImmutableMemtable>>, seq: u64) -> Vec<Vec<RowEntry>> {
+    let mut entries = Vec::new();
+    for table in tables {
+        let table = table.table();
+        if table.last_seq().is_none_or(|last| last <= seq) {
+            continue;
+        }
+        let mut iter = table.iter();
+        while let Some(entry) = iter.next_sync() {
+            if entry.seq > seq {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.key.cmp(&b.key)));
+    let mut batches: Vec<Vec<RowEntry>> = Vec::new();
+    for entry in entries {
+        match batches.last_mut() {
+            Some(batch) if batch[0].seq == entry.seq => batch.push(entry),
+            _ => batches.push(vec![entry]),
+        }
+    }
+    batches
+}
+
 struct ManifestPoller {
     inner: Arc<DbReaderInner>,
 }
@@ -963,6 +1142,9 @@ struct ManifestPoller {
 #[async_trait]
 impl MessageHandler<DbReaderMessage> for ManifestPoller {
     fn tickers(&mut self) -> Vec<MessageTickerDef<DbReaderMessage>> {
+        if matches!(self.inner.mode, DbReaderMode::Checkpoint(_)) {
+            return Vec::new();
+        }
         vec![MessageTickerDef::new(
             self.inner.options.manifest_poll_interval,
             Box::new(|| DbReaderMessage::PollManifest),
@@ -993,6 +1175,15 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
                     result => result,
                 }
             }
+            DbReaderMessage::RowCacheWake => {
+                if let Some(row_cache) = &self.inner.row_cache {
+                    // The poller feeds the cache, so no batch is in flight here.
+                    row_cache
+                        .cache
+                        .drain_writer(self.inner.oracle.last_committed_seq());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1001,6 +1192,11 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
         _messages: BoxStream<'async_trait, DbReaderMessage>,
         _result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
+        // Stop the cache's write side before anything that can fail, so its queued requests are
+        // refused rather than left waiting for a poller that is gone.
+        if let Some(row_cache) = &self.inner.row_cache {
+            row_cache.cache.close_writer();
+        }
         if self.inner.mode != DbReaderMode::ManagedCheckpoint {
             return Ok(());
         }
@@ -1182,6 +1378,7 @@ impl DbReader {
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
         recorder: slatedb_common::metrics::MetricsRecorderHelper,
+        row_cache: Option<ReaderRowCacheOptions>,
     ) -> Result<Self, SlateDBError> {
         Self::validate_options(mode, &options)?;
 
@@ -1195,41 +1392,60 @@ impl DbReader {
             .db_state()
             .validate_extractor_configuration(segment_extractor.as_deref())?;
 
-        let inner = Arc::new(
-            DbReaderInner::new(
-                manifest_store,
-                table_store,
-                wal_store,
-                wal_reader,
-                options,
-                mode,
-                merge_operator,
-                segment_extractor,
-                system_clock.clone(),
-                rand,
-                recorder,
-                manifest,
-            )
-            .await?,
-        );
+        let mut inner = DbReaderInner::new(
+            manifest_store,
+            table_store,
+            wal_store,
+            wal_reader,
+            options,
+            mode,
+            merge_operator,
+            segment_extractor,
+            system_clock.clone(),
+            rand,
+            recorder,
+            manifest,
+        )
+        .await?;
+        if let Some(row_cache) = &row_cache {
+            inner.attach_row_cache(Arc::clone(&row_cache.cache));
+        }
+        let inner = Arc::new(inner);
         let task_executor = MessageHandlerExecutor::new(
             Arc::new(inner.status_manager.clone()),
             system_clock.clone(),
         );
 
         // Pinned checkpoints never advance. Managed checkpoints and unprotected readers both
-        // poll for newer database state according to `DbReaderOptions`.
-        let poller = if matches!(mode, DbReaderMode::Checkpoint(_)) {
+        // poll for newer database state according to `DbReaderOptions`. A row cache needs the
+        // poller in every mode: it owns the cache's write side.
+        let poller = if matches!(mode, DbReaderMode::Checkpoint(_)) && row_cache.is_none() {
             None
         } else {
             Some(inner.spawn_manifest_poller(&task_executor)?)
         };
 
-        Ok(Self {
+        let reader = Self {
             inner,
             task_executor,
             poller,
-        })
+        };
+        if let (Some(options), Some(poller)) = (row_cache, &reader.poller) {
+            // The oracle holds the sequence number of the initial state, which the cache starts
+            // from.
+            let ctx = RowCacheOpenContext::new_reader(
+                &reader.inner,
+                poller.clone(),
+                Handle::current(),
+                options.metrics_recorder,
+                options.fp_registry,
+            );
+            if let Err(err) = options.cache.open(ctx) {
+                reader.shutdown().await;
+                return Err(SlateDBError::RowCache(Arc::new(err)));
+            }
+        }
+        Ok(reader)
     }
 
     /// Create a snapshot of the reader's current state.
@@ -1683,6 +1899,12 @@ impl DbReader {
     /// }
     /// ```
     pub async fn close(&self) -> Result<(), crate::Error> {
+        // Before the poller stops, so the cache's background jobs can finish their handshakes
+        // with it.
+        if let Some(row_cache) = &self.inner.row_cache {
+            row_cache.cache.close().await;
+        }
+
         self.task_executor
             .shutdown_task(DB_READER_TASK_NAME)
             .await
@@ -1693,6 +1915,16 @@ impl DbReader {
         }
 
         Ok(())
+    }
+
+    /// Stops the poller and the block cache of a reader whose open failed.
+    async fn shutdown(&self) {
+        if let Err(e) = self.task_executor.shutdown_task(DB_READER_TASK_NAME).await {
+            warn!("failed to shutdown manifest poller [error={:?}]", e);
+        }
+        if let Err(e) = self.inner.table_store.close_cache().await {
+            warn!("failed to close block cache [error={:?}]", e);
+        }
     }
 }
 
@@ -2011,6 +2243,7 @@ mod tests {
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
             slatedb_common::metrics::MetricsRecorderHelper::noop(),
+            None,
         )
         .await
         .unwrap();
@@ -2375,6 +2608,7 @@ mod tests {
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
             slatedb_common::metrics::MetricsRecorderHelper::noop(),
+            None,
         )
         .await
         .unwrap();
@@ -3445,6 +3679,7 @@ mod tests {
                 self.system_clock.clone(),
                 self.rand.clone(),
                 slatedb_common::metrics::MetricsRecorderHelper::noop(),
+                None,
             )
             .await
         }
@@ -3666,6 +3901,7 @@ mod tests {
             rand: test_provider.rand.clone(),
             recorder,
             snapshots: SnapshotRegistry::new(),
+            row_cache: None,
         };
 
         let rebuilt_state = inner
@@ -3754,6 +3990,7 @@ mod tests {
             rand: test_provider.rand.clone(),
             recorder,
             snapshots: SnapshotRegistry::new(),
+            row_cache: None,
         }
     }
 

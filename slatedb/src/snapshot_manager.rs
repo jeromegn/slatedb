@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::db_reader::DbReaderInner;
+use crate::db_reader_snapshot::CheckpointLease;
 use crate::oracle::{DbOracle, Oracle};
 use crate::transaction_manager::TransactionManager;
 use crate::utils::IdGenerator;
@@ -26,6 +28,13 @@ enum Registration {
         manager: Arc<TransactionManager>,
         id: Uuid,
     },
+    /// A hold on a reader snapshot's sequence number and checkpoint lease in the reader's
+    /// snapshot registry, taken by an iterator of the snapshot's scans.
+    ReaderSnapshot {
+        inner: Arc<DbReaderInner>,
+        seq: u64,
+        lease: Option<Arc<CheckpointLease>>,
+    },
 }
 
 impl RetentionPin {
@@ -43,6 +52,19 @@ impl RetentionPin {
         })
     }
 
+    /// The pin of a scan iterator of a reader snapshot at `seq` with `lease`: the reader keeps
+    /// the sequence number registered and the checkpoint leased until the iterator drops too.
+    pub(crate) fn reader_snapshot(
+        inner: Arc<DbReaderInner>,
+        seq: u64,
+        lease: Option<Arc<CheckpointLease>>,
+    ) -> Arc<Self> {
+        inner.snapshots.hold(seq, lease.as_ref());
+        Arc::new(Self {
+            registration: Some(Registration::ReaderSnapshot { inner, seq, lease }),
+        })
+    }
+
     /// Leaves the release of the registration to the caller.
     pub(crate) fn disarm(mut self) {
         self.registration = None;
@@ -54,6 +76,9 @@ impl Drop for RetentionPin {
         match self.registration.take() {
             Some(Registration::Snapshot { manager, id }) => manager.drop_snapshot(&id),
             Some(Registration::Transaction { manager, id }) => manager.release_retention(&id),
+            Some(Registration::ReaderSnapshot { inner, seq, lease }) => {
+                inner.snapshots.release(seq, lease.as_ref())
+            }
             None => {}
         }
     }

@@ -31,6 +31,7 @@ use crate::db_iter::DbIterator;
 use crate::db_reader::{DbReaderInner, ReaderState};
 use crate::error::SlateDBError;
 use crate::manifest::ManifestCore;
+use crate::snapshot_manager::RetentionPin;
 use crate::types::KeyValue;
 use crate::{Checkpoint, DbReadOps};
 
@@ -55,8 +56,9 @@ use crate::{Checkpoint, DbReadOps};
 /// reader is pinned to protects the snapshot, as it protects the reader. In
 /// [`DbReaderMode::FollowLatest`](crate::DbReaderMode::FollowLatest), nothing protects it.
 ///
-/// Keep the snapshot while you use the iterators of its scans. Dropping the snapshot drops its
-/// lease.
+/// The iterators of its scans hold the snapshot's sequence number and lease too, so an iterator
+/// that outlives the snapshot still reads the files the lease protects. The lease ends when the
+/// snapshot and every such iterator have dropped.
 pub struct DbReaderSnapshot {
     seq: u64,
     state: Arc<ReaderState>,
@@ -233,10 +235,15 @@ impl DbReaderSnapshot {
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, crate::Error> {
         self.check_readable()?;
-        self.inner
+        let iter = self
+            .inner
             .scan_at(&self.state, self.seq, range, options, prefix)
-            .await
-            .map_err(Into::into)
+            .await?;
+        Ok(iter.retaining(RetentionPin::reader_snapshot(
+            Arc::clone(&self.inner),
+            self.seq,
+            self.lease.clone(),
+        )))
     }
 
     #[cfg(test)]
@@ -448,6 +455,22 @@ impl SnapshotRegistry {
         *inner.seqs.entry(state.seq()).or_default() += 1;
         self.publish_min_seq(&inner);
         Ok((state, lease))
+    }
+
+    /// One more holder of a live snapshot at `seq` and of its `lease`: an iterator of the
+    /// snapshot's scans. [`Self::release`] ends the hold. A lapsed lease that a new one replaced
+    /// gets no holder, as [`Self::release`] ignores it.
+    pub(crate) fn hold(&self, seq: u64, lease: Option<&Arc<CheckpointLease>>) {
+        let mut inner = self.inner.lock();
+        *inner.seqs.entry(seq).or_default() += 1;
+        if let Some(lease) = lease {
+            if let Some(leased) = inner.leases.get_mut(&lease.id) {
+                if Arc::ptr_eq(&leased.lease, lease) {
+                    leased.holders += 1;
+                }
+            }
+        }
+        self.publish_min_seq(&inner);
     }
 
     /// Releases a snapshot at `seq` and its lease.
